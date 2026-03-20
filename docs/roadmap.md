@@ -1,13 +1,13 @@
 # OpenWire Roadmap
 
-This document tracks the next development stages for OpenWire after the current v1 foundation.
+This document tracks the pending development stages for OpenWire after the current baseline.
 
-It is intended to be a long-lived maintenance document:
+It is intended to stay small and operational:
 
 - keep priorities visible
-- define what "done" means for each stage
+- define what "done" means for the active stages
 - prevent feature creep inside transport and policy work
-- record which suggestions are explicitly accepted now and which are deferred
+- keep completed work out of the "next" section
 
 ## Current Baseline
 
@@ -18,11 +18,18 @@ OpenWire already has:
 - `CallContext` and `EventListener`
 - pluggable DNS / TCP / TLS traits
 - shared `hyper-util` connection pooling
-- redirect handling
+- built-in request normalization via the internal `BridgeInterceptor`
+- minimal safe retries for replayable requests on connection-establishment failures
+- redirect handling with retry counting tracked separately from redirect counting
 - basic response body observability
 - Rustls-based default TLS integration
 
-The next work should build on this base instead of reopening the transport core unless required.
+The next work should build on this base instead of reopening transport internals unless required.
+
+## Recently Completed
+
+- 2026-03-20: internal `BridgeInterceptor` merged with integration coverage for empty, fixed-size, and streaming request bodies
+- 2026-03-20: minimal safe retry policy merged with integration coverage for retried success, retry exhaustion, non-replayable bodies, and retry/redirect count separation
 
 ## Priority Rules
 
@@ -33,73 +40,6 @@ Priority is defined as:
 - P3: feature expansion after core semantics stabilize
 
 Features below are accepted into the roadmap.
-
-## P1: Built-in BridgeInterceptor
-
-### Goal
-
-Introduce a built-in interceptor that normalizes outgoing requests before they reach user-provided network interceptors and transport.
-
-### Scope
-
-- add `Host` when absent
-- set `User-Agent: openwire/<version>` when absent
-- set `Content-Length` for replayable fixed-size bodies
-- set `Transfer-Encoding: chunked` for streaming bodies when appropriate
-- keep the behavior internal and deterministic across all requests
-
-### Out of Scope
-
-- automatic gzip / deflate decompression
-- cookie handling
-- transparent content negotiation
-
-### Design Notes
-
-- place this interceptor inside the built-in stack, not as a public opt-in middleware
-- user network interceptors should observe the normalized request
-- avoid leaking hyper-specific rules into user API types
-
-### Acceptance Criteria
-
-- requests without `Host` gain a correct header derived from the URI
-- fixed-size request bodies emit `Content-Length`
-- streaming request bodies do not emit a wrong `Content-Length`
-- user-supplied `User-Agent` is preserved
-- integration tests cover empty, replayable, and streaming bodies
-
-## P1: Minimal Safe Retry Policy
-
-### Goal
-
-Split retry behavior from redirect behavior and introduce a minimal retry policy focused only on safe transport retries.
-
-### Scope
-
-- retry connection-establishment failures only
-- retry only replayable requests
-- keep retry count small and explicit
-- separate retry count from redirect count in policy state
-
-### Out of Scope
-
-- 408 / 503 retry policies
-- backoff / jitter
-- retry-after parsing
-- application-level retry rules
-
-### Design Notes
-
-- model this as a dedicated policy layer instead of folding more logic into redirect handling
-- the retry layer should run before redirect follow-up generation
-- retries must emit clear attempt metadata for tracing and event listeners
-
-### Acceptance Criteria
-
-- non-replayable streaming request bodies are not retried
-- replayable `GET` / fixed-body requests can retry on connection failure
-- redirect counting and retry counting are independently tracked
-- tests cover retried success, retry exhaustion, and non-retryable bodies
 
 ## P2: RequestBuilder Ergonomics
 
@@ -119,11 +59,13 @@ Add a user-facing builder API so callers do not need to construct `http::Request
 - generated API surface for every HTTP verb on day one
 - JSON serialization helpers in the same phase
 
-### Design Notes
+### Execution Plan
 
-- keep `http::Request<RequestBody>` as the canonical lower-level API
-- `RequestBuilder` should compile down into that canonical form
-- avoid hiding `http` types completely; advanced users should still have the low-level path
+1. Add a minimal `RequestBuilder` type that compiles down into `http::Request<RequestBody>`.
+2. Land `client.get(url)` and `client.post(url)` as the first public entry points.
+3. Support common body conversions already represented by `RequestBody` (`Bytes`, `Vec<u8>`, `String`, `&'static str`).
+4. Add request-local overrides for timeout and basic auth / bearer auth helpers.
+5. Update `crates/openwire/examples` and the README once the builder is merged.
 
 ### Acceptance Criteria
 
@@ -132,17 +74,21 @@ Add a user-facing builder API so callers do not need to construct `http::Request
 - per-request timeout override works without rebuilding the whole client
 - examples in `crates/openwire/examples` include the new builder style
 
-## P2: Observability Improvements
+## P2: Observability Stabilization
 
 ### Goal
 
-Make response-body failures, connection reuse, and request attempt data visible in both events and tracing.
+Make response-body failures, connection reuse, and request-attempt data consistently visible in both events and tracing.
+
+### Current Gap
+
+OpenWire already emits `response_body_failed`, exposes connection reuse in `connection_acquired`, and attaches attempt numbers to attempt spans. The remaining work is to stabilize those fields, tighten event ordering guarantees, and add explicit regression coverage.
 
 ### Scope
 
 - keep `response_body_failed` as a first-class event
-- expose whether a connection was reused in event callbacks
-- include attempt metadata in tracing spans
+- expose reused-connection metadata consistently in tracing as well as events
+- keep retry and redirect attempt metadata easy to correlate in spans
 - make tracing field names stable and predictable
 
 ### Out of Scope
@@ -150,11 +96,12 @@ Make response-body failures, connection reuse, and request attempt data visible 
 - full OpenTelemetry exporter integration
 - metrics backend abstraction
 
-### Design Notes
+### Execution Plan
 
-- event ordering should remain internally consistent even if hyper-util limits exact OkHttp parity
-- prefer adding explicit fields over encoding metadata in free-form log messages
-- keep one terminal call outcome per call path
+1. Audit current tracing spans and promote ad hoc fields into a stable schema.
+2. Decide and document the canonical field set for `call_id`, `attempt`, `connection_id`, `connection_reused`, and retry/redirect context.
+3. Add event-ordering tests for success, response-body failure, and retry paths.
+4. Ensure body read failures never duplicate the terminal call outcome.
 
 ### Acceptance Criteria
 
@@ -166,14 +113,14 @@ Make response-body failures, connection reuse, and request attempt data visible 
 
 ### Goal
 
-Add higher-level HTTP client behavior only after BridgeInterceptor, retry, and builder ergonomics are stable.
+Add higher-level HTTP client behavior only after RequestBuilder and observability stabilization are done.
 
 ### CookieJar
 
 - define a `CookieJar` trait
 - load cookies before request send
 - save cookies from response headers after response receive
-- wire into BridgeInterceptor instead of transport
+- wire cookie application into the built-in request normalization/policy stack, not transport
 
 ### Authenticator
 
@@ -191,8 +138,6 @@ Add higher-level HTTP client behavior only after BridgeInterceptor, retry, and b
 
 Do not begin this phase until:
 
-- BridgeInterceptor is stable
-- retry policy semantics are validated
 - RequestBuilder is merged
 - observability fields are considered stable enough for downstream tooling
 
@@ -223,14 +168,12 @@ Definition of done for a roadmap item:
 - implementation merged
 - tests added for the promised behavior
 - docs/examples updated when the public API changed
-- item removed from the "next" section or marked complete with date/reference
+- item removed from the "next" section or moved into "Recently Completed"
 
 ## Suggested Execution Order
 
-1. BridgeInterceptor
-2. Minimal safe retry layer
-3. RequestBuilder
-4. Observability polish
-5. CookieJar
-6. Authenticator
-7. `openwire-cache`
+1. RequestBuilder
+2. Observability stabilization
+3. CookieJar
+4. Authenticator
+5. `openwire-cache`

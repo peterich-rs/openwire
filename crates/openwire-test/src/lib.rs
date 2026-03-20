@@ -174,6 +174,10 @@ impl EventListener for RecordingEventListener {
         self.push(format!("connection_released {}", connection_id.as_u64()));
     }
 
+    fn retry(&self, _ctx: &CallContext, attempt: u32, reason: &str) {
+        self.push(format!("retry {attempt} {reason}"));
+    }
+
     fn redirect(&self, _ctx: &CallContext, attempt: u32, location: &http::Uri) {
         self.push(format!("redirect {attempt} {location}"));
     }
