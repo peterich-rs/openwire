@@ -6,7 +6,6 @@ use http::header::{
     AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, PROXY_AUTHORIZATION,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
-use hyper_util::client::legacy::Client as HyperClient;
 use openwire_core::{
     BoxFuture, BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange,
     InterceptorLayer, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime,
@@ -29,15 +28,10 @@ pub struct Client {
 }
 
 struct ClientInner {
-    application_interceptors: Vec<SharedInterceptor>,
-    network_interceptors: Vec<SharedInterceptor>,
     event_listener_factory: SharedEventListenerFactory,
     runtime: Arc<dyn Runtime>,
-    transport: TransportConfig,
-    policy: PolicyConfig,
-    dns_resolver: Arc<dyn DnsResolver>,
-    tcp_connector: Arc<dyn TcpConnector>,
-    tls_connector: Option<Arc<dyn TlsConnector>>,
+    call_timeout: Option<Duration>,
+    service: BoxWireService,
 }
 
 pub struct Call {
@@ -181,17 +175,39 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client, WireError> {
+        #[cfg(feature = "tls-rustls")]
+        let tls_connector = match self.tls_connector {
+            Some(tls_connector) => Some(tls_connector),
+            None => Some(
+                Arc::new(openwire_rustls::RustlsTlsConnector::builder().build()?)
+                    as Arc<dyn TlsConnector>,
+            ),
+        };
+
+        #[cfg(not(feature = "tls-rustls"))]
+        let tls_connector = self.tls_connector;
+
+        let connector = ConnectorStack {
+            dns_resolver: self.dns_resolver,
+            tcp_connector: self.tcp_connector,
+            tls_connector,
+            connect_timeout: self.transport.connect_timeout,
+        };
+
+        let transport = TransportService::new(build_hyper_client(connector, &self.transport));
+        let service = build_service_chain(
+            transport,
+            self.application_interceptors,
+            self.network_interceptors,
+            self.policy.clone(),
+        );
+
         Ok(Client {
             inner: Arc::new(ClientInner {
-                application_interceptors: self.application_interceptors,
-                network_interceptors: self.network_interceptors,
                 event_listener_factory: self.event_listener_factory,
                 runtime: self.runtime,
-                transport: self.transport,
-                policy: self.policy,
-                dns_resolver: self.dns_resolver,
-                tcp_connector: self.tcp_connector,
-                tls_connector: self.tls_connector,
+                call_timeout: self.policy.call_timeout,
+                service,
             }),
         })
     }
@@ -199,16 +215,6 @@ impl ClientBuilder {
 
 impl Default for ClientBuilder {
     fn default() -> Self {
-        #[cfg(feature = "tls-rustls")]
-        let tls_connector = Some(Arc::new(
-            openwire_rustls::RustlsTlsConnector::builder()
-                .build()
-                .expect("failed to build default rustls connector"),
-        ) as Arc<dyn TlsConnector>);
-
-        #[cfg(not(feature = "tls-rustls"))]
-        let tls_connector = None;
-
         Self {
             application_interceptors: Vec::new(),
             network_interceptors: Vec::new(),
@@ -229,7 +235,7 @@ impl Default for ClientBuilder {
             },
             dns_resolver: Arc::new(SystemDnsResolver),
             tcp_connector: Arc::new(TokioTcpConnector),
-            tls_connector,
+            tls_connector: None,
         }
     }
 }
@@ -256,41 +262,6 @@ impl Client {
     ) -> Result<Response<ResponseBody>, WireError> {
         self.new_call(request).execute().await
     }
-
-    fn build_service(&self, ctx: CallContext) -> BoxWireService {
-        let connector = ConnectorStack {
-            dns_resolver: self.inner.dns_resolver.clone(),
-            tcp_connector: self.inner.tcp_connector.clone(),
-            tls_connector: self.inner.tls_connector.clone(),
-            connect_timeout: self.inner.transport.connect_timeout,
-            ctx,
-        };
-
-        let hyper_client: HyperClient<_, RequestBody> =
-            build_hyper_client(connector, &self.inner.transport);
-        let transport = TransportService {
-            client: hyper_client,
-        };
-
-        let mut network: BoxWireService = BoxCloneSyncService::new(transport);
-        for interceptor in self.inner.network_interceptors.iter().rev() {
-            network =
-                BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
-        }
-
-        let policy = PolicyService {
-            network,
-            config: self.inner.policy.clone(),
-        };
-
-        let mut service: BoxWireService = BoxCloneSyncService::new(policy);
-        for interceptor in self.inner.application_interceptors.iter().rev() {
-            service =
-                BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
-        }
-
-        service
-    }
 }
 
 impl Call {
@@ -298,7 +269,7 @@ impl Call {
         let ctx = CallContext::from_factory(
             &self.client.inner.event_listener_factory,
             &self.request,
-            self.client.inner.policy.call_timeout,
+            self.client.inner.call_timeout,
         );
 
         let span = tracing::info_span!(
@@ -311,8 +282,7 @@ impl Call {
         async move {
             ctx.listener().call_start(&ctx, &self.request);
 
-            let service = self.client.build_service(ctx.clone());
-            let mut service = service;
+            let mut service = self.client.inner.service.clone();
             let execute_ctx = ctx.clone();
             let execute = async move {
                 tower::ServiceExt::ready(&mut service)
@@ -322,7 +292,10 @@ impl Call {
                     .await
             };
 
-            let result = match self.client.inner.policy.call_timeout {
+            let result = match ctx
+                .deadline()
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            {
                 Some(timeout) => tokio::time::timeout(timeout, execute)
                     .await
                     .map_err(|_| WireError::timeout(format!("call timed out after {timeout:?}")))?,
@@ -364,7 +337,9 @@ impl Service<Exchange> for PolicyService {
         let network = self.network.clone();
         let config = self.config.clone();
         Box::pin(async move {
-            let (mut request, ctx, mut attempt) = exchange.into_parts();
+            let (mut request, ctx, initial_attempt) = exchange.into_parts();
+            let mut attempt = initial_attempt;
+            let mut redirects = 0usize;
 
             loop {
                 validate_request(&request)?;
@@ -393,7 +368,7 @@ impl Service<Exchange> for PolicyService {
                     return Ok(response);
                 }
 
-                if attempt as usize >= config.max_redirects {
+                if redirects >= config.max_redirects {
                     return Err(WireError::redirect(format!(
                         "too many redirects (max {})",
                         config.max_redirects
@@ -401,13 +376,41 @@ impl Service<Exchange> for PolicyService {
                 }
 
                 let next_uri = resolve_redirect_uri(&redirect_snapshot.uri, location)?;
-                ctx.listener().redirect(&ctx, attempt, &next_uri);
+                ctx.listener()
+                    .redirect(&ctx, redirects as u32 + 1, &next_uri);
 
                 request = redirect_snapshot.into_redirect_request(response.status(), next_uri)?;
+                redirects += 1;
                 attempt += 1;
             }
         })
     }
+}
+
+fn build_service_chain(
+    transport: TransportService,
+    application_interceptors: Vec<SharedInterceptor>,
+    network_interceptors: Vec<SharedInterceptor>,
+    policy: PolicyConfig,
+) -> BoxWireService {
+    let mut network: BoxWireService = BoxCloneSyncService::new(transport);
+    for interceptor in network_interceptors.iter().rev() {
+        network =
+            BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
+    }
+
+    let policy = PolicyService {
+        network,
+        config: policy,
+    };
+
+    let mut service: BoxWireService = BoxCloneSyncService::new(policy);
+    for interceptor in application_interceptors.iter().rev() {
+        service =
+            BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
+    }
+
+    service
 }
 
 fn validate_request(request: &Request<RequestBody>) -> Result<(), WireError> {

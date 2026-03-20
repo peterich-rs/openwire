@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
 use thiserror::Error;
 
-pub type BoxError = Box<dyn StdError + Send + Sync>;
+pub type BoxError = Arc<dyn StdError + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WireErrorKind {
@@ -41,7 +42,7 @@ impl fmt::Display for WireErrorKind {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[error("{kind}: {message}")]
 pub struct WireError {
     kind: WireErrorKind,
@@ -65,12 +66,12 @@ impl WireError {
         source: E,
     ) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self {
             kind,
             message: message.into(),
-            source: Some(source.into()),
+            source: Some(Arc::new(source)),
         }
     }
 
@@ -96,28 +97,28 @@ impl WireError {
 
     pub fn dns<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Dns, message, source)
     }
 
     pub fn connect<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Connect, message, source)
     }
 
     pub fn tls<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Tls, message, source)
     }
 
     pub fn protocol<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Protocol, message, source)
     }
@@ -128,21 +129,21 @@ impl WireError {
 
     pub fn body<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Body, message, source)
     }
 
     pub fn interceptor<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Interceptor, message, source)
     }
 
     pub fn internal<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
-        E: Into<BoxError>,
+        E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Internal, message, source)
     }

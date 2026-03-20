@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,12 +17,24 @@ impl CallId {
     }
 }
 
+impl fmt::Display for CallId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+impl fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -39,6 +52,7 @@ struct CallContextInner {
     listener: SharedEventListener,
     created_at: Instant,
     deadline: Option<Instant>,
+    connection_established: AtomicBool,
 }
 
 impl std::fmt::Debug for CallContext {
@@ -61,6 +75,7 @@ impl CallContext {
                 listener,
                 created_at,
                 deadline,
+                connection_established: AtomicBool::new(false),
             }),
         }
     }
@@ -88,5 +103,15 @@ impl CallContext {
 
     pub fn deadline(&self) -> Option<Instant> {
         self.inner.deadline
+    }
+
+    pub fn mark_connection_established(&self) {
+        self.inner
+            .connection_established
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub fn connection_established(&self) -> bool {
+        self.inner.connection_established.load(Ordering::Relaxed)
     }
 }

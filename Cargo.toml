@@ -11,8 +11,8 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
-authors = ["fannnzhang"]
-repository = "https://github.com/fannnzhang/openwire"
+authors = ["OpenWire contributors"]
+repository = "https://github.com/peterich-rs/openwire"
 rust-version = "1.80"
 
 [workspace.dependencies]

@@ -32,6 +32,7 @@ pub trait EventListener: Send + Sync + 'static {
     fn response_headers_start(&self, _ctx: &CallContext) {}
     fn response_headers_end(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
     fn response_body_end(&self, _ctx: &CallContext, _bytes_read: u64) {}
+    fn response_body_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
     fn connection_acquired(&self, _ctx: &CallContext, _connection_id: ConnectionId, _reused: bool) {
     }

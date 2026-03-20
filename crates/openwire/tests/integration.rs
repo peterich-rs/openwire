@@ -121,6 +121,38 @@ async fn custom_dns_routes_custom_host() {
 }
 
 #[tokio::test]
+async fn shared_client_reuses_connection_pool_across_calls() {
+    let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
+    let client = Client::builder().build().expect("client");
+
+    let request_one = Request::builder()
+        .uri(server.http_url("/first"))
+        .body(RequestBody::empty())
+        .expect("request");
+    let response_one = client.execute(request_one).await.expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let request_two = Request::builder()
+        .uri(server.http_url("/second"))
+        .body(RequestBody::empty())
+        .expect("request");
+    let response_two = client.execute(request_two).await.expect("response");
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_two.into_body().text().await.expect("body");
+
+    assert_eq!(connection_one, connection_two);
+}
+
+#[tokio::test]
 async fn interceptors_wrap_transport_in_expected_order() {
     let server = spawn_http1(|_request| async move { ok_text("ok") }).await;
     let order = Arc::new(Mutex::new(Vec::new()));

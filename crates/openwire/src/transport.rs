@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -21,6 +23,10 @@ use openwire_core::{
 };
 use tower::Service;
 use tracing::Instrument;
+
+tokio::task_local! {
+    static CURRENT_CALL_CONTEXT: CallContext;
+}
 
 #[derive(Clone)]
 pub struct TokioRuntime;
@@ -113,6 +119,7 @@ impl TcpConnector for TokioTcpConnector {
                 tls: false,
             };
 
+            ctx.mark_connection_established();
             ctx.listener().connect_end(&ctx, info.id, addr);
 
             Ok(Box::new(TcpConnection {
@@ -180,7 +187,6 @@ pub(crate) struct ConnectorStack {
     pub(crate) tcp_connector: Arc<dyn TcpConnector>,
     pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
     pub(crate) connect_timeout: Option<Duration>,
-    pub(crate) ctx: CallContext,
 }
 
 impl Service<Uri> for ConnectorStack {
@@ -197,9 +203,9 @@ impl Service<Uri> for ConnectorStack {
         let tcp_connector = self.tcp_connector.clone();
         let tls_connector = self.tls_connector.clone();
         let connect_timeout = self.connect_timeout;
-        let ctx = self.ctx.clone();
 
         Box::pin(async move {
+            let ctx = current_call_context()?;
             let host = uri
                 .host()
                 .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?
@@ -261,6 +267,16 @@ impl Service<Uri> for ConnectorStack {
 #[derive(Clone)]
 pub(crate) struct TransportService {
     pub(crate) client: HyperClient<ConnectorStack, RequestBody>,
+    connection_registry: Arc<Mutex<HashSet<openwire_core::ConnectionId>>>,
+}
+
+impl TransportService {
+    pub(crate) fn new(client: HyperClient<ConnectorStack, RequestBody>) -> Self {
+        Self {
+            client,
+            connection_registry: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
 }
 
 impl Service<Exchange> for TransportService {
@@ -274,6 +290,7 @@ impl Service<Exchange> for TransportService {
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
         let client = self.client.clone();
+        let connection_registry = self.connection_registry.clone();
         Box::pin(async move {
             let (request, ctx, attempt) = exchange.into_parts();
             let request_body_len = request.body().replayable_len();
@@ -287,10 +304,10 @@ impl Service<Exchange> for TransportService {
             );
 
             async move {
-                ctx.listener().request_headers_start(&ctx);
-                ctx.listener().request_headers_end(&ctx);
-
-                let response = client.request(request).await.map_err(map_client_error)?;
+                let response = with_call_context(ctx.clone(), async move {
+                    client.request(request).await.map_err(map_client_error)
+                })
+                .await?;
 
                 if let Some(bytes) = request_body_len {
                     ctx.listener().request_body_end(&ctx, bytes);
@@ -298,7 +315,13 @@ impl Service<Exchange> for TransportService {
 
                 let connection_info = response.extensions().get::<ConnectionInfo>().cloned();
                 if let Some(info) = &connection_info {
-                    ctx.listener().connection_acquired(&ctx, info.id, false);
+                    let reused = {
+                        let mut seen = connection_registry
+                            .lock()
+                            .expect("connection registry lock");
+                        !seen.insert(info.id)
+                    };
+                    ctx.listener().connection_acquired(&ctx, info.id, reused);
                 }
 
                 ctx.listener().response_headers_start(&ctx);
@@ -394,7 +417,7 @@ impl Body for ObservedIncomingBody {
             }
             Poll::Ready(Some(Err(error))) => {
                 let error = WireError::from(error);
-                this.ctx.listener().call_failed(&this.ctx, &error);
+                this.ctx.listener().response_body_failed(&this.ctx, &error);
                 this.finish();
                 Poll::Ready(Some(Err(error)))
             }
@@ -432,4 +455,22 @@ fn map_client_error(error: hyper_util::client::legacy::Error) -> WireError {
     }
 
     WireError::protocol("transport request failed", error)
+}
+
+fn current_call_context() -> Result<CallContext, WireError> {
+    CURRENT_CALL_CONTEXT
+        .try_with(Clone::clone)
+        .map_err(|error| {
+            WireError::internal(
+                "call context unavailable inside connector stack",
+                io::Error::new(io::ErrorKind::Other, error.to_string()),
+            )
+        })
+}
+
+pub(crate) async fn with_call_context<F, T>(ctx: CallContext, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CURRENT_CALL_CONTEXT.scope(ctx, future).await
 }
