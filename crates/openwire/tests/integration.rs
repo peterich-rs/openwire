@@ -1,15 +1,21 @@
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+use futures_util::stream;
+use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING, USER_AGENT};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use openwire::{
     BoxFuture, CallContext, Client, DnsResolver, Exchange, Interceptor, Next, RequestBody,
-    ResponseBody, RustlsTlsConnector, WireError, WireErrorKind,
+    ResponseBody, RustlsTlsConnector, TcpConnector, TokioTcpConnector, WireError, WireErrorKind,
 };
+use openwire_core::BoxConnection;
 use openwire_test::{
-    ok_text, spawn_http1, spawn_https_http1, RecordingEventListenerFactory, StaticDnsResolver,
+    collect_request_body, ok_text, spawn_http1, spawn_https_http1, RecordingEventListenerFactory,
+    StaticDnsResolver,
 };
 
 #[tokio::test]
@@ -247,6 +253,327 @@ async fn connect_failure_is_classified() {
     assert_eq!(error.kind(), WireErrorKind::Connect);
 }
 
+#[tokio::test]
+async fn retries_replayable_requests_on_connection_failure() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .event_listener_factory(events.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/retry-once",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "retry ok");
+    assert_eq!(connector.attempts(), 2);
+
+    let events = events.events();
+    assert!(
+        events.iter().any(|event| event == "retry 1 connect"),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn retry_exhaustion_returns_connect_error() {
+    let server = spawn_http1(|_request| async move { ok_text("never reached") }).await;
+    let connector = FailingTcpConnector::new(2);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .event_listener_factory(events.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/retry-exhausted",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client.execute(request).await.expect_err("should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 2);
+
+    let retry_events = events
+        .events()
+        .into_iter()
+        .filter(|event| event.starts_with("retry "))
+        .count();
+    assert_eq!(retry_events, 1);
+}
+
+#[tokio::test]
+async fn streaming_request_bodies_are_not_retried_on_connection_failure() {
+    let server = spawn_http1(|_request| async move { ok_text("never reached") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/streaming-no-retry",
+            server.addr().port()
+        ))
+        .body(RequestBody::from_stream(stream::iter(vec![Ok::<
+            Bytes,
+            WireError,
+        >(
+            Bytes::from_static(b"streaming body"),
+        )])))
+        .expect("request");
+
+    let error = client.execute(request).await.expect_err("should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 1);
+}
+
+#[tokio::test]
+async fn redirect_count_remains_independent_from_retry_count() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect-after-retry" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/redirect-target")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect after retry"),
+        }
+    })
+    .await;
+
+    let connector = FailingTcpConnector::new(1);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector)
+        .event_listener_factory(events.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/redirect-after-retry",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "redirect after retry");
+
+    let events = events.events();
+    assert!(
+        events.iter().any(|event| event == "retry 1 connect"),
+        "events = {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("redirect 1 http://openwire.test:")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn bridge_interceptor_normalizes_empty_requests_before_network_interceptors() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("request body should be utf-8"),
+            });
+            ok_text("normalized")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/empty",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "normalized");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some(default_user_agent().to_owned()),
+        content_length: Some("0".to_owned()),
+        transfer_encoding: None,
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: String::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn bridge_interceptor_preserves_user_agent_and_sets_fixed_body_content_length() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("request body should be utf-8"),
+            });
+            ok_text("fixed")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/fixed",
+            server.addr().port()
+        ))
+        .header(USER_AGENT, "custom-agent/1.0")
+        .header(CONTENT_LENGTH, "999")
+        .body(RequestBody::from_static(b"hello"))
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "fixed");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some("custom-agent/1.0".to_owned()),
+        content_length: Some("5".to_owned()),
+        transfer_encoding: None,
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: "hello".to_owned(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn bridge_interceptor_streaming_body_uses_chunked_without_content_length() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("request body should be utf-8"),
+            });
+            ok_text("streaming")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let stream = stream::iter(vec![
+        Ok::<Bytes, WireError>(Bytes::from_static(b"hello ")),
+        Ok::<Bytes, WireError>(Bytes::from_static(b"stream")),
+    ]);
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/stream",
+            server.addr().port()
+        ))
+        .header(CONTENT_LENGTH, "999")
+        .header(TRANSFER_ENCODING, "identity")
+        .body(RequestBody::from_stream(stream))
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "streaming");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some(default_user_agent().to_owned()),
+        content_length: None,
+        transfer_encoding: Some("chunked".to_owned()),
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: "hello stream".to_owned(),
+        }
+    );
+}
+
 #[derive(Clone)]
 struct RecordingInterceptor {
     label: &'static str,
@@ -278,6 +605,136 @@ impl Interceptor for RecordingInterceptor {
                 _ => "net:after",
             });
             response
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct HeaderCaptureInterceptor {
+    seen: Arc<Mutex<Vec<ObservedHeaders>>>,
+}
+
+impl HeaderCaptureInterceptor {
+    fn take_single(&self) -> ObservedHeaders {
+        let seen = self.seen.lock().expect("captured headers");
+        assert_eq!(seen.len(), 1, "expected exactly one captured request");
+        seen[0].clone()
+    }
+}
+
+impl Interceptor for HeaderCaptureInterceptor {
+    fn intercept(
+        &self,
+        exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let seen = self.seen.clone();
+        let headers = ObservedHeaders::capture(exchange.request().headers());
+        Box::pin(async move {
+            seen.lock().expect("captured headers").push(headers);
+            next.run(exchange).await
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedHeaders {
+    host: Option<String>,
+    user_agent: Option<String>,
+    content_length: Option<String>,
+    transfer_encoding: Option<String>,
+}
+
+impl ObservedHeaders {
+    fn capture(headers: &http::HeaderMap) -> Self {
+        Self {
+            host: header_value(headers, HOST),
+            user_agent: header_value(headers, USER_AGENT),
+            content_length: header_value(headers, CONTENT_LENGTH),
+            transfer_encoding: header_value(headers, TRANSFER_ENCODING),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedServerRequest {
+    headers: ObservedHeaders,
+    body: String,
+}
+
+fn take_observed_server_request(
+    observed: &Arc<Mutex<Option<ObservedServerRequest>>>,
+) -> ObservedServerRequest {
+    observed
+        .lock()
+        .expect("observed server request")
+        .clone()
+        .expect("observed server request")
+}
+
+fn header_value(headers: &http::HeaderMap, name: http::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn default_user_agent() -> &'static str {
+    concat!("openwire/", env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Clone)]
+struct FailingTcpConnector {
+    failures_remaining: Arc<Mutex<usize>>,
+    attempts: Arc<Mutex<usize>>,
+}
+
+impl FailingTcpConnector {
+    fn new(failures: usize) -> Self {
+        Self {
+            failures_remaining: Arc::new(Mutex::new(failures)),
+            attempts: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        *self.attempts.lock().expect("connector attempts")
+    }
+}
+
+impl TcpConnector for FailingTcpConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        addr: SocketAddr,
+        timeout: Option<std::time::Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let failures_remaining = self.failures_remaining.clone();
+        let attempts = self.attempts.clone();
+        Box::pin(async move {
+            *attempts.lock().expect("connector attempts") += 1;
+
+            let should_fail = {
+                let mut failures_remaining = failures_remaining
+                    .lock()
+                    .expect("remaining connector failures");
+                if *failures_remaining == 0 {
+                    false
+                } else {
+                    *failures_remaining -= 1;
+                    true
+                }
+            };
+
+            if should_fail {
+                ctx.listener().connect_start(&ctx, addr);
+                return Err(WireError::connect(
+                    "scripted connect failure",
+                    io::Error::new(io::ErrorKind::ConnectionRefused, "scripted connect failure"),
+                ));
+            }
+
+            TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }
 }

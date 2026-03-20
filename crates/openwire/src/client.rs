@@ -10,6 +10,7 @@ use openwire_core::{
     BoxFuture, BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange,
     InterceptorLayer, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime,
     SharedEventListenerFactory, SharedInterceptor, TcpConnector, TlsConnector, WireError,
+    WireErrorKind,
 };
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -17,6 +18,7 @@ use tower::Service;
 use tracing::Instrument;
 use url::Url;
 
+use crate::bridge::BridgeInterceptor;
 use crate::transport::{
     build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
     TransportService,
@@ -52,6 +54,18 @@ pub(crate) struct TransportConfig {
 #[derive(Clone)]
 struct PolicyConfig {
     call_timeout: Option<Duration>,
+    retry: RetryPolicyConfig,
+    redirect: RedirectPolicyConfig,
+}
+
+#[derive(Clone)]
+struct RetryPolicyConfig {
+    retry_on_connection_failure: bool,
+    max_retries: usize,
+}
+
+#[derive(Clone)]
+struct RedirectPolicyConfig {
     follow_redirects: bool,
     max_redirects: usize,
 }
@@ -140,12 +154,22 @@ impl ClientBuilder {
     }
 
     pub fn follow_redirects(mut self, enabled: bool) -> Self {
-        self.policy.follow_redirects = enabled;
+        self.policy.redirect.follow_redirects = enabled;
         self
     }
 
     pub fn max_redirects(mut self, max_redirects: usize) -> Self {
-        self.policy.max_redirects = max_redirects;
+        self.policy.redirect.max_redirects = max_redirects;
+        self
+    }
+
+    pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
+        self.policy.retry.retry_on_connection_failure = enabled;
+        self
+    }
+
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.policy.retry.max_retries = max_retries;
         self
     }
 
@@ -226,12 +250,18 @@ impl Default for ClientBuilder {
                 pool_max_idle_per_host: usize::MAX,
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
-                retry_canceled_requests: true,
+                retry_canceled_requests: false,
             },
             policy: PolicyConfig {
                 call_timeout: None,
-                follow_redirects: true,
-                max_redirects: 10,
+                retry: RetryPolicyConfig {
+                    retry_on_connection_failure: true,
+                    max_retries: 1,
+                },
+                redirect: RedirectPolicyConfig {
+                    follow_redirects: true,
+                    max_redirects: 10,
+                },
             },
             dns_resolver: Arc::new(SystemDnsResolver),
             tcp_connector: Arc::new(TokioTcpConnector),
@@ -319,12 +349,84 @@ impl Call {
 }
 
 #[derive(Clone)]
-struct PolicyService {
+struct RetryPolicyService {
     network: BoxWireService,
-    config: PolicyConfig,
+    config: RetryPolicyConfig,
 }
 
-impl Service<Exchange> for PolicyService {
+impl Service<Exchange> for RetryPolicyService {
+    type Response = Response<ResponseBody>;
+    type Error = WireError;
+    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, exchange: Exchange) -> Self::Future {
+        let network = self.network.clone();
+        let config = self.config.clone();
+        Box::pin(async move {
+            let (mut request, ctx, mut attempt) = exchange.into_parts();
+            let retry_snapshot = RetrySnapshot::capture(&request);
+            let mut retries = 0u32;
+
+            loop {
+                let mut svc = network.clone();
+                let result = tower::ServiceExt::ready(&mut svc)
+                    .await
+                    .map_err(|error| WireError::internal("network chain not ready", error))?
+                    .call(Exchange::new(request, ctx.clone(), attempt))
+                    .await;
+
+                match result {
+                    Ok(mut response) => {
+                        response.extensions_mut().insert(AttemptMetadata {
+                            total_attempt: attempt,
+                            retry_count: retries,
+                        });
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let Some(reason) = retry_reason(&error) else {
+                            return Err(error);
+                        };
+
+                        if !config.retry_on_connection_failure
+                            || retries as usize >= config.max_retries
+                        {
+                            return Err(error);
+                        }
+
+                        let Some(snapshot) = &retry_snapshot else {
+                            return Err(error);
+                        };
+
+                        retries += 1;
+                        attempt += 1;
+                        ctx.listener().retry(&ctx, retries, reason);
+                        tracing::debug!(
+                            call_id = ctx.call_id().as_u64(),
+                            retry_attempt = retries,
+                            attempt,
+                            reason,
+                            "retrying request after connection-establishment failure",
+                        );
+                        request = snapshot.to_request()?;
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+struct RedirectPolicyService {
+    network: BoxWireService,
+    config: RedirectPolicyConfig,
+}
+
+impl Service<Exchange> for RedirectPolicyService {
     type Response = Response<ResponseBody>;
     type Error = WireError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
@@ -339,20 +441,35 @@ impl Service<Exchange> for PolicyService {
         Box::pin(async move {
             let (mut request, ctx, initial_attempt) = exchange.into_parts();
             let mut attempt = initial_attempt;
-            let mut redirects = 0usize;
+            let mut redirects = 0u32;
+            let mut total_retries = 0u32;
 
             loop {
                 validate_request(&request)?;
                 let redirect_snapshot = RedirectSnapshot::capture(&request);
 
                 let mut svc = network.clone();
-                let response = tower::ServiceExt::ready(&mut svc)
+                let mut response = tower::ServiceExt::ready(&mut svc)
                     .await
                     .map_err(|error| WireError::internal("network chain not ready", error))?
                     .call(Exchange::new(request, ctx.clone(), attempt))
                     .await?;
 
+                let attempt_metadata = response
+                    .extensions()
+                    .get::<AttemptMetadata>()
+                    .copied()
+                    .unwrap_or(AttemptMetadata {
+                        total_attempt: attempt,
+                        retry_count: 0,
+                    });
+                total_retries += attempt_metadata.retry_count;
+
                 if !config.follow_redirects {
+                    response.extensions_mut().insert(AttemptMetadata {
+                        total_attempt: attempt_metadata.total_attempt,
+                        retry_count: total_retries,
+                    });
                     return Ok(response);
                 }
 
@@ -361,14 +478,22 @@ impl Service<Exchange> for PolicyService {
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
                 else {
+                    response.extensions_mut().insert(AttemptMetadata {
+                        total_attempt: attempt_metadata.total_attempt,
+                        retry_count: total_retries,
+                    });
                     return Ok(response);
                 };
 
                 if !is_redirect_status(response.status()) {
+                    response.extensions_mut().insert(AttemptMetadata {
+                        total_attempt: attempt_metadata.total_attempt,
+                        retry_count: total_retries,
+                    });
                     return Ok(response);
                 }
 
-                if redirects >= config.max_redirects {
+                if redirects as usize >= config.max_redirects {
                     return Err(WireError::redirect(format!(
                         "too many redirects (max {})",
                         config.max_redirects
@@ -376,12 +501,11 @@ impl Service<Exchange> for PolicyService {
                 }
 
                 let next_uri = resolve_redirect_uri(&redirect_snapshot.uri, location)?;
-                ctx.listener()
-                    .redirect(&ctx, redirects as u32 + 1, &next_uri);
+                ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
 
                 request = redirect_snapshot.into_redirect_request(response.status(), next_uri)?;
                 redirects += 1;
-                attempt += 1;
+                attempt = attempt_metadata.total_attempt + 1;
             }
         })
     }
@@ -398,13 +522,20 @@ fn build_service_chain(
         network =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
     }
+    network = BoxCloneSyncService::new(
+        InterceptorLayer::new(Arc::new(BridgeInterceptor) as SharedInterceptor).layer(network),
+    );
 
-    let policy = PolicyService {
+    let retry_policy = RetryPolicyService {
         network,
-        config: policy,
+        config: policy.retry,
+    };
+    let redirect_policy = RedirectPolicyService {
+        network: BoxCloneSyncService::new(retry_policy),
+        config: policy.redirect,
     };
 
-    let mut service: BoxWireService = BoxCloneSyncService::new(policy);
+    let mut service: BoxWireService = BoxCloneSyncService::new(redirect_policy);
     for interceptor in application_interceptors.iter().rev() {
         service =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
@@ -461,6 +592,48 @@ struct RedirectSnapshot {
     version: Version,
     headers: HeaderMap,
     body: Option<RequestBody>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttemptMetadata {
+    total_attempt: u32,
+    retry_count: u32,
+}
+
+struct RetrySnapshot {
+    method: Method,
+    uri: Uri,
+    version: Version,
+    headers: HeaderMap,
+    body: Option<RequestBody>,
+}
+
+impl RetrySnapshot {
+    fn capture(request: &Request<RequestBody>) -> Option<Self> {
+        let body = request.body().try_clone()?;
+        Some(Self {
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+            version: request.version(),
+            headers: request.headers().clone(),
+            body: Some(body),
+        })
+    }
+
+    fn to_request(&self) -> Result<Request<RequestBody>, WireError> {
+        let body = self
+            .body
+            .as_ref()
+            .and_then(RequestBody::try_clone)
+            .expect("captured replayable body must remain replayable");
+        let mut request = Request::builder()
+            .method(self.method.clone())
+            .uri(self.uri.clone())
+            .version(self.version)
+            .body(body)?;
+        *request.headers_mut() = self.headers.clone();
+        Ok(request)
+    }
 }
 
 impl RedirectSnapshot {
@@ -532,4 +705,16 @@ impl RedirectSnapshot {
 
 fn same_authority(left: &Uri, right: &Uri) -> bool {
     left.scheme_str() == right.scheme_str() && left.authority() == right.authority()
+}
+
+fn retry_reason(error: &WireError) -> Option<&'static str> {
+    match error.kind() {
+        WireErrorKind::Dns => Some("dns"),
+        WireErrorKind::Connect => Some("connect"),
+        WireErrorKind::Tls => Some("tls"),
+        WireErrorKind::Timeout if error.message().starts_with("connection timed out after") => {
+            Some("connect_timeout")
+        }
+        _ => None,
+    }
 }

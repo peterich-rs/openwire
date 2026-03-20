@@ -18,6 +18,7 @@ This workspace uses:
 ## Roadmap
 
 - Long-term planning and accepted next-stage work live in [docs/roadmap.md](docs/roadmap.md)
+- The current near-term roadmap now starts with `RequestBuilder` ergonomics and observability stabilization
 
 ## Current API
 
@@ -44,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `Client`, `ClientBuilder`, and one-shot `Call`
 - application and network interceptors
 - event listener factory and per-call event listeners
+- built-in request normalization for `Host`, `User-Agent`, and request body framing
+- minimal safe retries for replayable requests on connection-establishment failures
 - custom DNS resolver / TCP connector / TLS connector hooks
 - redirect handling with basic authority-sensitive header stripping
 - call timeout and connect timeout
