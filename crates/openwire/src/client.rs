@@ -45,6 +45,12 @@ pub struct Call {
 #[derive(Clone, Copy)]
 pub(crate) struct RequestTimeout(pub(crate) Duration);
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PolicyTraceContext {
+    pub(crate) retry_count: u32,
+    pub(crate) redirect_count: u32,
+}
+
 #[derive(Clone)]
 pub(crate) struct TransportConfig {
     pub(crate) connect_timeout: Option<Duration>,
@@ -393,10 +399,16 @@ impl Service<Exchange> for RetryPolicyService {
         let config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, mut attempt) = exchange.into_parts();
+            let mut policy_trace = request
+                .extensions()
+                .get::<PolicyTraceContext>()
+                .copied()
+                .unwrap_or_default();
             let retry_snapshot = RetrySnapshot::capture(&request);
             let mut retries = 0u32;
 
             loop {
+                request.extensions_mut().insert(policy_trace);
                 let mut svc = network.clone();
                 let result = tower::ServiceExt::ready(&mut svc)
                     .await
@@ -429,15 +441,17 @@ impl Service<Exchange> for RetryPolicyService {
 
                         retries += 1;
                         attempt += 1;
+                        policy_trace.retry_count = retries;
                         ctx.listener().retry(&ctx, retries, reason);
                         tracing::debug!(
                             call_id = ctx.call_id().as_u64(),
-                            retry_attempt = retries,
                             attempt,
-                            reason,
+                            retry_count = policy_trace.retry_count,
+                            redirect_count = policy_trace.redirect_count,
+                            retry_reason = reason,
                             "retrying request after connection-establishment failure",
                         );
-                        request = snapshot.to_request()?;
+                        request = snapshot.to_request(policy_trace)?;
                     }
                 }
             }
@@ -465,12 +479,18 @@ impl Service<Exchange> for RedirectPolicyService {
         let config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, initial_attempt) = exchange.into_parts();
+            let mut policy_trace = request
+                .extensions()
+                .get::<PolicyTraceContext>()
+                .copied()
+                .unwrap_or_default();
             let mut attempt = initial_attempt;
             let mut redirects = 0u32;
             let mut total_retries = 0u32;
 
             loop {
                 validate_request(&request)?;
+                request.extensions_mut().insert(policy_trace);
                 let redirect_snapshot = RedirectSnapshot::capture(&request);
 
                 let mut svc = network.clone();
@@ -527,10 +547,25 @@ impl Service<Exchange> for RedirectPolicyService {
 
                 let next_uri = resolve_redirect_uri(&redirect_snapshot.uri, location)?;
                 ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
+                let next_attempt = attempt_metadata.total_attempt + 1;
+                policy_trace.retry_count = total_retries;
+                policy_trace.redirect_count = redirects + 1;
+                tracing::debug!(
+                    call_id = ctx.call_id().as_u64(),
+                    attempt = next_attempt,
+                    retry_count = policy_trace.retry_count,
+                    redirect_count = policy_trace.redirect_count,
+                    redirect_location = %next_uri,
+                    "following redirect",
+                );
 
-                request = redirect_snapshot.into_redirect_request(response.status(), next_uri)?;
+                request = redirect_snapshot.into_redirect_request(
+                    response.status(),
+                    next_uri,
+                    policy_trace,
+                )?;
                 redirects += 1;
-                attempt = attempt_metadata.total_attempt + 1;
+                attempt = next_attempt;
             }
         })
     }
@@ -645,7 +680,10 @@ impl RetrySnapshot {
         })
     }
 
-    fn to_request(&self) -> Result<Request<RequestBody>, WireError> {
+    fn to_request(
+        &self,
+        policy_trace: PolicyTraceContext,
+    ) -> Result<Request<RequestBody>, WireError> {
         let body = self
             .body
             .as_ref()
@@ -657,6 +695,7 @@ impl RetrySnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = self.headers.clone();
+        request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
 }
@@ -676,6 +715,7 @@ impl RedirectSnapshot {
         self,
         status: StatusCode,
         next_uri: Uri,
+        policy_trace: PolicyTraceContext,
     ) -> Result<Request<RequestBody>, WireError> {
         let same_authority = same_authority(&self.uri, &next_uri);
         let should_switch_to_get = matches!(
@@ -724,6 +764,7 @@ impl RedirectSnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = headers;
+        request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
 }
