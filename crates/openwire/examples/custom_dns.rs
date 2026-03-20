@@ -1,7 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use http::Request;
-use openwire::{BoxFuture, CallContext, Client, DnsResolver, RequestBody, WireError};
+use openwire::{BoxFuture, CallContext, Client, DnsResolver, WireError};
 
 #[derive(Clone)]
 struct LoopbackResolver;
@@ -25,11 +24,7 @@ impl DnsResolver for LoopbackResolver {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().dns_resolver(LoopbackResolver).build()?;
-    let request = Request::builder()
-        .uri("http://openwire.local:8080/")
-        .body(RequestBody::empty())?;
-
-    let response = client.execute(request).await?;
+    let response = client.get("http://openwire.local:8080/").send().await?;
     println!("status = {}", response.status());
     Ok(())
 }

@@ -19,6 +19,7 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::bridge::BridgeInterceptor;
+use crate::request_builder::RequestBuilder;
 use crate::transport::{
     build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
     TransportService,
@@ -40,6 +41,9 @@ pub struct Call {
     client: Client,
     request: Request<RequestBody>,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct RequestTimeout(pub(crate) Duration);
 
 #[derive(Clone)]
 pub(crate) struct TransportConfig {
@@ -275,6 +279,20 @@ impl Client {
         ClientBuilder::new()
     }
 
+    pub fn get<U>(&self, uri: U) -> RequestBuilder
+    where
+        U: TryInto<Uri>,
+    {
+        RequestBuilder::new(self.clone(), Method::GET, uri)
+    }
+
+    pub fn post<U>(&self, uri: U) -> RequestBuilder
+    where
+        U: TryInto<Uri>,
+    {
+        RequestBuilder::new(self.clone(), Method::POST, uri)
+    }
+
     pub fn new_call(&self, request: Request<RequestBody>) -> Call {
         Call {
             client: self.clone(),
@@ -296,10 +314,17 @@ impl Client {
 
 impl Call {
     pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
+        let timeout = self
+            .request
+            .extensions()
+            .get::<RequestTimeout>()
+            .copied()
+            .map(|timeout| timeout.0)
+            .or(self.client.inner.call_timeout);
         let ctx = CallContext::from_factory(
             &self.client.inner.event_listener_factory,
             &self.request,
-            self.client.inner.call_timeout,
+            timeout,
         );
 
         let span = tracing::info_span!(

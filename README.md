@@ -23,18 +23,12 @@ This workspace uses:
 ## Current API
 
 ```rust
-use http::Request;
-use openwire::{Client, RequestBody};
+use openwire::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().build()?;
-
-    let request = Request::builder()
-        .uri("http://example.com/")
-        .body(RequestBody::empty())?;
-
-    let response = client.execute(request).await?;
+    let response = client.get("http://example.com/").send().await?;
     println!("status = {}", response.status());
     Ok(())
 }
@@ -43,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Implemented in this repository
 
 - `Client`, `ClientBuilder`, and one-shot `Call`
+- `RequestBuilder` with `client.get(url)` / `client.post(url)` entry points
 - application and network interceptors
 - event listener factory and per-call event listeners
 - built-in request normalization for `Host`, `User-Agent`, and request body framing
@@ -50,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - custom DNS resolver / TCP connector / TLS connector hooks
 - redirect handling with basic authority-sensitive header stripping
 - call timeout and connect timeout
+- per-request timeout override plus basic auth / bearer auth helpers
 - connection pooling via `hyper-util`
 - default Tokio runtime integration
 - default rustls TLS connector with platform verifier or native roots fallback
