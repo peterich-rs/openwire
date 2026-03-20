@@ -15,6 +15,10 @@ This workspace uses:
 - `crates/openwire-rustls`: default rustls TLS connector
 - `crates/openwire-test`: local test server and observability test helpers
 
+## Roadmap
+
+- Long-term planning and accepted next-stage work live in [docs/roadmap.md](docs/roadmap.md)
+
 ## Current API
 
 ```rust
