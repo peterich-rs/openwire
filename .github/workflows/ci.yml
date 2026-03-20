@@ -53,3 +53,19 @@ jobs:
 
       - name: Build workspace
         run: cargo build --workspace
+
+  gate:
+    name: CI Gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - test-and-build
+    steps:
+      - name: Verify required CI jobs passed
+        env:
+          FMT_RESULT: ${{ needs.fmt.result }}
+          TEST_AND_BUILD_RESULT: ${{ needs.test-and-build.result }}
+        run: |
+          test "$FMT_RESULT" = "success"
+          test "$TEST_AND_BUILD_RESULT" = "success"
