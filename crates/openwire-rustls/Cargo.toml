@@ -1,0 +1,29 @@
+[package]
+name = "openwire-rustls"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["platform-verifier"]
+platform-verifier = ["dep:rustls-platform-verifier"]
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+openwire-core = { path = "../openwire-core" }
+pin-project-lite.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pemfile.workspace = true
+rustls-platform-verifier = { workspace = true, optional = true }
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true

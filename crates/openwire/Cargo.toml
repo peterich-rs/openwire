@@ -1,0 +1,35 @@
+[package]
+name = "openwire"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["runtime-tokio", "tls-rustls", "platform-verifier"]
+runtime-tokio = []
+tls-rustls = ["dep:openwire-rustls"]
+platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+openwire-core = { path = "../openwire-core" }
+openwire-rustls = { path = "../openwire-rustls", optional = true, default-features = false }
+pin-project-lite.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+openwire-test = { path = "../openwire-test" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
