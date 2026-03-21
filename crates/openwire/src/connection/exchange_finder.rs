@@ -101,16 +101,11 @@ impl ExchangeFinder {
         }
 
         if let Some(existing) = self.pool.get_by_id(prepared.address(), info.id) {
-            let reused = existing.snapshot().completed_exchanges > 0;
-            if matches!(
-                existing.snapshot().allocation,
-                ConnectionAllocationState::Idle
-            ) {
-                let _ = existing.try_acquire();
-            }
+            let tracked = existing.try_acquire();
+            debug_assert!(tracked, "observed reused connection should be acquirable");
             return ObservedConnection {
                 connection: existing,
-                reused,
+                reused: true,
             };
         }
 
@@ -152,10 +147,10 @@ mod tests {
     use http::Request;
     use openwire_core::{ConnectionInfo, RequestBody};
 
-    use super::{ExchangeFinder, PreparedExchangeOutcome};
+    use super::{ExchangeFinder, PreparedExchange, PreparedExchangeOutcome};
     use crate::connection::{
-        Address, AuthorityKey, ConnectionProtocol, DnsPolicy, PoolSettings, ProtocolPolicy,
-        RealConnection, Route, UriScheme,
+        Address, AuthorityKey, ConnectionAllocationState, ConnectionProtocol, DnsPolicy,
+        PoolSettings, ProtocolPolicy, RealConnection, Route, UriScheme,
     };
 
     fn make_address() -> Address {
@@ -232,5 +227,41 @@ mod tests {
 
         assert!(observed.reused());
         assert_eq!(observed.connection().id(), connection.id());
+    }
+
+    #[test]
+    fn exchange_finder_tracks_parallel_http2_streams_on_existing_connection() {
+        let pool = Arc::new(crate::connection::ConnectionPool::new(
+            PoolSettings::default(),
+        ));
+        let route = Route::direct(
+            make_address(),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 80)),
+        );
+        let connection = RealConnection::new(route, ConnectionProtocol::Http2);
+        assert!(connection.try_acquire());
+        pool.insert(connection.clone());
+        let finder = ExchangeFinder::new(pool, Vec::new());
+
+        let prepared = PreparedExchange {
+            address: make_address(),
+            outcome: PreparedExchangeOutcome::PoolMiss,
+        };
+        let observed = finder.observe_connection(
+            &prepared,
+            &ConnectionInfo {
+                id: connection.id(),
+                remote_addr: Some(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 80))),
+                local_addr: None,
+                tls: false,
+            },
+            ConnectionProtocol::Http2,
+        );
+
+        assert!(observed.reused());
+        assert_eq!(
+            observed.connection().snapshot().allocation,
+            ConnectionAllocationState::InUse { allocations: 2 }
+        );
     }
 }

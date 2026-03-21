@@ -9,7 +9,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::instrument::WithSubscriber;
 
-use super::{ConnectFailure, ConnectFailureStage, ConnectPlan, RouteFamily, RouteKind, RoutePlan};
+use super::{
+    ConnectAttemptState, ConnectFailure, ConnectFailureStage, ConnectPlan, RouteFamily, RouteKind,
+    RoutePlan,
+};
 
 static NEXT_CONNECT_RACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -332,16 +335,22 @@ async fn cleanup_losers(
     handles: &mut [JoinHandle<()>],
     rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage>,
 ) {
+    let mut canceled_routes = vec![false; route_count];
     for (index, handle) in handles.iter_mut().enumerate() {
         if index != winner_index {
             handle.abort();
         }
     }
     for index in 0..route_count {
-        if index != winner_index && connect_plan.mark_lost(index, winner_index) {
-            ctx.listener()
-                .connect_race_lost(ctx, race_id, index, route_count, "canceled");
-        }
+        emit_canceled_loss_if_needed(
+            ctx,
+            connect_plan,
+            race_id,
+            winner_index,
+            route_count,
+            index,
+            &mut canceled_routes,
+        );
     }
     abort_all(handles).await;
 
@@ -352,16 +361,50 @@ async fn cleanup_losers(
         } = message
         {
             drop(stream);
-            if route_index != winner_index {
-                ctx.listener().connect_race_lost(
-                    ctx,
-                    race_id,
-                    route_index,
-                    route_count,
-                    "canceled",
-                );
-            }
+            emit_canceled_loss_if_needed(
+                ctx,
+                connect_plan,
+                race_id,
+                winner_index,
+                route_count,
+                route_index,
+                &mut canceled_routes,
+            );
         }
+    }
+}
+
+fn emit_canceled_loss_if_needed(
+    ctx: &CallContext,
+    connect_plan: &mut ConnectPlan,
+    race_id: u64,
+    winner_index: usize,
+    route_count: usize,
+    route_index: usize,
+    canceled_routes: &mut [bool],
+) {
+    if route_index == winner_index || canceled_routes.get(route_index).copied().unwrap_or(false) {
+        return;
+    }
+
+    let should_emit = match connect_plan
+        .attempt(route_index)
+        .map(|attempt| attempt.state())
+    {
+        Some(ConnectAttemptState::Pending | ConnectAttemptState::Running) => {
+            let _ = connect_plan.mark_lost(route_index, winner_index);
+            true
+        }
+        Some(ConnectAttemptState::Lost {
+            winner_index: current_winner,
+        }) if *current_winner == winner_index => true,
+        _ => false,
+    };
+
+    if should_emit {
+        canceled_routes[route_index] = true;
+        ctx.listener()
+            .connect_race_lost(ctx, race_id, route_index, route_count, "canceled");
     }
 }
 

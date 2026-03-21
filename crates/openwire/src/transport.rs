@@ -21,6 +21,7 @@ use openwire_core::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
@@ -238,59 +239,64 @@ impl Service<Uri> for ConnectorStack {
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
             connect_timeout,
         };
+        let span = tracing::Span::current();
 
-        Box::pin(async move {
-            let ctx = current_call_context()?;
-            let proxy = proxies.iter().find(|proxy| proxy.matches(&uri));
-            let address = current_request_address()
-                .map(Ok)
-                .unwrap_or_else(|| Address::from_uri(&uri, proxy))?;
+        Box::pin(
+            async move {
+                let ctx = current_call_context()?;
+                let proxy = proxies.iter().find(|proxy| proxy.matches(&uri));
+                let address = current_request_address()
+                    .map(Ok)
+                    .unwrap_or_else(|| Address::from_uri(&uri, proxy))?;
 
-            if let Some(proxy) = proxy {
-                if proxy.intercepts_http()
-                    && uri
-                        .scheme_str()
-                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
-                {
-                    return connect_via_http_forward_proxy(
-                        ctx,
-                        address,
-                        route_planner.clone(),
-                        proxy_connect_deps.dns_resolver.clone(),
-                        proxy_connect_deps.tcp_connector.clone(),
-                        proxy_connect_deps.connect_timeout,
-                    )
-                    .await;
+                if let Some(proxy) = proxy {
+                    if proxy.intercepts_http()
+                        && uri
+                            .scheme_str()
+                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+                    {
+                        return connect_via_http_forward_proxy(
+                            ctx,
+                            address,
+                            route_planner.clone(),
+                            proxy_connect_deps.dns_resolver.clone(),
+                            proxy_connect_deps.tcp_connector.clone(),
+                            proxy_connect_deps.connect_timeout,
+                        )
+                        .await;
+                    }
+
+                    if proxy.intercepts_https()
+                        && uri
+                            .scheme_str()
+                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                    {
+                        return connect_via_http_proxy(
+                            ctx,
+                            uri,
+                            address,
+                            route_planner,
+                            proxy_connect_deps,
+                        )
+                        .await;
+                    }
                 }
 
-                if proxy.intercepts_https()
-                    && uri
-                        .scheme_str()
-                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-                {
-                    return connect_via_http_proxy(
-                        ctx,
-                        uri,
-                        address,
-                        route_planner,
-                        proxy_connect_deps,
-                    )
-                    .await;
-                }
+                connect_direct(
+                    ctx,
+                    uri,
+                    address,
+                    route_planner,
+                    proxy_connect_deps.dns_resolver,
+                    proxy_connect_deps.tcp_connector,
+                    proxy_connect_deps.tls_connector,
+                    proxy_connect_deps.connect_timeout,
+                )
+                .await
             }
-
-            connect_direct(
-                ctx,
-                uri,
-                address,
-                route_planner,
-                proxy_connect_deps.dns_resolver,
-                proxy_connect_deps.tcp_connector,
-                proxy_connect_deps.tls_connector,
-                proxy_connect_deps.connect_timeout,
-            )
-            .await
-        })
+            .instrument(span)
+            .with_current_subscriber(),
+        )
     }
 }
 

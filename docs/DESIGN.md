@@ -310,7 +310,8 @@ Current baseline:
 - direct-route fast fallback now uses short-lived background tasks for staged
   TCP race attempts
 - Hyper/OpenWire Tokio runtime glue may spawn background connection-management
-  futures, and those futures now preserve the current tracing subscriber
+  futures, and those futures now preserve the current tracing subscriber and
+  active attempt span
 - body polling happens on the caller's task
 - current synchronization points are small:
   - atomics for global IDs and per-call connection-established flag

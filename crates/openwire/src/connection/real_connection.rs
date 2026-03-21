@@ -109,11 +109,15 @@ impl RealConnection {
 
     pub(crate) fn try_acquire(&self) -> bool {
         let mut state = self.inner.state.lock().expect("real connection lock");
-        if state.health != ConnectionHealth::Healthy || state.allocations > 0 {
+        if state.health != ConnectionHealth::Healthy {
             return false;
         }
 
-        state.allocations = 1;
+        if self.inner.protocol == ConnectionProtocol::Http1 && state.allocations > 0 {
+            return false;
+        }
+
+        state.allocations += 1;
         state.idle_since = None;
         true
     }
@@ -125,8 +129,8 @@ impl RealConnection {
         }
 
         state.allocations -= 1;
+        state.completed_exchanges += 1;
         if state.allocations == 0 {
-            state.completed_exchanges += 1;
             state.idle_since = Some(Instant::now());
         }
         true
@@ -170,7 +174,7 @@ mod tests {
     use super::{ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection};
     use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, Route, UriScheme};
 
-    fn test_connection() -> RealConnection {
+    fn test_connection(protocol: ConnectionProtocol) -> RealConnection {
         let address = Address::new(
             UriScheme::Http,
             AuthorityKey::new("example.com", 80),
@@ -183,12 +187,12 @@ mod tests {
             address,
             SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 80)),
         );
-        RealConnection::new(route, ConnectionProtocol::Http1)
+        RealConnection::new(route, protocol)
     }
 
     #[test]
     fn real_connection_transitions_between_idle_in_use_and_closed() {
-        let connection = test_connection();
+        let connection = test_connection(ConnectionProtocol::Http1);
 
         let snapshot = connection.snapshot();
         assert_eq!(snapshot.protocol, ConnectionProtocol::Http1);
@@ -218,5 +222,32 @@ mod tests {
         assert_eq!(snapshot.health, ConnectionHealth::Closed);
         assert_eq!(snapshot.allocation, ConnectionAllocationState::Closed);
         assert!(snapshot.idle_since.is_none());
+    }
+
+    #[test]
+    fn http2_connection_tracks_parallel_allocations() {
+        let connection = test_connection(ConnectionProtocol::Http2);
+
+        assert!(connection.try_acquire());
+        assert!(connection.try_acquire());
+        assert_eq!(
+            connection.snapshot().allocation,
+            ConnectionAllocationState::InUse { allocations: 2 }
+        );
+
+        assert!(connection.release());
+        let snapshot = connection.snapshot();
+        assert_eq!(
+            snapshot.allocation,
+            ConnectionAllocationState::InUse { allocations: 1 }
+        );
+        assert_eq!(snapshot.completed_exchanges, 1);
+        assert!(snapshot.idle_since.is_none());
+
+        assert!(connection.release());
+        let snapshot = connection.snapshot();
+        assert_eq!(snapshot.allocation, ConnectionAllocationState::Idle);
+        assert_eq!(snapshot.completed_exchanges, 2);
+        assert!(snapshot.idle_since.is_some());
     }
 }

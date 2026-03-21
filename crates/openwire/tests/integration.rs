@@ -1311,6 +1311,15 @@ async fn fast_fallback_continues_after_tls_failure_and_only_tlses_the_winner() {
             "connect_race_won ",
         ],
     );
+    let lost_events = events
+        .iter()
+        .filter(|event| event.starts_with("connect_race_lost "))
+        .collect::<Vec<_>>();
+    assert_eq!(lost_events.len(), 1, "events = {events:?}");
+    assert!(
+        lost_events[0].contains("reason=tls_failed"),
+        "events = {events:?}",
+    );
 }
 
 #[tokio::test]
