@@ -74,3 +74,9 @@ cargo check --workspace --all-targets
 cargo test --workspace --all-targets
 cargo bench -p openwire --bench perf_baseline -- --noplot
 ```
+
+Optional live-network smoke suite:
+
+```bash
+cargo test -p openwire --test live_network -- --ignored --test-threads=1
+```

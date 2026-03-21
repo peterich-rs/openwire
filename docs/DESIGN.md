@@ -505,7 +505,7 @@ Accepted next-step design:
 - do not add new production API surface merely to support live-network tests
 - do not change the required CI path in `.github/workflows/ci.yml`
 
-Planned layout:
+Live-suite layout:
 
 ```text
 crates/openwire/tests/
@@ -562,6 +562,17 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 
 The live suite remains outside the required CI gate and does not change the
 existing `.github/workflows/ci.yml` required path.
+
+Current live-network coverage on this branch includes:
+
+- `httpbingo` GET / POST echo smoke checks
+- `httpbingo` redirect-following and no-redirect client behavior
+- `httpbingo` cookie-jar roundtrip, delay-timeout, streaming, ETag, and basic-auth smoke checks
+- `badssl` expired, wrong-hostname, and self-signed certificate failures classified as TLS errors
+
+TLS-version-policy live checks against `tls-v1-*` `badssl` endpoints remain
+deferred to a later slice because zero-config outcomes vary with the active
+platform verifier and OS certificate / policy defaults.
 
 ## 13. Current Non-Goals
 
