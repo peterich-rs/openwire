@@ -19,6 +19,7 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::bridge::BridgeInterceptor;
+use crate::trace::PolicyTraceContext;
 use crate::transport::{
     build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
     TransportService,
@@ -39,12 +40,6 @@ struct ClientInner {
 pub struct Call {
     client: Client,
     request: Request<RequestBody>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct PolicyTraceContext {
-    pub(crate) retry_count: u32,
-    pub(crate) redirect_count: u32,
 }
 
 #[derive(Clone)]
@@ -469,7 +464,7 @@ impl Service<Exchange> for RedirectPolicyService {
                 let redirect_snapshot = RedirectSnapshot::capture(&request);
 
                 let mut svc = network.clone();
-                let mut response = tower::ServiceExt::ready(&mut svc)
+                let response = tower::ServiceExt::ready(&mut svc)
                     .await
                     .map_err(|error| WireError::internal("network chain not ready", error))?
                     .call(Exchange::new(request, ctx.clone(), attempt))
@@ -486,11 +481,11 @@ impl Service<Exchange> for RedirectPolicyService {
                 total_retries += attempt_metadata.retry_count;
 
                 if !config.follow_redirects {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 }
 
                 let Some(location) = response
@@ -498,19 +493,19 @@ impl Service<Exchange> for RedirectPolicyService {
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
                 else {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 };
 
                 if !is_redirect_status(response.status()) {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 }
 
                 if redirects as usize >= config.max_redirects {
@@ -748,14 +743,24 @@ fn same_authority(left: &Uri, right: &Uri) -> bool {
     left.scheme_str() == right.scheme_str() && left.authority() == right.authority()
 }
 
+fn response_with_attempt_metadata(
+    mut response: Response<ResponseBody>,
+    total_attempt: u32,
+    retry_count: u32,
+) -> Response<ResponseBody> {
+    response.extensions_mut().insert(AttemptMetadata {
+        total_attempt,
+        retry_count,
+    });
+    response
+}
+
 fn retry_reason(error: &WireError) -> Option<&'static str> {
     match error.kind() {
         WireErrorKind::Dns => Some("dns"),
         WireErrorKind::Connect => Some("connect"),
         WireErrorKind::Tls => Some("tls"),
-        WireErrorKind::Timeout if error.message().starts_with("connection timed out after") => {
-            Some("connect_timeout")
-        }
+        WireErrorKind::Timeout if error.is_connect_timeout() => Some("connect_timeout"),
         _ => None,
     }
 }

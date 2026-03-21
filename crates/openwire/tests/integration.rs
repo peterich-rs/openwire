@@ -324,6 +324,37 @@ async fn success_events_follow_stable_order() {
 }
 
 #[tokio::test]
+async fn dropping_response_body_without_consuming_it_does_not_emit_response_body_end() {
+    let server = spawn_http1(|_request| async move { ok_text("abandoned") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/abandoned")))
+        .await
+        .expect("response");
+    drop(response);
+
+    let events = events.events();
+    assert_event_subsequence(&events, &["call_end 200 OK", "connection_released "]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_end ")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_failed ")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
 async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
     let server = spawn_raw_http1_response(
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc".to_vec(),
@@ -637,7 +668,6 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
             "connection_acquired ",
             "response_headers_end 302 Found",
             "redirect 1 http://openwire.test:",
-            "response_body_end 0",
             "connection_released ",
             "connection_acquired ",
             "response_headers_end 200 OK",

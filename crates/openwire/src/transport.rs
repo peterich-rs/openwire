@@ -24,7 +24,7 @@ use openwire_core::{
 use tower::Service;
 use tracing::Instrument;
 
-use crate::client::PolicyTraceContext;
+use crate::trace::PolicyTraceContext;
 
 tokio::task_local! {
     static CURRENT_CALL_CONTEXT: CallContext;
@@ -99,8 +99,9 @@ impl TcpConnector for TokioTcpConnector {
                         result.map_err(|error| WireError::connect("TCP connect failed", error))?
                     }
                     Err(_error) => {
-                        let error =
-                            WireError::timeout(format!("connection timed out after {timeout:?}"));
+                        let error = WireError::connect_timeout(format!(
+                            "connection timed out after {timeout:?}"
+                        ));
                         ctx.listener().connect_failed(&ctx, addr, &error);
                         return Err(error);
                     }
@@ -448,6 +449,14 @@ impl ObservedIncomingBody {
         self.release_connection();
     }
 
+    fn finish_abandoned(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.release_connection();
+    }
+
     fn release_connection(&mut self) {
         if let Some(connection_id) = self.connection_id {
             self.ctx
@@ -459,7 +468,7 @@ impl ObservedIncomingBody {
 
 impl Drop for ObservedIncomingBody {
     fn drop(&mut self) {
-        self.finish_successfully();
+        self.finish_abandoned();
     }
 }
 
@@ -526,7 +535,7 @@ fn current_call_context() -> Result<CallContext, WireError> {
         .map_err(|error| {
             WireError::internal(
                 "call context unavailable inside connector stack",
-                io::Error::new(io::ErrorKind::Other, error.to_string()),
+                io::Error::other(error.to_string()),
             )
         })
 }
