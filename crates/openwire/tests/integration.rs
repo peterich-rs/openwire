@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use hyper::body::Incoming;
 use openwire::{
     AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, Exchange, Interceptor,
     Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody, RustlsTlsConnector, TcpConnector,
-    TokioTcpConnector, Url, WireError, WireErrorKind,
+    TlsConnector, TokioTcpConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_test::{
@@ -23,6 +24,7 @@ use openwire_test::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
 use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
 use tracing_subscriber::prelude::*;
@@ -1051,21 +1053,22 @@ async fn shared_client_reuses_connection_pool_across_calls() {
 async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
     let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
     let trace = TraceCapture::default();
-    let subscriber = tracing_subscriber::registry().with(trace.clone());
-    let _guard = tracing::subscriber::set_default(subscriber);
     let client = Client::builder().build().expect("client");
 
-    let response = client
-        .execute(empty_request(server.http_url("/first")))
-        .await
-        .expect("response");
-    let _ = response.into_body().text().await.expect("body");
+    with_trace_capture(&trace, async {
+        let response = client
+            .execute(empty_request(server.http_url("/first")))
+            .await
+            .expect("response");
+        let _ = response.into_body().text().await.expect("body");
 
-    let response = client
-        .execute(empty_request(server.http_url("/second")))
-        .await
-        .expect("response");
-    let _ = response.into_body().text().await.expect("body");
+        let response = client
+            .execute(empty_request(server.http_url("/second")))
+            .await
+            .expect("response");
+        let _ = response.into_body().text().await.expect("body");
+    })
+    .await;
 
     let spans = trace.spans_named("openwire.attempt");
     assert_eq!(spans.len(), 2, "spans = {spans:?}");
@@ -1105,6 +1108,208 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
         spans[0].fields.get("connection_id"),
         spans[1].fields.get("connection_id"),
         "spans = {spans:?}",
+    );
+}
+
+#[tokio::test]
+async fn fast_fallback_dual_stack_routes_emit_observability_and_reduce_latency() {
+    let server = spawn_http1(|_request| async move { ok_text("dual-stack race") }).await;
+    let fake_ipv6 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0], 9001));
+    let fake_ipv4 = SocketAddr::from(([192, 0, 2, 20], 9002));
+    let resolver =
+        MultiAddrResolver::new([("openwire.test".to_owned(), vec![fake_ipv6, fake_ipv4])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_ipv6,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::from_millis(600),
+            },
+        ),
+        (
+            fake_ipv4,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::from_millis(10),
+            },
+        ),
+    ]);
+    let events = RecordingEventListenerFactory::default();
+    let trace = TraceCapture::default();
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let (body, elapsed) = with_trace_capture(&trace, async {
+        let start = std::time::Instant::now();
+        let response = client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/race",
+                server.addr().port()
+            )))
+            .await
+            .expect("response");
+        let body = response.into_body().text().await.expect("body");
+        (body, start.elapsed())
+    })
+    .await;
+
+    assert_eq!(body, "dual-stack race");
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "elapsed = {elapsed:?} should be faster than sequential fallback",
+    );
+    assert_eq!(connector.attempts(), 2);
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "route_plan 2 fast_fallback=true",
+            "connect_race_start ",
+            "connect_race_start ",
+            "connect_race_won ",
+            "connect_race_lost ",
+        ],
+    );
+
+    let planned = trace
+        .event_by_message("planned direct connect routes")
+        .expect("planned route trace event");
+    assert_eq!(
+        planned.fields.get("route_count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        planned
+            .fields
+            .get("fast_fallback_enabled")
+            .map(String::as_str),
+        Some("true")
+    );
+    let planned_race_id = planned
+        .fields
+        .get("connect_race_id")
+        .cloned()
+        .expect("planned route trace race id");
+
+    let winner = trace
+        .event_by_message("fast fallback connect attempt won")
+        .expect("winner trace event");
+    assert_eq!(
+        winner.fields.get("route_index").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(winner.fields.get("connect_race_id"), Some(&planned_race_id),);
+}
+
+#[tokio::test]
+async fn fast_fallback_single_stack_multi_ip_routes_do_not_wait_for_first_ipv6() {
+    let server = spawn_http1(|_request| async move { ok_text("single-stack race") }).await;
+    let fake_aaaa_1 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1], 9101));
+    let fake_aaaa_2 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2], 9102));
+    let resolver =
+        MultiAddrResolver::new([("openwire.test".to_owned(), vec![fake_aaaa_1, fake_aaaa_2])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_aaaa_1,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::from_millis(600),
+            },
+        ),
+        (
+            fake_aaaa_2,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::from_millis(10),
+            },
+        ),
+    ]);
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .build()
+        .expect("client");
+
+    let start = std::time::Instant::now();
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/race-v6",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    let elapsed = start.elapsed();
+
+    assert_eq!(body, "single-stack race");
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "elapsed = {elapsed:?} should be faster than sequential fallback",
+    );
+    assert_eq!(connector.attempts(), 2);
+}
+
+#[tokio::test]
+async fn fast_fallback_continues_after_tls_failure_and_only_tlses_the_winner() {
+    let server = spawn_http1(|_request| async move { ok_text("tls fallback") }).await;
+    let fake_1 = SocketAddr::from(([192, 0, 2, 31], 9201));
+    let fake_2 = SocketAddr::from(([192, 0, 2, 32], 9202));
+    let resolver = MultiAddrResolver::new([("openwire.test".to_owned(), vec![fake_1, fake_2])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_1,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::ZERO,
+            },
+        ),
+        (
+            fake_2,
+            TcpAttemptScript {
+                actual_addr: server.addr(),
+                delay: Duration::from_millis(10),
+            },
+        ),
+    ]);
+    let tls = ScriptedPassThroughTlsConnector::new(vec![
+        TlsAttemptScript::Fail(Duration::from_millis(5)),
+        TlsAttemptScript::Pass(Duration::from_millis(1)),
+    ]);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .tls_connector(tls.clone())
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://openwire.test:{}/race-tls",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "tls fallback");
+    assert_eq!(connector.attempts(), 2);
+    assert_eq!(tls.calls(), 2);
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "route_plan 2 fast_fallback=true",
+            "connect_race_lost ",
+            "connect_race_won ",
+        ],
     );
 }
 
@@ -1231,8 +1436,6 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
     .await;
     let events = RecordingEventListenerFactory::default();
     let trace = TraceCapture::default();
-    let subscriber = tracing_subscriber::registry().with(trace.clone());
-    let _guard = tracing::subscriber::set_default(subscriber);
 
     let client = Client::builder()
         .dns_resolver(StaticDnsResolver::new(server.addr()))
@@ -1240,20 +1443,23 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
         .build()
         .expect("client");
 
-    let response = client
-        .execute(empty_request(format!(
-            "http://openwire.test:{}/broken",
-            server.addr().port()
-        )))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let error = with_trace_capture(&trace, async {
+        let response = client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/broken",
+                server.addr().port()
+            )))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
 
-    let error = response
-        .into_body()
-        .text()
-        .await
-        .expect_err("body should fail");
+        response
+            .into_body()
+            .text()
+            .await
+            .expect_err("body should fail")
+    })
+    .await;
     assert_eq!(error.kind(), WireErrorKind::Protocol);
 
     let events = events.events();
@@ -1506,8 +1712,6 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
     let connector = FailingTcpConnector::new(1);
     let events = RecordingEventListenerFactory::default();
     let trace = TraceCapture::default();
-    let subscriber = tracing_subscriber::registry().with(trace.clone());
-    let _guard = tracing::subscriber::set_default(subscriber);
 
     let client = Client::builder()
         .dns_resolver(StaticDnsResolver::new(server.addr()))
@@ -1517,14 +1721,17 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
         .build()
         .expect("client");
 
-    let response = client
-        .execute(empty_request(format!(
-            "http://openwire.test:{}/redirect-after-retry",
-            server.addr().port()
-        )))
-        .await
-        .expect("response");
-    let _ = response.into_body().text().await.expect("body");
+    with_trace_capture(&trace, async {
+        let response = client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/redirect-after-retry",
+                server.addr().port()
+            )))
+            .await
+            .expect("response");
+        let _ = response.into_body().text().await.expect("body");
+    })
+    .await;
 
     let events = events.events();
     assert_event_subsequence(
@@ -2226,6 +2433,148 @@ impl TcpConnector for FailingTcpConnector {
 }
 
 #[derive(Clone)]
+struct ScriptedRaceTcpConnector {
+    scripts: Arc<HashMap<SocketAddr, TcpAttemptScript>>,
+    attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+struct TcpAttemptScript {
+    actual_addr: SocketAddr,
+    delay: Duration,
+}
+
+impl ScriptedRaceTcpConnector {
+    fn new(entries: impl IntoIterator<Item = (SocketAddr, TcpAttemptScript)>) -> Self {
+        Self {
+            scripts: Arc::new(entries.into_iter().collect()),
+            attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::Relaxed)
+    }
+}
+
+impl TcpConnector for ScriptedRaceTcpConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        addr: SocketAddr,
+        timeout: Option<std::time::Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let script = self
+            .scripts
+            .get(&addr)
+            .copied()
+            .expect("missing tcp script");
+        let attempts = self.attempts.clone();
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(script.delay).await;
+            TokioTcpConnector
+                .connect(ctx, script.actual_addr, timeout)
+                .await
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MultiAddrResolver {
+    map: Arc<HashMap<String, Vec<SocketAddr>>>,
+}
+
+impl MultiAddrResolver {
+    fn new(entries: impl IntoIterator<Item = (String, Vec<SocketAddr>)>) -> Self {
+        Self {
+            map: Arc::new(entries.into_iter().collect()),
+        }
+    }
+}
+
+impl DnsResolver for MultiAddrResolver {
+    fn resolve(
+        &self,
+        ctx: CallContext,
+        host: String,
+        port: u16,
+    ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
+        let map = self.map.clone();
+        Box::pin(async move {
+            ctx.listener().dns_start(&ctx, &host, port);
+            let addrs = map.get(&host).cloned().ok_or_else(|| {
+                WireError::dns(
+                    "host not found in resolver map",
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "missing host"),
+                )
+            })?;
+            ctx.listener().dns_end(&ctx, &host, &addrs);
+            Ok(addrs)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedPassThroughTlsConnector {
+    scripts: Arc<Mutex<Vec<TlsAttemptScript>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum TlsAttemptScript {
+    Pass(Duration),
+    Fail(Duration),
+}
+
+impl ScriptedPassThroughTlsConnector {
+    fn new(scripts: Vec<TlsAttemptScript>) -> Self {
+        Self {
+            scripts: Arc::new(Mutex::new(scripts)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl TlsConnector for ScriptedPassThroughTlsConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        uri: hyper::Uri,
+        stream: BoxConnection,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let host = uri.host().unwrap_or("openwire.test").to_owned();
+        let scripts = self.scripts.clone();
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let script = scripts.lock().expect("tls scripts").remove(0);
+            ctx.listener().tls_start(&ctx, &host);
+            match script {
+                TlsAttemptScript::Pass(delay) => {
+                    tokio::time::sleep(delay).await;
+                    ctx.listener().tls_end(&ctx, &host);
+                    Ok(stream)
+                }
+                TlsAttemptScript::Fail(delay) => {
+                    tokio::time::sleep(delay).await;
+                    let error = WireError::tls(
+                        "scripted tls failure",
+                        io::Error::new(io::ErrorKind::ConnectionAborted, "scripted tls failure"),
+                    );
+                    ctx.listener().tls_failed(&ctx, &host, &error);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
 struct HostMapResolver {
     map: Arc<HashMap<String, SocketAddr>>,
 }
@@ -2770,6 +3119,16 @@ impl TraceCapture {
             })
             .cloned()
     }
+}
+
+async fn with_trace_capture<F, T>(trace: &TraceCapture, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let subscriber = tracing_subscriber::registry().with(trace.clone());
+    future
+        .with_subscriber(tracing::Dispatch::new(subscriber))
+        .await
 }
 
 impl<S> Layer<S> for TraceCapture

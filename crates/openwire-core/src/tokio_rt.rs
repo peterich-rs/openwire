@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use hyper::rt::{Executor, Sleep, Timer};
 use pin_project_lite::pin_project;
+use tracing::instrument::WithSubscriber;
 
 use crate::{BoxFuture, Runtime, WireError};
 
@@ -13,7 +14,7 @@ pub struct TokioRuntime;
 
 impl Runtime for TokioRuntime {
     fn spawn(&self, future: BoxFuture<()>) -> Result<(), WireError> {
-        tokio::spawn(future);
+        tokio::spawn(future.with_current_subscriber());
         Ok(())
     }
 
@@ -38,7 +39,7 @@ where
     Fut::Output: Send + 'static,
 {
     fn execute(&self, future: Fut) {
-        tokio::spawn(future);
+        tokio::spawn(future.with_current_subscriber());
     }
 }
 

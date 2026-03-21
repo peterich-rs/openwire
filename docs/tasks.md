@@ -122,13 +122,13 @@ direct routes.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P6-001 | `TODO` | Add `FastFallbackDialer` over `RoutePlan` | P2-004 | Supports queued/staggered attempts and explicit winner/loser states |
-| P6-002 | `TODO` | Implement staggered TCP racing for dual-stack routes | P6-001 | Integration tests prove reduced sequential-fallback behavior |
-| P6-003 | `TODO` | Implement staggered TCP racing for single-stack multi-IP routes | P6-001 | Integration tests cover multiple A and multiple AAAA scenarios |
-| P6-004 | `TODO` | Ensure only the winning TCP connection enters TLS | P6-001 | Loser sockets are canceled before TLS starts |
-| P6-005 | `TODO` | Continue remaining route candidates if the TCP winner later fails in TLS or protocol binding | P6-004 | Tests cover TLS failure after TCP success |
-| P6-006 | `TODO` | Add cleanup for loser attempts, including completed sockets and aborted handshakes | P6-001 | No resource leaks in race tests |
-| P6-007 | `TODO` | Add observability for route count, route index, connect race ID, and winner/loser events | P6-001 | Tracing and event tests cover fast-fallback fields |
+| P6-001 | `DONE` | Add `FastFallbackDialer` over `RoutePlan` | P2-004 | Supports queued/staggered attempts and explicit winner/loser states |
+| P6-002 | `DONE` | Implement staggered TCP racing for dual-stack routes | P6-001 | Integration tests prove reduced sequential-fallback behavior |
+| P6-003 | `DONE` | Implement staggered TCP racing for single-stack multi-IP routes | P6-001 | Integration tests cover multiple A and multiple AAAA scenarios |
+| P6-004 | `DONE` | Ensure only the winning TCP connection enters TLS | P6-001 | Loser sockets are canceled before TLS starts |
+| P6-005 | `DONE` | Continue remaining route candidates if the TCP winner later fails in TLS or protocol binding | P6-004 | Tests cover TLS failure after TCP success |
+| P6-006 | `DONE` | Add cleanup for loser attempts, including completed sockets and aborted handshakes | P6-001 | No resource leaks in race tests |
+| P6-007 | `DONE` | Add observability for route count, route index, connect race ID, and winner/loser events | P6-001 | Tracing and event tests cover fast-fallback fields |
 
 ## Phase 7: Direct Protocol Binding
 
@@ -231,12 +231,13 @@ These items remain intentionally outside the near-term execution path.
 If execution starts now, the next contiguous slice should be:
 
 1. `P5-005`
-2. `P6-001` through `P6-007`
-3. `P7-001` through `P7-005`
+2. `P7-001` through `P7-005`
+3. `P8-001` through `P8-004`
 
 Rationale:
 
-- acquisition now uses `Address` + pool + planner, but still relies on
-  temporary task-local propagation into the legacy connector path
-- fast fallback is the next missing behavior on the owned acquisition path
-- direct protocol binding should follow once the route-race semantics are in place
+- the remaining acquisition gap is removing temporary task-local propagation
+- direct-route fast fallback is landed, so the next missing ownership slice is
+  direct protocol binding
+- HTTP/1.1 busy/idle pool semantics should follow once requests can execute on
+  owned connections

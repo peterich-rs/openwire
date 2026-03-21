@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -28,7 +27,9 @@ use crate::auth::{
     AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
     SharedAuthenticator,
 };
-use crate::connection::{Address, ConnectionProtocol, ExchangeFinder, RouteKind, RoutePlanner};
+use crate::connection::{
+    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, RouteKind, RoutePlanner,
+};
 use crate::proxy::Proxy;
 use crate::trace::PolicyTraceContext;
 
@@ -303,48 +304,26 @@ async fn connect_direct(
     tls_connector: Option<Arc<dyn TlsConnector>>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
     let host = address.authority().host().to_owned();
     let port = address.authority().port();
     let addrs = dns_resolver.resolve(ctx.clone(), host, port).await?;
     let route_plan = route_planner.plan_direct(address, addrs);
-    let mut last_error = None;
-
-    for route in route_plan.iter().cloned() {
-        let &RouteKind::Direct { target: addr } = route.kind() else {
-            continue;
-        };
-        match tcp_connector
-            .connect(ctx.clone(), addr, connect_timeout)
-            .await
-        {
-            Ok(stream) => {
-                if scheme.eq_ignore_ascii_case("https") {
-                    let tls_connector = tls_connector.clone().ok_or_else(|| {
-                        WireError::tls(
-                            "HTTPS requested but no TLS connector is configured",
-                            io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
-                        )
-                    })?;
-                    return tls_connector.connect(ctx.clone(), uri, stream).await;
-                }
-                return Ok(stream);
-            }
-            Err(error) => {
-                ctx.listener().connect_failed(&ctx, addr, &error);
-                last_error = Some(error);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no address connected"),
+    let (stream, outcome) = FastFallbackDialer
+        .dial_direct(
+            ctx.clone(),
+            uri,
+            route_plan,
+            tcp_connector,
+            tls_connector,
+            connect_timeout,
         )
-    }))
+        .await?;
+    let span = tracing::Span::current();
+    span.record("route_count", outcome.route_count as u64);
+    span.record("fast_fallback_enabled", outcome.fast_fallback_enabled);
+    span.record("connect_race_id", outcome.race_id);
+    span.record("connect_winner", outcome.winner_index as u64);
+    Ok(stream)
 }
 
 async fn connect_via_http_forward_proxy(
@@ -946,6 +925,10 @@ fn attempt_span(
         auth_count = policy_trace.auth_count,
         method = %request.method(),
         uri = %request.uri(),
+        route_count = tracing::field::Empty,
+        fast_fallback_enabled = tracing::field::Empty,
+        connect_race_id = tracing::field::Empty,
+        connect_winner = tracing::field::Empty,
         connection_id = tracing::field::Empty,
         connection_reused = tracing::field::Empty,
     )
@@ -1141,14 +1124,14 @@ fn current_call_context() -> Result<CallContext, WireError> {
 
 pub(crate) async fn with_call_context<F, T>(ctx: CallContext, future: F) -> T
 where
-    F: Future<Output = T>,
+    F: std::future::Future<Output = T>,
 {
     CURRENT_CALL_CONTEXT.scope(ctx, future).await
 }
 
 async fn with_request_address<F, T>(address: Address, future: F) -> T
 where
-    F: Future<Output = T>,
+    F: std::future::Future<Output = T>,
 {
     CURRENT_REQUEST_ADDRESS.scope(address, future).await
 }

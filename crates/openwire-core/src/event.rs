@@ -39,6 +39,37 @@ pub trait EventListener: Send + Sync + 'static {
 
     fn connection_released(&self, _ctx: &CallContext, _connection_id: ConnectionId) {}
 
+    fn route_plan(&self, _ctx: &CallContext, _route_count: usize, _fast_fallback_enabled: bool) {}
+
+    fn connect_race_start(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+        _route_family: &str,
+    ) {
+    }
+
+    fn connect_race_won(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+    ) {
+    }
+
+    fn connect_race_lost(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+        _reason: &str,
+    ) {
+    }
+
     fn retry(&self, _ctx: &CallContext, _attempt: u32, _reason: &str) {}
     fn redirect(&self, _ctx: &CallContext, _attempt: u32, _location: &Uri) {}
 }

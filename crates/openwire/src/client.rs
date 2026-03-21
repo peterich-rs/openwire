@@ -10,6 +10,7 @@ use openwire_core::{
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
 use tower::Service;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{Authenticator, SharedAuthenticator};
@@ -395,6 +396,7 @@ impl Call {
             }
         }
         .instrument(span)
+        .with_current_subscriber()
         .await
     }
 }

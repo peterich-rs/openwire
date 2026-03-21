@@ -122,7 +122,10 @@ User API
                       -> RoutePlanner
                       -> proxy-aware route construction
                       -> dns
-                      -> tcp (sequential RoutePlan dial)
+                      -> FastFallbackDialer (direct routes only)
+                        -> staggered TCP race
+                        -> winner TLS
+                      -> tcp (sequential RoutePlan dial for proxy routes)
                       -> tls
                   -> hyper request execution
                 -> observe actual connection into ConnectionPool
@@ -286,6 +289,8 @@ Important baseline details to preserve during migration:
 - exact-address derivation and pool lookup now happen in `TransportService` via `ExchangeFinder`
 - the miss path now builds proxy-aware routes through `RoutePlanner`, but the
   full proxy policy boundary still partly lives in `ConnectorStack`
+- direct-route cold connects now run through `FastFallbackDialer`; proxy routes
+  still dial sequentially
 - `tokio::task_local!` currently exists only because `hyper_util::client::legacy::Client` does not expose OpenWire-owned context flow
 - response-body lifecycle currently drives connection release bookkeeping
 - the initial `hyper-util` migration boundary is explicit:
@@ -301,8 +306,11 @@ Important baseline details to preserve during migration:
 
 Current baseline:
 
-- all request work runs on the caller's Tokio task
-- no implicit background tasks in the current runtime path
+- request policy/interceptor work still starts on the caller's Tokio task
+- direct-route fast fallback now uses short-lived background tasks for staged
+  TCP race attempts
+- Hyper/OpenWire Tokio runtime glue may spawn background connection-management
+  futures, and those futures now preserve the current tracing subscriber
 - body polling happens on the caller's task
 - current synchronization points are small:
   - atomics for global IDs and per-call connection-established flag
@@ -324,12 +332,14 @@ Current hot-path observations:
 
 - warm pooled requests are already benchmarked locally for HTTP/1.1 and HTTPS HTTP/2
 - current cold-connect path now derives `Address` and ordered `RoutePlan`
-  metadata before dialing, but still executes route attempts sequentially
+  metadata before dialing
+- direct routes use staggered fast fallback; proxy routes still execute route
+  attempts sequentially
 - current per-request service execution still clones boxed service layers
 
 Optimization priority order:
 
-1. replace sequential multi-address connect with fast fallback
+1. extend fast fallback beyond the current direct-route slice
 2. remove temporary task-local propagation from the acquisition path
 3. avoid avoidable cold-connect cloning
 4. preserve low-overhead observability on warm paths

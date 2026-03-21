@@ -185,6 +185,50 @@ impl EventListener for RecordingEventListener {
         self.push(format!("connection_released {}", connection_id.as_u64()));
     }
 
+    fn route_plan(&self, _ctx: &CallContext, route_count: usize, fast_fallback_enabled: bool) {
+        self.push(format!(
+            "route_plan {route_count} fast_fallback={fast_fallback_enabled}"
+        ));
+    }
+
+    fn connect_race_start(
+        &self,
+        _ctx: &CallContext,
+        race_id: u64,
+        route_index: usize,
+        route_count: usize,
+        route_family: &str,
+    ) {
+        self.push(format!(
+            "connect_race_start {race_id} route={route_index}/{route_count} family={route_family}"
+        ));
+    }
+
+    fn connect_race_won(
+        &self,
+        _ctx: &CallContext,
+        race_id: u64,
+        route_index: usize,
+        route_count: usize,
+    ) {
+        self.push(format!(
+            "connect_race_won {race_id} route={route_index}/{route_count}"
+        ));
+    }
+
+    fn connect_race_lost(
+        &self,
+        _ctx: &CallContext,
+        race_id: u64,
+        route_index: usize,
+        route_count: usize,
+        reason: &str,
+    ) {
+        self.push(format!(
+            "connect_race_lost {race_id} route={route_index}/{route_count} reason={reason}"
+        ));
+    }
+
     fn retry(&self, _ctx: &CallContext, attempt: u32, reason: &str) {
         self.push(format!("retry {attempt} {reason}"));
     }

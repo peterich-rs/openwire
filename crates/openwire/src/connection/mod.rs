@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod exchange_finder;
+mod fast_fallback;
 mod planning;
 mod pool;
 mod real_connection;
@@ -8,6 +9,7 @@ mod real_connection;
 pub(crate) use exchange_finder::{
     ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
 };
+pub(crate) use fast_fallback::{FastFallbackDialer, FastFallbackOutcome};
 pub(crate) use planning::{
     Address, AuthorityKey, ConnectAttempt, ConnectAttemptState, ConnectFailure,
     ConnectFailureStage, ConnectPlan, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig,
