@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream;
-use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING, USER_AGENT};
+use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use openwire::{
-    BoxFuture, CallContext, Client, DnsResolver, Exchange, Interceptor, Next, RequestBody,
-    ResponseBody, RustlsTlsConnector, TcpConnector, TokioTcpConnector, WireError, WireErrorKind,
+    AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, Exchange, Interceptor,
+    Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody, RustlsTlsConnector, TcpConnector,
+    TokioTcpConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_test::{
@@ -19,7 +21,7 @@ use openwire_test::{
     StaticDnsResolver,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
@@ -85,6 +87,865 @@ async fn follows_redirects_for_get_requests() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "redirect complete");
+}
+
+#[tokio::test]
+async fn authenticator_retries_replayable_requests_on_401() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let auth = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if auth == Some("Bearer good") {
+            ok_text("authorized")
+        } else {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"openwire\"")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("unauthorized response")
+        }
+    })
+    .await;
+
+    let authenticator = StaticAuthorizationAuthenticator::new("Bearer good");
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/auth",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    assert_eq!(authenticator.calls(), 1);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "authorized");
+}
+
+#[tokio::test]
+async fn https_requests_can_tunnel_through_http_proxy() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxied tls ok") }).await;
+    let proxy = spawn_connect_proxy().await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!("https://localhost:{}/secure", server.addr().port()))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied tls ok");
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .any(|request| request.starts_with(&format!(
+                "CONNECT localhost:{} HTTP/1.1",
+                server.addr().port()
+            ))),
+        "requests = {:?}",
+        proxy.requests(),
+    );
+}
+
+#[tokio::test]
+async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxied tls auth ok") }).await;
+    let proxy = spawn_connect_proxy_requiring_authorization(
+        "Proxy-Authorization",
+        "Basic cHJveHk6c2VjcmV0",
+    )
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let authenticator =
+        StaticHeaderAuthenticator::new("proxy-authorization", "Basic cHJveHk6c2VjcmV0");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://localhost:{}/secure-auth",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied tls auth ok");
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(
+        authenticator.observed_kinds(),
+        vec![openwire::AuthKind::Proxy]
+    );
+
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 2, "requests = {requests:?}");
+    assert!(
+        requests[0].starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            server.addr().port()
+        )),
+        "requests = {requests:?}",
+    );
+    assert!(
+        !requests[0].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}",
+    );
+    assert!(
+        requests[1].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn declining_proxy_authenticator_fails_connect_tunnel_on_407() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxied tls auth ok") }).await;
+    let proxy = spawn_connect_proxy_requiring_authorization(
+        "Proxy-Authorization",
+        "Basic cHJveHk6c2VjcmV0",
+    )
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let authenticator = DecliningAuthenticator::default();
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://localhost:{}/secure-auth",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("connect auth should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(proxy.requests().len(), 1);
+    assert!(
+        error
+            .to_string()
+            .contains("407 Proxy Authentication Required"),
+        "error = {error:?}",
+    );
+}
+
+#[tokio::test]
+async fn connect_proxy_auth_attempts_are_limited() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxied tls auth ok") }).await;
+    let proxy = spawn_connect_proxy_requiring_authorization(
+        "Proxy-Authorization",
+        "Basic cHJveHk6c2VjcmV0",
+    )
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let authenticator = StaticHeaderAuthenticator::new("proxy-authorization", "Basic wrong");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .max_auth_attempts(1)
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://localhost:{}/secure-auth",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("connect auth should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(proxy.requests().len(), 2);
+    assert!(
+        error
+            .to_string()
+            .contains("407 Proxy Authentication Required"),
+        "error = {error:?}",
+    );
+}
+
+#[tokio::test]
+async fn connect_timeout_applies_to_proxy_connect_response_reads() {
+    let proxy = spawn_stalling_connect_proxy().await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .connect_timeout(Duration::from_millis(25))
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("https://localhost:443/slow-connect")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("proxy CONNECT read should time out");
+    assert_eq!(error.kind(), WireErrorKind::Timeout);
+    assert!(error.is_connect_timeout(), "error = {error:?}");
+}
+
+#[tokio::test]
+async fn http_requests_can_route_through_http_proxy_without_origin_dns() {
+    let proxy = spawn_plain_http_proxy_response("proxied http ok").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/resource?x=1")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied http ok");
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .any(|request| request
+                .starts_with("GET http://does-not-resolve.test/resource?x=1 HTTP/1.1")),
+        "requests = {:?}",
+        proxy.requests(),
+    );
+}
+
+#[tokio::test]
+async fn no_proxy_exact_host_bypasses_proxy() {
+    let server = spawn_http1(|_request| async move { ok_text("direct exact") }).await;
+    let proxy = spawn_plain_http_proxy_response("proxied http ok").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy.test".to_owned(), proxy.addr()),
+            ("direct.test".to_owned(), server.addr()),
+        ]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config")
+                .no_proxy(NoProxy::new().host("direct.test")),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://direct.test:{}/resource",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "direct exact");
+    assert!(
+        proxy.requests().is_empty(),
+        "requests = {:?}",
+        proxy.requests()
+    );
+}
+
+#[tokio::test]
+async fn no_proxy_domain_suffix_bypasses_proxy() {
+    let server = spawn_http1(|_request| async move { ok_text("direct suffix") }).await;
+    let proxy = spawn_plain_http_proxy_response("proxied http ok").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy.test".to_owned(), proxy.addr()),
+            ("api.internal.test".to_owned(), server.addr()),
+        ]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config")
+                .no_proxy(NoProxy::new().domain("internal.test")),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://api.internal.test:{}/resource",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "direct suffix");
+    assert!(
+        proxy.requests().is_empty(),
+        "requests = {:?}",
+        proxy.requests()
+    );
+}
+
+#[tokio::test]
+async fn no_proxy_localhost_bypasses_proxy() {
+    let server = spawn_http1(|_request| async move { ok_text("direct loopback") }).await;
+    let proxy = spawn_plain_http_proxy_response("proxied http ok").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy.test".to_owned(), proxy.addr()),
+            ("127.0.0.1".to_owned(), server.addr()),
+        ]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config")
+                .no_proxy(NoProxy::new().localhost()),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(server.http_url("/loopback"))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "direct loopback");
+    assert!(
+        proxy.requests().is_empty(),
+        "requests = {:?}",
+        proxy.requests()
+    );
+}
+
+#[tokio::test]
+async fn system_http_proxy_from_env_is_applied() {
+    let _guard = environment_lock().lock().await;
+    let proxy = spawn_plain_http_proxy_response("env proxy").await;
+    let _env = ScopedEnv::set([
+        (
+            "http_proxy",
+            format!("http://127.0.0.1:{}", proxy.addr().port()),
+        ),
+        ("HTTP_PROXY", String::new()),
+        ("https_proxy", String::new()),
+        ("HTTPS_PROXY", String::new()),
+        ("all_proxy", String::new()),
+        ("ALL_PROXY", String::new()),
+        ("no_proxy", String::new()),
+        ("NO_PROXY", String::new()),
+    ]);
+
+    let client = Client::builder()
+        .use_system_proxy(true)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/from-env")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "env proxy");
+    assert_eq!(proxy.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn system_no_proxy_from_env_bypasses_proxy() {
+    let _guard = environment_lock().lock().await;
+    let server = spawn_http1(|_request| async move { ok_text("env direct") }).await;
+    let proxy = spawn_plain_http_proxy_response("env proxy").await;
+    let _env = ScopedEnv::set([
+        (
+            "http_proxy",
+            format!("http://proxy.test:{}", proxy.addr().port()),
+        ),
+        ("HTTP_PROXY", String::new()),
+        ("https_proxy", String::new()),
+        ("HTTPS_PROXY", String::new()),
+        ("all_proxy", String::new()),
+        ("ALL_PROXY", String::new()),
+        ("no_proxy", "example.internal".to_owned()),
+        ("NO_PROXY", String::new()),
+    ]);
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy.test".to_owned(), proxy.addr()),
+            ("api.example.internal".to_owned(), server.addr()),
+        ]))
+        .use_system_proxy(true)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://api.example.internal:{}/env-no-proxy",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "env direct");
+    assert!(proxy.requests().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_proxy_rules_take_priority_over_system_proxy() {
+    let _guard = environment_lock().lock().await;
+    let explicit_proxy = spawn_plain_http_proxy_response("explicit").await;
+    let env_proxy = spawn_plain_http_proxy_response("env").await;
+    let _env = ScopedEnv::set([
+        (
+            "http_proxy",
+            format!("http://env-proxy.test:{}", env_proxy.addr().port()),
+        ),
+        ("HTTP_PROXY", String::new()),
+        ("https_proxy", String::new()),
+        ("HTTPS_PROXY", String::new()),
+        ("all_proxy", String::new()),
+        ("ALL_PROXY", String::new()),
+        ("no_proxy", String::new()),
+        ("NO_PROXY", String::new()),
+    ]);
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("explicit-proxy.test".to_owned(), explicit_proxy.addr()),
+            ("env-proxy.test".to_owned(), env_proxy.addr()),
+        ]))
+        .proxy(
+            Proxy::http(format!(
+                "http://explicit-proxy.test:{}",
+                explicit_proxy.addr().port()
+            ))
+            .expect("explicit proxy"),
+        )
+        .use_system_proxy(true)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/priority")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "explicit");
+    assert_eq!(explicit_proxy.requests().len(), 1);
+    assert!(env_proxy.requests().is_empty());
+}
+
+#[tokio::test]
+async fn proxy_rules_use_first_matching_entry() {
+    let first_proxy = spawn_plain_http_proxy_response("proxy one").await;
+    let second_proxy = spawn_plain_http_proxy_response("proxy two").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy-one.test".to_owned(), first_proxy.addr()),
+            ("proxy-two.test".to_owned(), second_proxy.addr()),
+        ]))
+        .proxy(
+            Proxy::http(format!(
+                "http://proxy-one.test:{}",
+                first_proxy.addr().port()
+            ))
+            .expect("proxy one"),
+        )
+        .proxy(
+            Proxy::all(format!(
+                "http://proxy-two.test:{}",
+                second_proxy.addr().port()
+            ))
+            .expect("proxy two"),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/ordered")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxy one");
+    assert_eq!(first_proxy.requests().len(), 1);
+    assert!(second_proxy.requests().is_empty());
+}
+
+#[tokio::test]
+async fn http_proxy_can_retry_requests_after_407_with_proxy_authenticator() {
+    let proxy =
+        spawn_proxy_requiring_authorization("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0").await;
+    let authenticator =
+        StaticHeaderAuthenticator::new("proxy-authorization", "Basic cHJveHk6c2VjcmV0");
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/proxy-auth")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxy authorized");
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(
+        authenticator.observed_kinds(),
+        vec![openwire::AuthKind::Proxy]
+    );
+}
+
+#[tokio::test]
+async fn declining_proxy_authenticator_returns_407_response() {
+    let proxy =
+        spawn_proxy_requiring_authorization("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0").await;
+    let authenticator = DecliningAuthenticator::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://does-not-resolve.test/proxy-auth-decline")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+}
+
+#[tokio::test]
+async fn proxy_connect_failures_return_connect_errors() {
+    let proxy = spawn_rejecting_connect_proxy().await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("https://localhost:443/secure")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("proxy should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+}
+
+#[tokio::test]
+async fn cookie_jar_sends_preloaded_cookies() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let cookie = request
+            .headers()
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none")
+            .to_owned();
+        ok_text(cookie)
+    })
+    .await;
+
+    let jar = Jar::default();
+    jar.add_cookie_str(
+        "session=preloaded; Path=/",
+        &format!("http://openwire.test:{}/", server.addr().port())
+            .parse::<Url>()
+            .expect("url"),
+    );
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .cookie_jar(jar)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/cookies",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "session=preloaded");
+}
+
+#[tokio::test]
+async fn redirect_response_cookies_are_applied_to_follow_up_requests() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/start" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/finish")
+                .header("set-cookie", "session=redirected; Path=/")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            "/finish" => {
+                let cookie = request
+                    .headers()
+                    .get(COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("none")
+                    .to_owned();
+                ok_text(cookie)
+            }
+            _ => ok_text("unexpected"),
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .cookie_jar(Jar::default())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/start",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "session=redirected");
+}
+
+#[tokio::test]
+async fn redirect_response_cookies_are_ignored_without_cookie_jar() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/start" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/finish")
+                .header("set-cookie", "session=redirected; Path=/")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            "/finish" => {
+                let cookie = request
+                    .headers()
+                    .get(COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("none")
+                    .to_owned();
+                ok_text(cookie)
+            }
+            _ => ok_text("unexpected"),
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/start",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "none");
+}
+
+#[tokio::test]
+async fn explicit_cookie_header_skips_cookie_jar_injection() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let cookie = request
+            .headers()
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none")
+            .to_owned();
+        ok_text(cookie)
+    })
+    .await;
+
+    let jar = Jar::default();
+    jar.add_cookie_str(
+        "session=jar; Path=/",
+        &format!("http://openwire.test:{}/", server.addr().port())
+            .parse::<Url>()
+            .expect("url"),
+    );
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .cookie_jar(jar)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/manual",
+            server.addr().port()
+        ))
+        .header(COOKIE, "manual=1")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "manual=1");
+}
+
+#[tokio::test]
+async fn declining_authenticator_returns_401_response() {
+    let server = spawn_http1(|_request: Request<Incoming>| async move {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer realm=\"openwire\"")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .expect("unauthorized response")
+    })
+    .await;
+
+    let authenticator = DecliningAuthenticator::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/decline",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -221,12 +1082,20 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
         Some("0")
     );
     assert_eq!(
+        spans[0].fields.get("auth_count").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
         spans[0].fields.get("connection_reused").map(String::as_str),
         Some("false")
     );
     assert_eq!(
         spans[1].fields.get("attempt").map(String::as_str),
         Some("1")
+    );
+    assert_eq!(
+        spans[1].fields.get("auth_count").map(String::as_str),
+        Some("0")
     );
     assert_eq!(
         spans[1].fields.get("connection_reused").map(String::as_str),
@@ -692,6 +1561,10 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
         Some("0")
     );
     assert_eq!(
+        retry_event.fields.get("auth_count").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
         retry_event.fields.get("retry_reason").map(String::as_str),
         Some("connect")
     );
@@ -713,6 +1586,10 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
             .get("redirect_count")
             .map(String::as_str),
         Some("1")
+    );
+    assert_eq!(
+        redirect_event.fields.get("auth_count").map(String::as_str),
+        Some("0")
     );
     assert!(
         redirect_event
@@ -899,10 +1776,208 @@ async fn bridge_interceptor_streaming_body_uses_chunked_without_content_length()
     );
 }
 
+#[tokio::test]
+async fn streaming_request_bodies_are_not_authenticated_on_401() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let _ = collect_request_body(request).await;
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer realm=\"openwire\"")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .expect("unauthorized response")
+    })
+    .await;
+
+    let authenticator = StaticAuthorizationAuthenticator::new("Bearer good");
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/stream-auth",
+            server.addr().port()
+        ))
+        .body(RequestBody::from_stream(stream::iter(vec![Ok::<
+            Bytes,
+            WireError,
+        >(
+            Bytes::from_static(b"streaming auth body"),
+        )])))
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(authenticator.calls(), 0);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_attempts_are_limited_and_counted_independently() {
+    let server = spawn_http1(|_request: Request<Incoming>| async move {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer realm=\"openwire\"")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .expect("unauthorized response")
+    })
+    .await;
+
+    let authenticator = StaticAuthorizationAuthenticator::new("Bearer wrong");
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .max_auth_attempts(2)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/loop-auth",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    assert_eq!(authenticator.calls(), 2);
+    assert_eq!(authenticator.observed_auth_counts(), vec![0, 1]);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[derive(Clone)]
 struct RecordingInterceptor {
     label: &'static str,
     order: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[derive(Clone)]
+struct StaticAuthorizationAuthenticator {
+    header_value: &'static str,
+    calls: Arc<AtomicUsize>,
+    observed_auth_counts: Arc<Mutex<Vec<u32>>>,
+}
+
+impl StaticAuthorizationAuthenticator {
+    fn new(header_value: &'static str) -> Self {
+        Self {
+            header_value,
+            calls: Arc::new(AtomicUsize::new(0)),
+            observed_auth_counts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    fn observed_auth_counts(&self) -> Vec<u32> {
+        self.observed_auth_counts
+            .lock()
+            .expect("auth counts")
+            .clone()
+    }
+}
+
+impl Authenticator for StaticAuthorizationAuthenticator {
+    fn authenticate(
+        &self,
+        ctx: AuthContext,
+    ) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>> {
+        let header_value = self.header_value;
+        let calls = self.calls.clone();
+        let observed_auth_counts = self.observed_auth_counts.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            observed_auth_counts
+                .lock()
+                .expect("auth counts")
+                .push(ctx.auth_count());
+            let Some(mut request) = ctx.try_clone_request() else {
+                return Ok(None);
+            };
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, http::HeaderValue::from_static(header_value));
+            Ok(Some(request))
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct DecliningAuthenticator {
+    calls: Arc<AtomicUsize>,
+}
+
+impl DecliningAuthenticator {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+struct StaticHeaderAuthenticator {
+    header_name: &'static str,
+    header_value: &'static str,
+    calls: Arc<AtomicUsize>,
+    observed_kinds: Arc<Mutex<Vec<openwire::AuthKind>>>,
+}
+
+impl StaticHeaderAuthenticator {
+    fn new(header_name: &'static str, header_value: &'static str) -> Self {
+        Self {
+            header_name,
+            header_value,
+            calls: Arc::new(AtomicUsize::new(0)),
+            observed_kinds: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    fn observed_kinds(&self) -> Vec<openwire::AuthKind> {
+        self.observed_kinds.lock().expect("auth kinds").clone()
+    }
+}
+
+impl Authenticator for StaticHeaderAuthenticator {
+    fn authenticate(
+        &self,
+        ctx: AuthContext,
+    ) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>> {
+        let header_name = self.header_name;
+        let header_value = self.header_value;
+        let calls = self.calls.clone();
+        let observed_kinds = self.observed_kinds.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            observed_kinds.lock().expect("auth kinds").push(ctx.kind());
+            let Some(mut request) = ctx.try_clone_request() else {
+                return Ok(None);
+            };
+            request.headers_mut().insert(
+                http::header::HeaderName::from_static(header_name),
+                http::HeaderValue::from_static(header_value),
+            );
+            Ok(Some(request))
+        })
+    }
+}
+
+impl Authenticator for DecliningAuthenticator {
+    fn authenticate(
+        &self,
+        _ctx: AuthContext,
+    ) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>> {
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        })
+    }
 }
 
 impl RecordingInterceptor {
@@ -1013,6 +2088,85 @@ fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {
 
 fn default_user_agent() -> &'static str {
     concat!("openwire/", env!("CARGO_PKG_VERSION"))
+}
+
+fn environment_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+struct ScopedEnv {
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl ScopedEnv {
+    fn set<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: AsRef<str>,
+    {
+        // Windows treats environment variable names as case-insensitive, so
+        // pairs like `http_proxy` and `HTTP_PROXY` must collapse to one logical
+        // entry or later cleanup entries will erase the value we just set.
+        let mut merged = Vec::<(String, String, String)>::new();
+        for (key, value) in vars {
+            let key = key.into();
+            let value = value.as_ref().to_owned();
+            let normalized = normalize_env_key_for_platform(&key);
+
+            if let Some((_, existing_key, existing_value)) = merged
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == normalized)
+            {
+                if existing_value.is_empty() && !value.is_empty() {
+                    *existing_key = key;
+                    *existing_value = value;
+                }
+                continue;
+            }
+
+            merged.push((normalized, key, value));
+        }
+
+        let mut previous = Vec::new();
+        for (_, key, value) in merged {
+            previous.push((key.clone(), std::env::var(&key).ok()));
+            if value.is_empty() {
+                unsafe {
+                    std::env::remove_var(&key);
+                }
+            } else {
+                unsafe {
+                    std::env::set_var(&key, value);
+                }
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..).rev() {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(&key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&key);
+                },
+            }
+        }
+    }
+}
+
+fn normalize_env_key_for_platform(key: &str) -> String {
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key.to_owned()
+    }
 }
 
 #[derive(Clone)]
@@ -1140,6 +2294,73 @@ impl Drop for RawHttpServer {
     }
 }
 
+struct ConnectProxyServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl ConnectProxyServer {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("proxy requests").clone()
+    }
+}
+
+impl Drop for ConnectProxyServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+struct AuthorizationProxyServer {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl AuthorizationProxyServer {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for AuthorizationProxyServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+struct PlainHttpProxyServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl PlainHttpProxyServer {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("proxy requests").clone()
+    }
+}
+
+impl Drop for PlainHttpProxyServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1163,6 +2384,339 @@ async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
 
     RawHttpServer {
         addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_connect_proxy() -> ConnectProxyServer {
+    spawn_proxy_impl(true).await
+}
+
+async fn spawn_rejecting_connect_proxy() -> ConnectProxyServer {
+    spawn_proxy_impl(false).await
+}
+
+async fn spawn_stalling_connect_proxy() -> ConnectProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request);
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    });
+                }
+            }
+        }
+    });
+
+    ConnectProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_connect_proxy_requiring_authorization(
+    header_name: &'static str,
+    expected_value: &'static str,
+) -> ConnectProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request.clone());
+
+                        let authorized = request.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!("{header_name}: {expected_value}"))
+                        });
+
+                        if !authorized {
+                            client
+                                .write_all(
+                                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await
+                                .expect("write proxy auth challenge");
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+
+                        let target = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.strip_prefix("CONNECT "))
+                            .and_then(|line| line.strip_suffix(" HTTP/1.1"))
+                            .expect("CONNECT request line")
+                            .to_owned();
+
+                        let mut upstream = tokio::net::TcpStream::connect(&target)
+                            .await
+                            .expect("connect upstream through proxy");
+                        client
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await
+                            .expect("write proxy response");
+
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    });
+                }
+            }
+        }
+    });
+
+    ConnectProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_plain_http_proxy_response(body: &'static str) -> PlainHttpProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind plain proxy listener");
+    let addr = listener.local_addr().expect("plain proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request);
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        client
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write plain proxy response");
+                        let _ = client.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+
+    PlainHttpProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_proxy_requiring_authorization(
+    header_name: &'static str,
+    expected_value: &'static str,
+) -> AuthorizationProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind auth proxy listener");
+    let addr = listener.local_addr().expect("auth proxy listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        let authorized = request.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!("{header_name}: {expected_value}"))
+                        });
+
+                        let response = if authorized {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nproxy authorized"
+                        } else {
+                            "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        };
+
+                        client
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write auth proxy response");
+                        let _ = client.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+
+    AuthorizationProxyServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_proxy_impl(accept_connect: bool) -> ConnectProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request.clone());
+
+                        let target = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.strip_prefix("CONNECT "))
+                            .and_then(|line| line.strip_suffix(" HTTP/1.1"))
+                            .expect("CONNECT request line")
+                            .to_owned();
+
+                        if !accept_connect {
+                            client
+                                .write_all(
+                                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                                )
+                                .await
+                                .expect("write proxy rejection");
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+
+                        let mut upstream = tokio::net::TcpStream::connect(&target)
+                            .await
+                            .expect("connect upstream through proxy");
+                        client
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await
+                            .expect("write proxy response");
+
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    });
+                }
+            }
+        }
+    });
+
+    ConnectProxyServer {
+        addr,
+        requests,
         shutdown: Some(shutdown_tx),
     }
 }

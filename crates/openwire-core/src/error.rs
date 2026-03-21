@@ -9,6 +9,8 @@ pub type BoxError = Arc<dyn StdError + Send + Sync>;
 
 #[derive(Debug)]
 struct ConnectTimeoutMarker;
+#[derive(Debug)]
+struct NonRetryableConnectMarker;
 
 impl fmt::Display for ConnectTimeoutMarker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -17,6 +19,14 @@ impl fmt::Display for ConnectTimeoutMarker {
 }
 
 impl StdError for ConnectTimeoutMarker {}
+
+impl fmt::Display for NonRetryableConnectMarker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("non-retryable connect failure")
+    }
+}
+
+impl StdError for NonRetryableConnectMarker {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WireErrorKind {
@@ -101,6 +111,13 @@ impl WireError {
             .is_some()
     }
 
+    pub fn is_non_retryable_connect(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<NonRetryableConnectMarker>())
+            .is_some()
+    }
+
     pub fn invalid_request(message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(WireErrorKind::InvalidRequest, message)
     }
@@ -129,6 +146,10 @@ impl WireError {
         E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Connect, message, source)
+    }
+
+    pub fn connect_non_retryable(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::with_source(WireErrorKind::Connect, message, NonRetryableConnectMarker)
     }
 
     pub fn tls<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self

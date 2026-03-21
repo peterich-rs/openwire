@@ -15,6 +15,8 @@ platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 
 [dependencies]
 bytes.workspace = true
+cookie = "0.18.0"
+cookie_store = { version = "0.21.1", default-features = false, features = ["public_suffix"] }
 futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
