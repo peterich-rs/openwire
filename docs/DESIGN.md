@@ -297,6 +297,8 @@ Important baseline details to preserve during migration:
   still dial sequentially
 - protocol binding now happens in `TransportService` via
   `hyper::client::conn::http1` / `http2`
+- HTTP/1.1 idle timeout and max-idle-per-address limits now enforce
+  opportunistically on pool touch points; there is still no background sweeper
 - response-body lifecycle currently drives connection release bookkeeping
 - retained `hyper-util` usage is now limited to
   `hyper_util::client::legacy::connect::{Connection, Connected}` as a temporary

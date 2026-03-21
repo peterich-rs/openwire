@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use openwire_core::ConnectionId;
 
-use super::{Address, ConnectionAllocationState, RealConnection};
+use super::{Address, ConnectionAllocationState, ConnectionProtocol, RealConnection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PoolSettings {
@@ -47,28 +47,35 @@ impl ConnectionPool {
     }
 
     pub(crate) fn insert(&self, connection: RealConnection) {
-        self.connections
-            .lock()
-            .expect("connection pool lock")
-            .entry(connection.address().clone())
-            .or_default()
-            .push(connection);
+        let address = connection.address().clone();
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        pool.entry(address.clone()).or_default().push(connection);
+        prune_address(&self.settings, &mut pool, &address);
     }
 
     pub(crate) fn acquire(&self, address: &Address) -> Option<RealConnection> {
         let mut pool = self.connections.lock().expect("connection pool lock");
-        let connections = pool.get_mut(address)?;
-        connections.retain(|connection| !connection.is_closed());
-        if connections.is_empty() {
+        if !prune_address(&self.settings, &mut pool, address) {
             pool.remove(address);
             return None;
         }
 
+        let connections = pool.get_mut(address)?;
         connections.iter().find(|conn| conn.try_acquire()).cloned()
     }
 
     pub(crate) fn release(&self, connection: &RealConnection) -> bool {
-        connection.release()
+        if !connection.release() {
+            return false;
+        }
+
+        let address = connection.address().clone();
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        if !prune_address(&self.settings, &mut pool, &address) {
+            pool.remove(&address);
+        }
+
+        true
     }
 
     pub(crate) fn get_by_id(
@@ -76,16 +83,18 @@ impl ConnectionPool {
         address: &Address,
         connection_id: ConnectionId,
     ) -> Option<RealConnection> {
-        self.connections
-            .lock()
-            .expect("connection pool lock")
-            .get(address)
-            .and_then(|connections| {
-                connections
-                    .iter()
-                    .find(|connection| connection.id() == connection_id)
-                    .cloned()
-            })
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        if !prune_address(&self.settings, &mut pool, address) {
+            pool.remove(address);
+            return None;
+        }
+
+        pool.get(address).and_then(|connections| {
+            connections
+                .iter()
+                .find(|connection| connection.id() == connection_id)
+                .cloned()
+        })
     }
 
     pub(crate) fn remove(&self, connection_id: ConnectionId) -> Option<RealConnection> {
@@ -121,7 +130,11 @@ impl ConnectionPool {
     }
 
     pub(crate) fn stats(&self, address: &Address) -> PoolStats {
-        let pool = self.connections.lock().expect("connection pool lock");
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        if !prune_address(&self.settings, &mut pool, address) {
+            pool.remove(address);
+            return PoolStats::default();
+        }
         let Some(connections) = pool.get(address) else {
             return PoolStats::default();
         };
@@ -140,9 +153,98 @@ impl ConnectionPool {
     }
 }
 
+fn prune_address(
+    settings: &PoolSettings,
+    pool: &mut HashMap<Address, Vec<RealConnection>>,
+    address: &Address,
+) -> bool {
+    let Some(connections) = pool.get_mut(address) else {
+        return false;
+    };
+
+    prune_connections(settings, connections);
+    !connections.is_empty()
+}
+
+fn prune_connections(settings: &PoolSettings, connections: &mut Vec<RealConnection>) {
+    connections.retain(|connection| {
+        if connection.is_closed() {
+            return false;
+        }
+
+        if settings
+            .idle_timeout
+            .is_some_and(|timeout| idle_http1_expired(connection, timeout))
+        {
+            connection.close();
+            return false;
+        }
+
+        true
+    });
+
+    enforce_max_idle_http1(settings.max_idle_per_address, connections);
+}
+
+fn idle_http1_expired(connection: &RealConnection, timeout: Duration) -> bool {
+    if connection.protocol() != ConnectionProtocol::Http1 {
+        return false;
+    }
+
+    let snapshot = connection.snapshot();
+    matches!(snapshot.allocation, ConnectionAllocationState::Idle)
+        && snapshot
+            .idle_since
+            .is_some_and(|idle_since| idle_since.elapsed() >= timeout)
+}
+
+fn enforce_max_idle_http1(max_idle_per_address: usize, connections: &mut Vec<RealConnection>) {
+    if max_idle_per_address == usize::MAX {
+        return;
+    }
+
+    let mut idle_http1 = connections
+        .iter()
+        .filter_map(|connection| {
+            let snapshot = connection.snapshot();
+            if snapshot.protocol != ConnectionProtocol::Http1
+                || !matches!(snapshot.allocation, ConnectionAllocationState::Idle)
+            {
+                return None;
+            }
+
+            snapshot
+                .idle_since
+                .map(|idle_since| (connection.id(), idle_since))
+        })
+        .collect::<Vec<_>>();
+
+    if idle_http1.len() <= max_idle_per_address {
+        return;
+    }
+
+    idle_http1.sort_by_key(|(_, idle_since)| *idle_since);
+    let evict_count = idle_http1.len() - max_idle_per_address;
+    let evicted_ids = idle_http1
+        .into_iter()
+        .take(evict_count)
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+
+    connections.retain(|connection| {
+        if evicted_ids.contains(&connection.id()) {
+            connection.close();
+            return false;
+        }
+
+        true
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::thread;
     use std::time::Duration;
 
     use super::{ConnectionPool, PoolSettings, PoolStats};
@@ -164,11 +266,19 @@ mod tests {
     }
 
     fn make_connection(address: Address, last_octet: u8) -> RealConnection {
+        make_connection_with_protocol(address, last_octet, ConnectionProtocol::Http1)
+    }
+
+    fn make_connection_with_protocol(
+        address: Address,
+        last_octet: u8,
+        protocol: ConnectionProtocol,
+    ) -> RealConnection {
         let route = Route::direct(
             address,
             SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 443)),
         );
-        RealConnection::new(route, ConnectionProtocol::Http1)
+        RealConnection::new(route, protocol)
     }
 
     #[test]
@@ -258,5 +368,78 @@ mod tests {
         assert!(pool.acquire(&proxied).is_none());
         assert!(pool.acquire(&alt_dns).is_none());
         assert!(pool.acquire(&direct).is_some());
+    }
+
+    #[test]
+    fn pool_evicts_idle_http1_connections_after_timeout() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::ZERO),
+            max_idle_per_address: usize::MAX,
+        });
+        let connection = make_connection(address.clone(), 12);
+        let connection_id = connection.id();
+        pool.insert(connection);
+
+        assert!(pool.acquire(&address).is_none());
+        assert_eq!(pool.stats(&address), PoolStats::default());
+        assert!(pool.remove(connection_id).is_none());
+    }
+
+    #[test]
+    fn pool_keeps_only_newest_idle_http1_connections_within_limit() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: None,
+            max_idle_per_address: 2,
+        });
+
+        let oldest = make_connection(address.clone(), 21);
+        thread::sleep(Duration::from_millis(1));
+        let middle = make_connection(address.clone(), 22);
+        thread::sleep(Duration::from_millis(1));
+        let newest = make_connection(address.clone(), 23);
+
+        pool.insert(oldest.clone());
+        pool.insert(middle.clone());
+        pool.insert(newest.clone());
+
+        assert_eq!(
+            pool.stats(&address),
+            PoolStats {
+                total: 2,
+                idle: 2,
+                in_use: 0,
+            }
+        );
+        assert!(pool.remove(oldest.id()).is_none());
+        assert!(pool.remove(middle.id()).is_some());
+        assert!(pool.remove(newest.id()).is_some());
+    }
+
+    #[test]
+    fn pool_does_not_apply_http1_idle_eviction_rules_to_http2_connections() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::ZERO),
+            max_idle_per_address: 0,
+        });
+        let connection =
+            make_connection_with_protocol(address.clone(), 31, ConnectionProtocol::Http2);
+        let connection_id = connection.id();
+        pool.insert(connection);
+
+        assert_eq!(
+            pool.stats(&address),
+            PoolStats {
+                total: 1,
+                idle: 1,
+                in_use: 0,
+            }
+        );
+        assert_eq!(
+            pool.acquire(&address).map(|connection| connection.id()),
+            Some(connection_id)
+        );
     }
 }

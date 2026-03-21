@@ -153,7 +153,7 @@ fully generalized.
 | P8-001 | `DONE` | Mark HTTP/1.1 `RealConnection` busy during an active exchange | P7-001 | Pool refuses parallel reuse on the same HTTP/1.1 connection |
 | P8-002 | `DONE` | Return reusable HTTP/1.1 connections to idle state after response body lifecycle completes | P8-001 | Existing reuse integration tests pass |
 | P8-003 | `DONE` | Drop broken or abandoned HTTP/1.1 connections instead of reusing them | P8-001 | Tests cover body failure and abandonment paths |
-| P8-004 | `TODO` | Add idle timeout and max idle per address enforcement for HTTP/1.1 | P4-006 | Pool eviction tests pass |
+| P8-004 | `DONE` | Add idle timeout and max idle per address enforcement for HTTP/1.1 | P4-006 | Pool eviction tests pass |
 
 ## Phase 9: HTTP/2 Multiplex Reuse
 
@@ -230,15 +230,17 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P8-004`
-2. `P9-003`
-3. `P10-001` through `P10-005`
+1. `P9-003`
+2. `P10-001` through `P10-005`
+3. `P12-005`
 
 Rationale:
 
-- the owned connection runtime path is landed, but HTTP/1.1 eviction policy is
-  still only configuration without enforcement
+- HTTP/1.1 idle eviction policy is now enforced, so the next missing
+  correctness guard is conservative HTTP/2 stream-limit accounting
 - HTTP/2 multiplex reuse works, but the pool still needs conservative stream
   limit accounting before the concurrency model is considered hardened
 - proxy route generation and ownership are now the next major boundary still
   split between planner and connector branching
+- idle eviction now exists, but deterministic timing coverage still needs to be
+  added once the pool semantics settle further
