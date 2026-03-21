@@ -56,10 +56,10 @@ This phase defines exactly what OpenWire will reclaim from
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
 | P1-001 | `DONE` | Freeze the target execution chain and ownership split in `DESIGN.md` | P0-006 | `DESIGN.md` includes current chain, target chain, object model, threading/performance/error sections |
-| P1-002 | `TODO` | Freeze the initial connection-core scope: exact-address reuse only, no broad coalescing, no HTTP/3 | P1-001 | Scope decision recorded in `DESIGN.md` and reflected in this file |
-| P1-003 | `TODO` | Freeze the initial fast-fallback semantics: route-based, dual-stack + single-stack multi-IP, 250ms stagger | P1-001 | Trigger conditions, ordering rules, and winner/loser behavior explicitly documented |
-| P1-004 | `TODO` | Freeze the protocol-binding ownership boundary: `hyper` for HTTP codecs, OpenWire for acquisition/pool/orchestration | P1-001 | No remaining ambiguity in `DESIGN.md` on `hyper` vs OpenWire responsibilities |
-| P1-005 | `TODO` | Freeze the migration boundary for `hyper-util`: legacy client removed from runtime path, minimal adapter surface retained or replaced | P1-004 | Decision recorded before implementation of Stage 3 begins |
+| P1-002 | `DONE` | Freeze the initial connection-core scope: exact-address reuse only, no broad coalescing, no HTTP/3 | P1-001 | Scope decision recorded in `DESIGN.md` and reflected in this file |
+| P1-003 | `DONE` | Freeze the initial fast-fallback semantics: route-based, dual-stack + single-stack multi-IP, 250ms stagger | P1-001 | Trigger conditions, ordering rules, and winner/loser behavior explicitly documented |
+| P1-004 | `DONE` | Freeze the protocol-binding ownership boundary: `hyper` for HTTP codecs, OpenWire for acquisition/pool/orchestration | P1-001 | No remaining ambiguity in `DESIGN.md` on `hyper` vs OpenWire responsibilities |
+| P1-005 | `DONE` | Freeze the migration boundary for `hyper-util`: legacy client removed from runtime path, minimal adapter surface retained or replaced | P1-004 | Decision recorded before implementation of Stage 3 begins |
 
 ## Phase 2: Planning Types And Route Model
 
@@ -68,13 +68,13 @@ behavior.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P2-001 | `TODO` | Add internal `Address` type | P1-002 | Fields cover scheme, authority, proxy, TLS identity, protocol policy, DNS policy; unit tests for equality and keying |
-| P2-002 | `TODO` | Add internal `Route` type | P2-001 | Supports direct and proxy routes; unit tests for route classification |
-| P2-003 | `TODO` | Add internal `RoutePlan` type | P2-002 | Ordered route candidate collection with deterministic iteration |
-| P2-004 | `TODO` | Add internal `ConnectPlan` state model | P2-003 | Represents pending/running/won/lost/failed attempt states |
-| P2-005 | `TODO` | Add route-family metadata and local-vs-deferred DNS metadata to planning types | P2-002 | Tests cover direct, CONNECT, and future SOCKS-style route representation |
-| P2-006 | `TODO` | Add a pure planner test suite for dual-stack ordering and single-stack multi-IP ordering | P2-003 | Tests pass without network I/O |
-| P2-007 | `TODO` | Add a pure planner test suite for proxy route construction | P2-003 | Direct, HTTP forward, and CONNECT route cases covered |
+| P2-001 | `DONE` | Add internal `Address` type | P1-002 | Fields cover scheme, authority, proxy, TLS identity, protocol policy, DNS policy; unit tests for equality and keying |
+| P2-002 | `DONE` | Add internal `Route` type | P2-001 | Supports direct and proxy routes; unit tests for route classification |
+| P2-003 | `DONE` | Add internal `RoutePlan` type | P2-002 | Ordered route candidate collection with deterministic iteration |
+| P2-004 | `DONE` | Add internal `ConnectPlan` state model | P2-003 | Represents pending/running/won/lost/failed attempt states |
+| P2-005 | `DONE` | Add route-family metadata and local-vs-deferred DNS metadata to planning types | P2-002 | Tests cover direct, CONNECT, and future SOCKS-style route representation |
+| P2-006 | `DONE` | Add a pure planner test suite for dual-stack ordering and single-stack multi-IP ordering | P2-003 | Tests pass without network I/O |
+| P2-007 | `DONE` | Add a pure planner test suite for proxy route construction | P2-003 | Direct, HTTP forward, and CONNECT route cases covered |
 
 ## Phase 3: Runtime Adapter Ownership
 
@@ -83,10 +83,10 @@ client-side logic in the core runtime path.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P3-001 | `TODO` | Introduce OpenWire-owned Tokio I/O adapter equivalent to the currently used compatibility layer | P1-005 | HTTP/1.1 and HTTP/2 protocol handshakes compile against owned adapter |
-| P3-002 | `TODO` | Introduce OpenWire-owned Tokio executor bridge for `hyper` background futures | P3-001 | Handshake/binding code can spawn required tasks without `hyper-util` executor types |
-| P3-003 | `TODO` | Introduce OpenWire-owned Tokio timer bridge where `hyper` requires timers | P3-001 | Keep-alive and timeout hooks work through owned runtime adapter types |
-| P3-004 | `TODO` | Verify that `openwire`, `openwire-rustls`, and `openwire-test` no longer need `hyper-util` for anything beyond intentionally retained shims | P3-001 | Dependency usage audit documented in code comments or task notes |
+| P3-001 | `DONE` | Introduce OpenWire-owned Tokio I/O adapter equivalent to the currently used compatibility layer | P1-005 | HTTP/1.1 and HTTP/2 protocol handshakes compile against owned adapter |
+| P3-002 | `DONE` | Introduce OpenWire-owned Tokio executor bridge for `hyper` background futures | P3-001 | Handshake/binding code can spawn required tasks without `hyper-util` executor types |
+| P3-003 | `DONE` | Introduce OpenWire-owned Tokio timer bridge where `hyper` requires timers | P3-001 | Keep-alive and timeout hooks work through owned runtime adapter types |
+| P3-004 | `DONE` | Verify that `openwire`, `openwire-rustls`, and `openwire-test` no longer need `hyper-util` for anything beyond intentionally retained shims | P3-001 | Dependency usage audit documented in code comments or task notes |
 
 ## Phase 4: RealConnection And Pool Skeleton
 
@@ -95,12 +95,12 @@ through it.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P4-001 | `TODO` | Add internal `RealConnection` type with connection ID, route, protocol, health, and allocation state | P2-004 | Unit tests cover state transitions |
-| P4-002 | `TODO` | Add internal `ConnectionPool` skeleton keyed by `Address` | P4-001 | Pool supports insert, acquire, release, remove |
-| P4-003 | `TODO` | Implement exact-address reuse policy for the first milestone | P4-002 | Reuse tests pass with conservative matching only |
-| P4-004 | `TODO` | Add idle/in-use bookkeeping without background eviction yet | P4-002 | Pool state tests cover handoff and release |
+| P4-001 | `DONE` | Add internal `RealConnection` type with connection ID, route, protocol, health, and allocation state | P2-004 | Unit tests cover state transitions |
+| P4-002 | `DONE` | Add internal `ConnectionPool` skeleton keyed by `Address` | P4-001 | Pool supports insert, acquire, release, remove |
+| P4-003 | `DONE` | Implement exact-address reuse policy for the first milestone | P4-002 | Reuse tests pass with conservative matching only |
+| P4-004 | `DONE` | Add idle/in-use bookkeeping without background eviction yet | P4-002 | Pool state tests cover handoff and release |
 | P4-005 | `TODO` | Replace `connection_registry`-style reuse detection with pool-owned reuse state | P4-002 | Reuse observability derives from pool state instead of separate HashSet |
-| P4-006 | `TODO` | Add eviction settings on the pool object without enabling background cleanup yet | P4-004 | Settings compile and are stored; tests cover config plumbing |
+| P4-006 | `DONE` | Add eviction settings on the pool object without enabling background cleanup yet | P4-004 | Settings compile and are stored; tests cover config plumbing |
 
 ## Phase 5: ExchangeFinder And Acquisition Flow
 
@@ -230,12 +230,12 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P2-001` through `P2-007`
-2. `P3-001` through `P3-004`
-3. `P4-001` through `P4-006`
+1. `P4-005`
+2. `P5-001` through `P5-004`
+3. `P6-001` through `P6-007`
 
 Rationale:
 
-- the planning vocabulary must exist before acquisition can be moved
-- runtime adapters should be explicit before binding is rewritten
-- pool ownership must exist before fast fallback can be integrated correctly
+- reuse observability still depends on the temporary registry instead of the owned pool
+- acquisition must move onto `Address` + pool + planner before the legacy client can be retired
+- fast fallback is only worth integrating after owned acquisition is on the request path

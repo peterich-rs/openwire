@@ -5,7 +5,7 @@ use http::{Request, Response};
 use openwire_core::{
     BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
     NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
-    SharedInterceptor, TcpConnector, TlsConnector, WireError,
+    SharedInterceptor, TcpConnector, TlsConnector, TokioRuntime, WireError,
 };
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -20,8 +20,7 @@ use crate::policy::{
 };
 use crate::proxy::{system_proxies_from_env, Proxy};
 use crate::transport::{
-    build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
-    TransportService,
+    build_hyper_client, ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService,
 };
 
 #[derive(Clone)]

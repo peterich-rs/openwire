@@ -217,10 +217,12 @@ Ownership split:
 
 First-milestone rules:
 
+- these rules are frozen for the initial self-owned connection-core slice
 - exact `Address` equality for reuse
 - no broad connection coalescing
 - conservative HTTP/2 multiplex accounting
 - no speculative preconnect
+- no HTTP/3 and no HTTP/3-shaped connection-core abstractions
 
 ## 9. Fast Fallback Semantics
 
@@ -236,7 +238,7 @@ It should trigger for:
 First-milestone semantics:
 
 - first connect attempt starts immediately
-- later attempts start on a fixed stagger, target 250ms by default
+- later attempts start on a fixed stagger, frozen at a 250ms target by default
 - when both IPv6 and IPv4 exist, alternate families where practical
 - otherwise preserve resolver order within the single family
 - winner means TCP + required TLS + protocol binding all succeed
@@ -247,6 +249,14 @@ First-milestone semantics:
 
 OpenWire will own connection acquisition and reuse, but keep `hyper` for
 protocol machines.
+
+This ownership boundary is frozen for the initial migration:
+
+- OpenWire owns address derivation, route planning, acquisition, pooling, and
+  lifecycle bookkeeping
+- `hyper` owns only the HTTP/1.1 and HTTP/2 protocol state machines
+- no request execution path may re-introduce `hyper-util` pooling semantics as
+  a shortcut around the owned connection core
 
 HTTP/1.1:
 
@@ -269,6 +279,14 @@ Important baseline details to preserve during migration:
 - proxy selection currently lives in `ConnectorStack`, but should move into `RoutePlanner`
 - `tokio::task_local!` currently exists only because `hyper_util::client::legacy::Client` does not expose OpenWire-owned context flow
 - response-body lifecycle currently drives connection release bookkeeping
+- the initial `hyper-util` migration boundary is explicit:
+  - retain `hyper_util::client::legacy::Client` only until the owned
+    protocol-binding/runtime path lands
+  - retain `hyper_util::client::legacy::connect::{Connection, Connected}` only
+    as a temporary connection-metadata shim while connector/TLS integration is
+    still using the legacy client path
+  - replace `hyper_util::rt::{TokioIo, TokioExecutor, TokioTimer}` with
+    OpenWire-owned Tokio adapters before direct binding work
 
 ## 12. Threading And Synchronization
 
@@ -402,7 +420,6 @@ Not in scope until the owned connection core is stable:
 
 ## 18. Open Questions
 
-- whether any `hyper-util` adapter surface should remain after legacy-client removal
 - SOCKS support timing and placement
 - proxy route fast-fallback policy
 - cache integration timing after connection-core ownership lands

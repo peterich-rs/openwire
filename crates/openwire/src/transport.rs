@@ -16,11 +16,10 @@ use hyper::body::Incoming;
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioIo;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 use openwire_core::{
     next_connection_id, BoxConnection, BoxFuture, CallContext, ConnectionInfo, DnsResolver,
-    Exchange, RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector, WireError,
+    Exchange, RequestBody, ResponseBody, TcpConnector, TlsConnector, TokioExecutor, TokioIo,
+    TokioTimer, WireError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
@@ -35,20 +34,6 @@ use crate::trace::PolicyTraceContext;
 
 tokio::task_local! {
     static CURRENT_CALL_CONTEXT: CallContext;
-}
-
-#[derive(Clone)]
-pub struct TokioRuntime;
-
-impl Runtime for TokioRuntime {
-    fn spawn(&self, future: openwire_core::BoxFuture<()>) -> Result<(), WireError> {
-        tokio::spawn(future);
-        Ok(())
-    }
-
-    fn sleep(&self, duration: Duration) -> openwire_core::BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
 }
 
 #[derive(Clone, Debug, Default)]

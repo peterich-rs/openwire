@@ -5,9 +5,8 @@ use std::task::{Context, Poll};
 
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use hyper_util::rt::TokioIo;
 use openwire_core::{
-    BoxConnection, BoxFuture, CallContext, ConnectionInfo, TlsConnector, WireError,
+    BoxConnection, BoxFuture, CallContext, ConnectionInfo, TlsConnector, TokioIo, WireError,
 };
 use pin_project_lite::pin_project;
 use rustls::pki_types::{CertificateDer, ServerName};

@@ -9,10 +9,9 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use openwire_core::{
     BoxFuture, CallContext, ConnectionId, DnsResolver, EventListener, EventListenerFactory,
-    RequestBody, ResponseBody, SharedEventListener, WireError,
+    RequestBody, ResponseBody, SharedEventListener, TokioExecutor, TokioIo, WireError,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};

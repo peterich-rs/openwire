@@ -4,6 +4,7 @@ mod error;
 mod event;
 mod interceptor;
 mod runtime;
+mod tokio_rt;
 mod transport;
 
 use std::future::Future;
@@ -20,6 +21,7 @@ pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,
 };
 pub use runtime::Runtime;
+pub use tokio_rt::{TokioExecutor, TokioIo, TokioRuntime, TokioTimer};
 pub use transport::{
     BoxConnection, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector, TlsConnector,
 };

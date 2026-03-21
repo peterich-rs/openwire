@@ -19,6 +19,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 pin-project-lite.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true
-

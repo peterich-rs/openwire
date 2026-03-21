@@ -1062,6 +1062,7 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "thiserror 2.0.18",
+ "tokio",
  "tower",
  "tracing",
 ]
@@ -1096,7 +1097,6 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
- "hyper-util",
  "openwire-core",
  "rcgen",
  "rustls",
