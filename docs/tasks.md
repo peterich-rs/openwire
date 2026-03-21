@@ -99,7 +99,7 @@ through it.
 | P4-002 | `DONE` | Add internal `ConnectionPool` skeleton keyed by `Address` | P4-001 | Pool supports insert, acquire, release, remove |
 | P4-003 | `DONE` | Implement exact-address reuse policy for the first milestone | P4-002 | Reuse tests pass with conservative matching only |
 | P4-004 | `DONE` | Add idle/in-use bookkeeping without background eviction yet | P4-002 | Pool state tests cover handoff and release |
-| P4-005 | `TODO` | Replace `connection_registry`-style reuse detection with pool-owned reuse state | P4-002 | Reuse observability derives from pool state instead of separate HashSet |
+| P4-005 | `DONE` | Replace `connection_registry`-style reuse detection with pool-owned reuse state | P4-002 | Reuse observability derives from pool state instead of separate HashSet |
 | P4-006 | `DONE` | Add eviction settings on the pool object without enabling background cleanup yet | P4-004 | Settings compile and are stored; tests cover config plumbing |
 
 ## Phase 5: ExchangeFinder And Acquisition Flow
@@ -109,10 +109,10 @@ OpenWire.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P5-001 | `TODO` | Add internal `ExchangeFinder` that checks the pool before any new connection work | P4-002 | Pool hit / miss behavior covered by unit tests |
-| P5-002 | `TODO` | Thread `Address` derivation into request attempts before transport execution | P2-001 | Per-attempt code can derive stable connection keys |
-| P5-003 | `TODO` | Route pool hit requests through pooled `RealConnection` handles instead of `hyper_util` pool lookup | P5-001 | Existing reuse integration tests pass against owned pool lookup |
-| P5-004 | `TODO` | Route pool miss requests into planner + dialer path | P5-001 | Miss path is covered by integration tests |
+| P5-001 | `DONE` | Add internal `ExchangeFinder` that checks the pool before any new connection work | P4-002 | Pool hit / miss behavior covered by unit tests |
+| P5-002 | `DONE` | Thread `Address` derivation into request attempts before transport execution | P2-001 | Per-attempt code can derive stable connection keys |
+| P5-003 | `DONE` | Route pool hit requests through pooled `RealConnection` handles instead of `hyper_util` pool lookup | P5-001 | Existing reuse integration tests pass against owned pool lookup |
+| P5-004 | `DONE` | Route pool miss requests into planner + dialer path | P5-001 | Miss path is covered by integration tests |
 | P5-005 | `TODO` | Eliminate `tokio::task_local!` for `CallContext` propagation in the acquisition path | P5-003 | Connector and acquisition code receive explicit context |
 
 ## Phase 6: Fast Fallback Direct Routes
@@ -230,12 +230,13 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P4-005`
-2. `P5-001` through `P5-004`
-3. `P6-001` through `P6-007`
+1. `P5-005`
+2. `P6-001` through `P6-007`
+3. `P7-001` through `P7-005`
 
 Rationale:
 
-- reuse observability still depends on the temporary registry instead of the owned pool
-- acquisition must move onto `Address` + pool + planner before the legacy client can be retired
-- fast fallback is only worth integrating after owned acquisition is on the request path
+- acquisition now uses `Address` + pool + planner, but still relies on
+  temporary task-local propagation into the legacy connector path
+- fast fallback is the next missing behavior on the owned acquisition path
+- direct protocol binding should follow once the route-race semantics are in place

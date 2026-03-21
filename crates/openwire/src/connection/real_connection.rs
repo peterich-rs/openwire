@@ -59,9 +59,13 @@ struct RealConnectionState {
 
 impl RealConnection {
     pub(crate) fn new(route: Route, protocol: ConnectionProtocol) -> Self {
+        Self::with_id(next_connection_id(), route, protocol)
+    }
+
+    pub(crate) fn with_id(id: ConnectionId, route: Route, protocol: ConnectionProtocol) -> Self {
         Self {
             inner: Arc::new(RealConnectionInner {
-                id: next_connection_id(),
+                id,
                 address: route.address().clone(),
                 route,
                 protocol,

@@ -111,19 +111,26 @@ User API
           -> BridgeInterceptor (Host, User-Agent, body framing)
             -> network interceptors
               -> TransportService
+                -> derive Address
+                -> ExchangeFinder
+                  -> ConnectionPool lookup / reserve
                 -> with_call_context (tokio::task_local propagation)
+                -> with_request_address (temporary address propagation)
                 -> hyper_util::client::legacy::Client
-                  -> ConnectorStack
-                    -> proxy selection
-                    -> dns
-                    -> tcp (sequential address fallback)
-                    -> tls
+                  -> if pool miss:
+                    -> ConnectorStack
+                      -> RoutePlanner
+                      -> proxy-aware route construction
+                      -> dns
+                      -> tcp (sequential RoutePlan dial)
+                      -> tls
                   -> hyper request execution
+                -> observe actual connection into ConnectionPool
           -> store_response_cookies()
           -> authenticate_response()
           -> redirect decision
       -> ObservedIncomingBody wrapper
-        -> connection release bookkeeping
+        -> connection release bookkeeping + pool release
 ```
 
 This is the implemented baseline, not the target end state.
@@ -276,7 +283,9 @@ HTTP/2:
 Important baseline details to preserve during migration:
 
 - cookie and auth behavior currently lives in the follow-up coordinator, not in transport
-- proxy selection currently lives in `ConnectorStack`, but should move into `RoutePlanner`
+- exact-address derivation and pool lookup now happen in `TransportService` via `ExchangeFinder`
+- the miss path now builds proxy-aware routes through `RoutePlanner`, but the
+  full proxy policy boundary still partly lives in `ConnectorStack`
 - `tokio::task_local!` currently exists only because `hyper_util::client::legacy::Client` does not expose OpenWire-owned context flow
 - response-body lifecycle currently drives connection release bookkeeping
 - the initial `hyper-util` migration boundary is explicit:
@@ -298,8 +307,9 @@ Current baseline:
 - current synchronization points are small:
   - atomics for global IDs and per-call connection-established flag
   - `RwLock` for the default cookie jar
-  - a small `Mutex<HashSet<ConnectionId>>` used only for reuse observability bookkeeping
-  - `tokio::task_local!` for `CallContext` propagation into the connector path
+  - `Mutex<HashMap<Address, Vec<RealConnection>>>` inside `ConnectionPool`
+  - `tokio::task_local!` for `CallContext` and temporary request `Address`
+    propagation into the legacy connector path
 
 Target guidance:
 
@@ -313,13 +323,14 @@ Target guidance:
 Current hot-path observations:
 
 - warm pooled requests are already benchmarked locally for HTTP/1.1 and HTTPS HTTP/2
-- current cold-connect path still clones connector-owned config and resolves/tries addresses sequentially
+- current cold-connect path now derives `Address` and ordered `RoutePlan`
+  metadata before dialing, but still executes route attempts sequentially
 - current per-request service execution still clones boxed service layers
 
 Optimization priority order:
 
 1. replace sequential multi-address connect with fast fallback
-2. move reuse bookkeeping into the owned pool
+2. remove temporary task-local propagation from the acquisition path
 3. avoid avoidable cold-connect cloning
 4. preserve low-overhead observability on warm paths
 

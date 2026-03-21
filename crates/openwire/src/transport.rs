@@ -1,9 +1,8 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -29,11 +28,16 @@ use crate::auth::{
     AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
     SharedAuthenticator,
 };
+use crate::connection::{Address, ConnectionProtocol, ExchangeFinder, RouteKind, RoutePlanner};
 use crate::proxy::Proxy;
 use crate::trace::PolicyTraceContext;
 
 tokio::task_local! {
     static CURRENT_CALL_CONTEXT: CallContext;
+}
+
+tokio::task_local! {
+    static CURRENT_REQUEST_ADDRESS: Address;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,6 +187,7 @@ pub(crate) struct ConnectorStack {
     pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) proxies: Vec<Proxy>,
+    pub(crate) route_planner: RoutePlanner,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_proxy_auth_attempts: usize,
 }
@@ -223,6 +228,7 @@ impl Service<Uri> for ConnectorStack {
         let tls_connector = self.tls_connector.clone();
         let connect_timeout = self.connect_timeout;
         let proxies = self.proxies.clone();
+        let route_planner = self.route_planner.clone();
         let proxy_connect_deps = ProxyConnectDeps {
             dns_resolver,
             tcp_connector,
@@ -234,7 +240,12 @@ impl Service<Uri> for ConnectorStack {
 
         Box::pin(async move {
             let ctx = current_call_context()?;
-            if let Some(proxy) = proxies.iter().find(|proxy| proxy.matches(&uri)) {
+            let proxy = proxies.iter().find(|proxy| proxy.matches(&uri));
+            let address = current_request_address()
+                .map(Ok)
+                .unwrap_or_else(|| Address::from_uri(&uri, proxy))?;
+
+            if let Some(proxy) = proxy {
                 if proxy.intercepts_http()
                     && uri
                         .scheme_str()
@@ -242,7 +253,8 @@ impl Service<Uri> for ConnectorStack {
                 {
                     return connect_via_http_forward_proxy(
                         ctx,
-                        proxy,
+                        address,
+                        route_planner.clone(),
                         proxy_connect_deps.dns_resolver.clone(),
                         proxy_connect_deps.tcp_connector.clone(),
                         proxy_connect_deps.connect_timeout,
@@ -255,13 +267,22 @@ impl Service<Uri> for ConnectorStack {
                         .scheme_str()
                         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
                 {
-                    return connect_via_http_proxy(ctx, uri, proxy, proxy_connect_deps).await;
+                    return connect_via_http_proxy(
+                        ctx,
+                        uri,
+                        address,
+                        route_planner,
+                        proxy_connect_deps,
+                    )
+                    .await;
                 }
             }
 
             connect_direct(
                 ctx,
                 uri,
+                address,
+                route_planner,
                 proxy_connect_deps.dns_resolver,
                 proxy_connect_deps.tcp_connector,
                 proxy_connect_deps.tls_connector,
@@ -275,25 +296,26 @@ impl Service<Uri> for ConnectorStack {
 async fn connect_direct(
     ctx: CallContext,
     uri: Uri,
+    address: Address,
+    route_planner: RoutePlanner,
     dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let host = uri
-        .host()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?
-        .to_owned();
-
     let scheme = uri
         .scheme_str()
         .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
-    let port = default_port(&uri)?;
-
+    let host = address.authority().host().to_owned();
+    let port = address.authority().port();
     let addrs = dns_resolver.resolve(ctx.clone(), host, port).await?;
+    let route_plan = route_planner.plan_direct(address, addrs);
     let mut last_error = None;
 
-    for addr in addrs {
+    for route in route_plan.iter().cloned() {
+        let &RouteKind::Direct { target: addr } = route.kind() else {
+            continue;
+        };
         match tcp_connector
             .connect(ctx.clone(), addr, connect_timeout)
             .await
@@ -327,26 +349,30 @@ async fn connect_direct(
 
 async fn connect_via_http_forward_proxy(
     ctx: CallContext,
-    proxy: &Proxy,
+    address: Address,
+    route_planner: RoutePlanner,
     dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let proxy_host = proxy
-        .target()
-        .host_str()
-        .ok_or_else(|| WireError::invalid_request("proxy URL is missing a host"))?
-        .to_owned();
-    let proxy_port = proxy.target().port_or_known_default().ok_or_else(|| {
-        WireError::invalid_request("proxy URL is missing a port and has no known default")
+    let proxy = address.proxy().ok_or_else(|| {
+        WireError::internal(
+            "missing proxy config for forward proxy route",
+            io::Error::other("missing proxy config"),
+        )
     })?;
-
+    let proxy_host = proxy.endpoint().authority().host().to_owned();
+    let proxy_port = proxy.endpoint().authority().port();
     let addrs = dns_resolver
         .resolve(ctx.clone(), proxy_host, proxy_port)
         .await?;
+    let route_plan = route_planner.plan_http_forward(address, addrs);
     let mut last_error = None;
 
-    for addr in addrs {
+    for route in route_plan.iter().cloned() {
+        let &RouteKind::HttpForwardProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
         match tcp_connector
             .connect(ctx.clone(), addr, connect_timeout)
             .await
@@ -372,7 +398,8 @@ async fn connect_via_http_forward_proxy(
 async fn connect_via_http_proxy(
     ctx: CallContext,
     target_uri: Uri,
-    proxy: &Proxy,
+    address: Address,
+    route_planner: RoutePlanner,
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let target_scheme = target_uri
@@ -384,22 +411,25 @@ async fn connect_via_http_proxy(
         ));
     }
 
-    let proxy_host = proxy
-        .target()
-        .host_str()
-        .ok_or_else(|| WireError::invalid_request("proxy URL is missing a host"))?
-        .to_owned();
-    let proxy_port = proxy.target().port_or_known_default().ok_or_else(|| {
-        WireError::invalid_request("proxy URL is missing a port and has no known default")
+    let proxy = address.proxy().ok_or_else(|| {
+        WireError::internal(
+            "missing proxy config for CONNECT route",
+            io::Error::other("missing proxy config"),
+        )
     })?;
-
+    let proxy_host = proxy.endpoint().authority().host().to_owned();
+    let proxy_port = proxy.endpoint().authority().port();
     let addrs = deps
         .dns_resolver
         .resolve(ctx.clone(), proxy_host, proxy_port)
         .await?;
+    let route_plan = route_planner.plan_connect_proxy(address, addrs);
     let mut last_error = None;
 
-    for addr in addrs {
+    for route in route_plan.iter().cloned() {
+        let &RouteKind::ConnectProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
         match deps
             .tcp_connector
             .connect(ctx.clone(), addr, deps.connect_timeout)
@@ -796,30 +826,20 @@ impl hyper::rt::Write for ProxiedConnection {
     }
 }
 
-fn default_port(uri: &Uri) -> Result<u16, WireError> {
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
-    Ok(uri.port_u16().unwrap_or_else(|| {
-        if scheme.eq_ignore_ascii_case("https") {
-            443
-        } else {
-            80
-        }
-    }))
-}
-
 #[derive(Clone)]
 pub(crate) struct TransportService {
     pub(crate) client: HyperClient<ConnectorStack, RequestBody>,
-    connection_registry: Arc<Mutex<HashSet<openwire_core::ConnectionId>>>,
+    exchange_finder: Arc<ExchangeFinder>,
 }
 
 impl TransportService {
-    pub(crate) fn new(client: HyperClient<ConnectorStack, RequestBody>) -> Self {
+    pub(crate) fn new(
+        client: HyperClient<ConnectorStack, RequestBody>,
+        exchange_finder: Arc<ExchangeFinder>,
+    ) -> Self {
         Self {
             client,
-            connection_registry: Arc::new(Mutex::new(HashSet::new())),
+            exchange_finder,
         }
     }
 }
@@ -835,9 +855,10 @@ impl Service<Exchange> for TransportService {
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
         let client = self.client.clone();
-        let connection_registry = self.connection_registry.clone();
+        let exchange_finder = self.exchange_finder.clone();
         Box::pin(async move {
             let (request, ctx, attempt) = exchange.into_parts();
+            let prepared = exchange_finder.prepare(&request)?;
             let request_body_len = request.body().replayable_len();
             let policy_trace = request
                 .extensions()
@@ -848,27 +869,43 @@ impl Service<Exchange> for TransportService {
             let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
 
             async move {
-                let response = with_call_context(ctx.clone(), async move {
-                    client.request(request).await.map_err(map_client_error)
-                })
-                .await?;
+                let request_address = prepared.address().clone();
+                let result = with_call_context(
+                    ctx.clone(),
+                    with_request_address(request_address, async move {
+                        client.request(request).await.map_err(map_client_error)
+                    }),
+                )
+                .await;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        exchange_finder.discard_prepared(&prepared);
+                        return Err(error);
+                    }
+                };
 
                 if let Some(bytes) = request_body_len {
                     ctx.listener().request_body_end(&ctx, bytes);
                 }
 
                 let connection_info = response.extensions().get::<ConnectionInfo>().cloned();
+                let mut observed_connection = None;
                 if let Some(info) = &connection_info {
-                    let reused = {
-                        let mut seen = connection_registry
-                            .lock()
-                            .expect("connection registry lock");
-                        !seen.insert(info.id)
+                    let protocol = if response.version() == Version::HTTP_2 {
+                        ConnectionProtocol::Http2
+                    } else {
+                        ConnectionProtocol::Http1
                     };
+                    let observed = exchange_finder.observe_connection(&prepared, info, protocol);
+                    let reused = observed.reused();
+                    observed_connection = Some(observed.connection().clone());
                     ctx.listener().connection_acquired(&ctx, info.id, reused);
                     let span = tracing::Span::current();
                     span.record("connection_id", info.id.as_u64());
                     span.record("connection_reused", reused);
+                } else {
+                    exchange_finder.discard_prepared(&prepared);
                 }
 
                 ctx.listener().response_headers_start(&ctx);
@@ -877,7 +914,8 @@ impl Service<Exchange> for TransportService {
                     body,
                     ctx.clone(),
                     attempt,
-                    connection_info,
+                    observed_connection,
+                    exchange_finder.clone(),
                     tracing::Span::current(),
                 );
                 let response = Response::from_parts(parts, body);
@@ -935,7 +973,8 @@ struct ObservedIncomingBody {
     ctx: CallContext,
     attempt: u32,
     bytes_read: u64,
-    connection_id: Option<openwire_core::ConnectionId>,
+    connection: Option<crate::connection::RealConnection>,
+    exchange_finder: Arc<ExchangeFinder>,
     span: tracing::Span,
     finished: bool,
 }
@@ -945,7 +984,8 @@ impl ObservedIncomingBody {
         body: Incoming,
         ctx: CallContext,
         attempt: u32,
-        info: Option<ConnectionInfo>,
+        connection: Option<crate::connection::RealConnection>,
+        exchange_finder: Arc<ExchangeFinder>,
         span: tracing::Span,
     ) -> ResponseBody {
         ResponseBody::new(
@@ -954,7 +994,8 @@ impl ObservedIncomingBody {
                 ctx,
                 attempt,
                 bytes_read: 0,
-                connection_id: info.map(|info| info.id),
+                connection,
+                exchange_finder,
                 span,
                 finished: false,
             }
@@ -1001,10 +1042,11 @@ impl ObservedIncomingBody {
     }
 
     fn release_connection(&mut self) {
-        if let Some(connection_id) = self.connection_id {
+        if let Some(connection) = &self.connection {
+            let _ = self.exchange_finder.release(connection);
             self.ctx
                 .listener()
-                .connection_released(&self.ctx, connection_id);
+                .connection_released(&self.ctx, connection.id());
         }
     }
 }
@@ -1102,4 +1144,15 @@ where
     F: Future<Output = T>,
 {
     CURRENT_CALL_CONTEXT.scope(ctx, future).await
+}
+
+async fn with_request_address<F, T>(address: Address, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CURRENT_REQUEST_ADDRESS.scope(address, future).await
+}
+
+fn current_request_address() -> Option<Address> {
+    CURRENT_REQUEST_ADDRESS.try_with(Clone::clone).ok()
 }

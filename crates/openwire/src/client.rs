@@ -14,6 +14,7 @@ use tracing::Instrument;
 
 use crate::auth::{Authenticator, SharedAuthenticator};
 use crate::bridge::BridgeInterceptor;
+use crate::connection::{ConnectionPool, ExchangeFinder, PoolSettings, RoutePlanner};
 use crate::cookie::{CookieJar, SharedCookieJar};
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
@@ -241,17 +242,26 @@ impl ClientBuilder {
             proxies.extend(system_proxies_from_env()?);
         }
 
+        let pool = Arc::new(ConnectionPool::new(PoolSettings {
+            idle_timeout: self.transport.pool_idle_timeout,
+            max_idle_per_address: self.transport.pool_max_idle_per_host,
+        }));
+        let exchange_finder = Arc::new(ExchangeFinder::new(pool, proxies.clone()));
         let connector = ConnectorStack {
             dns_resolver: self.dns_resolver,
             tcp_connector: self.tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
             proxies,
+            route_planner: RoutePlanner::default(),
             proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
         };
 
-        let transport = TransportService::new(build_hyper_client(connector, &self.transport));
+        let transport = TransportService::new(
+            build_hyper_client(connector, &self.transport),
+            exchange_finder,
+        );
         let service = build_service_chain(
             transport,
             self.application_interceptors,

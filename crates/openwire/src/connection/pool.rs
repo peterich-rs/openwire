@@ -71,6 +71,23 @@ impl ConnectionPool {
         connection.release()
     }
 
+    pub(crate) fn get_by_id(
+        &self,
+        address: &Address,
+        connection_id: ConnectionId,
+    ) -> Option<RealConnection> {
+        self.connections
+            .lock()
+            .expect("connection pool lock")
+            .get(address)
+            .and_then(|connections| {
+                connections
+                    .iter()
+                    .find(|connection| connection.id() == connection_id)
+                    .cloned()
+            })
+    }
+
     pub(crate) fn remove(&self, connection_id: ConnectionId) -> Option<RealConnection> {
         let mut pool = self.connections.lock().expect("connection pool lock");
         let keys = pool.keys().cloned().collect::<Vec<_>>();

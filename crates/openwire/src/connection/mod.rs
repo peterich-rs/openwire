@@ -1,9 +1,13 @@
 #![allow(dead_code, unused_imports)]
 
+mod exchange_finder;
 mod planning;
 mod pool;
 mod real_connection;
 
+pub(crate) use exchange_finder::{
+    ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
+};
 pub(crate) use planning::{
     Address, AuthorityKey, ConnectAttempt, ConnectAttemptState, ConnectFailure,
     ConnectFailureStage, ConnectPlan, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig,

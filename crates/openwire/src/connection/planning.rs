@@ -303,6 +303,24 @@ impl Route {
         Self::proxy_route(address, proxy, RouteKind::SocksProxy { proxy })
     }
 
+    pub(crate) fn from_observed(address: Address, remote_addr: Option<SocketAddr>) -> Self {
+        let proxy = address.proxy().cloned();
+        let fallback_addr = remote_addr.unwrap_or_else(|| {
+            let port = proxy
+                .as_ref()
+                .map(|proxy| proxy.endpoint().authority().port())
+                .unwrap_or_else(|| address.authority().port());
+            SocketAddr::from(([0, 0, 0, 0], port))
+        });
+
+        match proxy.map(|proxy| proxy.mode()) {
+            Some(ProxyMode::Forward) => Self::http_forward(address, fallback_addr),
+            Some(ProxyMode::Connect) => Self::connect_proxy(address, fallback_addr),
+            Some(ProxyMode::SocksTunnel) => Self::socks_proxy(address, fallback_addr),
+            None => Self::direct(address, fallback_addr),
+        }
+    }
+
     fn proxy_route(address: Address, proxy: SocketAddr, kind: RouteKind) -> Self {
         let authority = address.authority();
         Self {
