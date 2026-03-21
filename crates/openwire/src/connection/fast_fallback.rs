@@ -67,7 +67,6 @@ impl FastFallbackDialer {
             let ctx = ctx.clone();
             let tx = tx.clone();
             let tcp_connector = tcp_connector.clone();
-            let route_count = route_count;
             handles.push(tokio::spawn(
                 async move {
                     if attempt.scheduled_after() > Duration::ZERO {
@@ -434,6 +433,7 @@ mod tests {
         BoxConnection, CallContext, ConnectionInfo, NoopEventListenerFactory,
         SharedEventListenerFactory, WireError, WireErrorKind,
     };
+    use tokio::sync::Notify;
 
     use super::FastFallbackDialer;
     use crate::connection::{
@@ -443,11 +443,12 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedTcpConnector {
         scripts: Arc<HashMap<SocketAddr, TcpScript>>,
+        success_notifiers: Arc<HashMap<SocketAddr, Arc<Notify>>>,
         attempts: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum TcpScript {
         Success { delay: Duration },
         Fail { delay: Duration },
@@ -457,8 +458,19 @@ mod tests {
         fn new(scripts: impl IntoIterator<Item = (SocketAddr, TcpScript)>) -> Self {
             Self {
                 scripts: Arc::new(scripts.into_iter().collect()),
+                success_notifiers: Arc::new(HashMap::new()),
                 attempts: Arc::new(AtomicUsize::new(0)),
                 drops: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_success_notifiers(
+            self,
+            notifiers: impl IntoIterator<Item = (SocketAddr, Arc<Notify>)>,
+        ) -> Self {
+            Self {
+                success_notifiers: Arc::new(notifiers.into_iter().collect()),
+                ..self
             }
         }
     }
@@ -473,8 +485,9 @@ mod tests {
             let script = self
                 .scripts
                 .get(&addr)
-                .copied()
+                .cloned()
                 .expect("missing tcp script");
+            let success_notifier = self.success_notifiers.get(&addr).cloned();
             let attempts = self.attempts.clone();
             let drops = self.drops.clone();
             Box::pin(async move {
@@ -493,7 +506,11 @@ mod tests {
                             tls: false,
                         };
                         ctx.listener().connect_end(&ctx, info.id, addr);
-                        Ok(Box::new(TestConnection::new(info, drops)) as BoxConnection)
+                        let stream = Box::new(TestConnection::new(info, drops)) as BoxConnection;
+                        if let Some(success_notifier) = success_notifier {
+                            success_notifier.notify_one();
+                        }
+                        Ok(stream)
                     }
                     TcpScript::Fail { .. } => {
                         let error = WireError::connect(
@@ -514,11 +531,18 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum TlsScript {
-        Pass { delay: Duration },
-        Fail { delay: Duration },
-        FailNonRetryable { delay: Duration },
+        Pass {
+            delay: Duration,
+            wait_for: Option<Arc<Notify>>,
+        },
+        Fail {
+            delay: Duration,
+        },
+        FailNonRetryable {
+            delay: Duration,
+        },
     }
 
     impl ScriptedTlsConnector {
@@ -545,7 +569,12 @@ mod tests {
                 let script = scripts.lock().expect("tls scripts").remove(0);
                 ctx.listener().tls_start(&ctx, &host);
                 match script {
-                    TlsScript::Pass { delay } => {
+                    TlsScript::Pass { delay, wait_for } => {
+                        if let Some(wait_for) = wait_for {
+                            tokio::time::timeout(Duration::from_secs(1), wait_for.notified())
+                                .await
+                                .expect("expected a completed loser connection before TLS exit");
+                        }
                         tokio::time::sleep(delay).await;
                         ctx.listener().tls_end(&ctx, &host);
                         Ok(stream)
@@ -677,6 +706,7 @@ mod tests {
             },
             TlsScript::Pass {
                 delay: Duration::from_millis(1),
+                wait_for: None,
             },
         ]));
 
@@ -703,22 +733,27 @@ mod tests {
     async fn cleanup_drops_completed_loser_streams_after_winner_is_selected() {
         let addr1 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 11), 443));
         let addr2 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 12), 443));
-        let tcp = Arc::new(ScriptedTcpConnector::new([
-            (
-                addr1,
-                TcpScript::Success {
-                    delay: Duration::ZERO,
-                },
-            ),
-            (
-                addr2,
-                TcpScript::Success {
-                    delay: Duration::from_millis(2),
-                },
-            ),
-        ]));
+        let loser_connected = Arc::new(Notify::new());
+        let tcp = Arc::new(
+            ScriptedTcpConnector::new([
+                (
+                    addr1,
+                    TcpScript::Success {
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    addr2,
+                    TcpScript::Success {
+                        delay: Duration::from_millis(2),
+                    },
+                ),
+            ])
+            .with_success_notifiers([(addr2, loser_connected.clone())]),
+        );
         let tls = Arc::new(ScriptedTlsConnector::new(vec![TlsScript::Pass {
-            delay: Duration::from_millis(5),
+            delay: Duration::ZERO,
+            wait_for: Some(loser_connected),
         }]));
 
         let (stream, _outcome) = FastFallbackDialer
@@ -735,10 +770,7 @@ mod tests {
 
         drop(stream);
         assert_eq!(tls.calls.load(Ordering::Relaxed), 1);
-        assert!(
-            tcp.drops.load(Ordering::Relaxed) >= 2,
-            "winner + loser streams should be dropped"
-        );
+        assert_eq!(tcp.drops.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -765,6 +797,7 @@ mod tests {
             },
             TlsScript::Pass {
                 delay: Duration::from_millis(1),
+                wait_for: None,
             },
         ]));
 

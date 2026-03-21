@@ -30,8 +30,8 @@ use crate::auth::{
     SharedAuthenticator,
 };
 use crate::connection::{
-    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, Route, RouteKind, RoutePlan,
-    RoutePlanner, UriScheme,
+    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, Route,
+    RouteKind, RoutePlan, RoutePlanner, UriScheme,
 };
 use crate::trace::PolicyTraceContext;
 
@@ -211,7 +211,7 @@ impl ConnectorStack {
         ctx: CallContext,
         address: &Address,
     ) -> Result<RoutePlan, WireError> {
-        let (dns_host, dns_port) = self.route_planner.dns_target(&address);
+        let (dns_host, dns_port) = self.route_planner.dns_target(address);
         let resolved_addrs = self
             .dns_resolver
             .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
@@ -242,7 +242,7 @@ async fn connect_route_plan(
 
     match first_route.kind() {
         RouteKind::Direct { .. } => {
-            return connect_direct(
+            connect_direct(
                 ctx,
                 uri,
                 route_plan,
@@ -250,23 +250,19 @@ async fn connect_route_plan(
                 deps.tls_connector,
                 deps.connect_timeout,
             )
-            .await;
+            .await
         }
         RouteKind::HttpForwardProxy { .. } => {
-            return connect_via_http_forward_proxy(
+            connect_via_http_forward_proxy(
                 ctx,
                 route_plan,
                 deps.tcp_connector,
                 deps.connect_timeout,
             )
-            .await;
+            .await
         }
-        RouteKind::ConnectProxy { .. } => {
-            return connect_via_http_proxy(ctx, uri, route_plan, deps).await;
-        }
-        RouteKind::SocksProxy { .. } => {
-            return connect_via_socks_proxy(ctx, uri, route_plan, deps).await;
-        }
+        RouteKind::ConnectProxy { .. } => connect_via_http_proxy(ctx, uri, route_plan, deps).await,
+        RouteKind::SocksProxy { .. } => connect_via_socks_proxy(ctx, uri, route_plan, deps).await,
     }
 }
 
@@ -292,11 +288,15 @@ async fn connect_direct(
         .with_current_subscriber()
         .await?;
     let span = tracing::Span::current();
+    record_fast_fallback_trace(&span, outcome);
+    Ok(stream)
+}
+
+fn record_fast_fallback_trace(span: &tracing::Span, outcome: FastFallbackOutcome) {
     span.record("route_count", outcome.route_count as u64);
     span.record("fast_fallback_enabled", outcome.fast_fallback_enabled);
     span.record("connect_race_id", outcome.race_id);
     span.record("connect_winner", outcome.winner_index as u64);
-    Ok(stream)
 }
 
 async fn connect_via_http_forward_proxy(
@@ -307,7 +307,7 @@ async fn connect_via_http_forward_proxy(
 ) -> Result<BoxConnection, WireError> {
     let mut last_error = None;
 
-    for route in route_plan.iter().cloned() {
+    for route in route_plan.iter() {
         let &RouteKind::HttpForwardProxy { proxy: addr } = route.kind() else {
             continue;
         };
@@ -346,7 +346,7 @@ async fn connect_via_http_proxy(
     }
     let mut last_error = None;
 
-    for route in route_plan.iter().cloned() {
+    for route in route_plan.iter() {
         let &RouteKind::ConnectProxy { proxy: addr } = route.kind() else {
             continue;
         };
@@ -406,7 +406,7 @@ async fn connect_via_socks_proxy(
 ) -> Result<BoxConnection, WireError> {
     let mut last_error = None;
 
-    for route in route_plan.iter().cloned() {
+    for route in route_plan.iter() {
         let &RouteKind::SocksProxy { proxy: addr } = route.kind() else {
             continue;
         };
@@ -1848,4 +1848,159 @@ fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
     let mut extensions = http::Extensions::new();
     connected.get_extras(&mut extensions);
     extensions.remove::<CoalescingInfo>().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Id, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    use super::{record_fast_fallback_trace, FastFallbackOutcome};
+
+    #[derive(Clone, Debug)]
+    struct CapturedSpan {
+        name: String,
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct TraceCaptureInner {
+        span_order: Vec<u64>,
+        spans: HashMap<u64, CapturedSpan>,
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture {
+        inner: Arc<Mutex<TraceCaptureInner>>,
+    }
+
+    impl TraceCapture {
+        fn spans_named(&self, name: &str) -> Vec<CapturedSpan> {
+            let inner = self.inner.lock().expect("trace capture lock");
+            inner
+                .span_order
+                .iter()
+                .filter_map(|id| inner.spans.get(id))
+                .filter(|span| span.name == name)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl<S> Layer<S> for TraceCapture
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &Id,
+            _ctx: LayerContext<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            attrs.record(&mut visitor);
+            let mut inner = self.inner.lock().expect("trace capture lock");
+            let id = id.into_u64();
+            inner.span_order.push(id);
+            inner.spans.insert(
+                id,
+                CapturedSpan {
+                    name: attrs.metadata().name().to_owned(),
+                    fields: visitor.fields,
+                },
+            );
+        }
+
+        fn on_record(
+            &self,
+            id: &Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: LayerContext<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            values.record(&mut visitor);
+            if let Some(span) = self
+                .inner
+                .lock()
+                .expect("trace capture lock")
+                .spans
+                .get_mut(&id.into_u64())
+            {
+                span.fields.extend(visitor.fields);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        fields: HashMap<String, String>,
+    }
+
+    impl Visit for FieldCapture {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[test]
+    fn record_fast_fallback_trace_records_expected_attempt_fields() {
+        let trace = TraceCapture::default();
+        let subscriber = tracing_subscriber::registry().with(trace.clone());
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(subscriber), || {
+            let span = tracing::debug_span!(
+                "openwire.attempt",
+                route_count = tracing::field::Empty,
+                fast_fallback_enabled = tracing::field::Empty,
+                connect_race_id = tracing::field::Empty,
+                connect_winner = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            record_fast_fallback_trace(
+                &span,
+                FastFallbackOutcome {
+                    race_id: 7,
+                    route_count: 2,
+                    winner_index: 1,
+                    fast_fallback_enabled: true,
+                },
+            );
+        });
+
+        let spans = trace.spans_named("openwire.attempt");
+        assert_eq!(spans.len(), 1, "spans = {spans:?}");
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("route_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            span.fields.get("fast_fallback_enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            span.fields.get("connect_race_id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            span.fields.get("connect_winner").map(String::as_str),
+            Some("1")
+        );
+    }
 }
