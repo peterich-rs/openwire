@@ -30,6 +30,8 @@ The next work should build on this base instead of reopening transport internals
 
 - 2026-03-20: internal `BridgeInterceptor` merged with integration coverage for empty, fixed-size, and streaming request bodies
 - 2026-03-20: minimal safe retry policy merged with integration coverage for retried success, retry exhaustion, non-replayable bodies, and retry/redirect count separation
+- 2026-03-21: request API boundary verified in the public examples and README around `http::Request<RequestBody>` plus `client.execute(request)`
+- 2026-03-21: observability stabilization verified with stable attempt span fields, response-body failure handling, and event-ordering regression coverage
 
 ## Priority Rules
 
@@ -151,24 +153,91 @@ OpenWire already emits `response_body_failed`, exposes connection reuse in `conn
 Add higher-level HTTP client behavior only after the request API boundary and
 observability stabilization are done.
 
-### CookieJar
+Detailed implementation planning for this phase lives in
+[docs/implementation-plan.md](implementation-plan.md).
 
-- define a `CookieJar` trait
-- load cookies before request send
-- save cookies from response headers after response receive
-- wire cookie application into the built-in request normalization/policy stack, not transport
+### Active Start Point
 
-### Authenticator
+The first work inside P3 should be `Core Semantics Hardening` before any new
+public feature lands.
 
-- define an `Authenticator` trait for follow-up requests
-- handle `401` and `407` in policy code, not in transport
-- restrict the first implementation to straightforward follow-up generation
+- treat the core request path as two linked foundations:
+  transport core plus policy core
+- prefer mature, widely used open-source crates as default subsystem
+  implementations where possible, while keeping OpenWire's API and policy model
+  owned in-house behind trait boundaries
+- finish clarifying retry, redirect, follow-up, request snapshot, and response
+  lifecycle semantics before adding higher-level features
+- keep cookies, auth, and cache in policy/interceptor code instead of
+  transport code
 
-### Cache
+### Default Implementation Principle
 
-- defer to a dedicated `openwire-cache` crate
-- implement as interceptor-layer behavior, not transport-layer behavior
-- follow HTTP caching semantics instead of ad hoc memoization
+OpenWire should not try to win by re-implementing commodity infrastructure.
+
+- adopt proven defaults for protocol, middleware, TLS, and similar subsystems
+- wrap those defaults behind OpenWire-owned traits and orchestration layers
+- spend implementation effort on API quality, observability, control surfaces,
+  extension points, and behavior contracts
+
+For each future capability, do a short build-vs-adopt decision pass before
+implementation starts.
+
+### Current Design Constraint
+
+Current retry and redirect follow-up requests are rebuilt from snapshots that
+preserve method, URI, version, headers, and replayable bodies, but they do not
+preserve arbitrary `http::Extensions`.
+
+Implication:
+
+- P3 should not assume automatic cloning of arbitrary request metadata across
+  retries, redirects, or future auth follow-ups
+- internal policy state for cookies/auth/cache should live in policy-owned
+  state, not transport
+- any broader request-metadata survivability promise must be designed
+  explicitly instead of being implied by the current snapshot logic
+
+### Phase Split
+
+#### P3.0: Core Semantics Hardening
+
+- extract retry and redirect services into `openwire::policy::*` internals
+- establish a single follow-up coordinator for retry, redirect, and future
+  authenticator flows
+- add a subsystem decision matrix for later features so defaults can come from
+  proven crates without leaking those choices into the public API
+- define the internal request snapshot / response-head / follow-up decision
+  model used by retry, redirect, and authenticator flows
+- keep tracing field names stable while allowing new optional policy counters
+- preserve the canonical execution chain:
+  user API -> `Client::execute` -> call context -> event listener ->
+  interceptor/policy chain -> transport -> connector stack -> hyper
+
+#### P3.1: CookieJar
+
+- define a public `CookieJar` trait
+- load request cookies before each network attempt
+- persist `Set-Cookie` headers after response headers are received
+- keep cookie matching and storage out of transport and out of the bridge
+  normalization code
+
+#### P3.2: Authenticator
+
+- define a public `Authenticator` trait for follow-up request generation
+- handle origin auth in policy code and reserve the same coordinator for proxy
+  auth when proxy support expands
+- require replayable request bodies for automatic auth follow-ups
+- keep auth loop limits independent from retry and redirect limits
+
+#### P3.3: `openwire-cache`
+
+- introduce a dedicated `openwire-cache` crate instead of growing cache logic
+  inside `openwire-core` or transport
+- implement cache lookup, conditional revalidation, and invalidation as
+  interceptor behavior
+- scope the first cache milestone to RFC-aligned GET/HEAD behavior before
+  broader optimizations
 
 ### Acceptance Gate For Starting P3
 
@@ -176,6 +245,10 @@ Do not begin this phase until:
 
 - request API boundary is considered stable
 - observability fields are considered stable enough for downstream tooling
+
+This gate is now considered satisfied by the current merged code and test
+coverage. The next stage should start with `P3.0: Core Semantics Hardening`,
+not with transport expansion and not with higher-level HTTP features first.
 
 ## Deferred For Now
 
@@ -208,8 +281,7 @@ Definition of done for a roadmap item:
 
 ## Suggested Execution Order
 
-1. Request API boundary
-2. Observability stabilization
-3. CookieJar
-4. Authenticator
-5. `openwire-cache`
+1. Core semantics hardening
+2. CookieJar
+3. Authenticator
+4. `openwire-cache`

@@ -18,7 +18,8 @@ This workspace uses:
 ## Roadmap
 
 - Long-term planning and accepted next-stage work live in [docs/roadmap.md](docs/roadmap.md)
-- The current near-term roadmap now starts with request API boundary clarification and observability stabilization
+- The active near-term roadmap now starts with `Core Semantics Hardening` for the request execution chain, before `CookieJar`, `Authenticator`, and `openwire-cache`
+- Detailed implementation planning lives in [docs/implementation-plan.md](docs/implementation-plan.md)
 
 ## Current API
 
@@ -46,15 +47,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - event listener factory and per-call event listeners
 - built-in request normalization for `Host`, `User-Agent`, and request body framing
 - minimal safe retries for replayable requests on connection-establishment failures
+- configurable `CookieJar` support with a default in-memory `Jar`
+- configurable `Authenticator` support for origin `401` follow-ups on replayable requests
+- HTTP proxy forwarding and HTTPS-over-HTTP proxy tunneling via `Proxy::http(...)`, `Proxy::https(...)`, and `Proxy::all(...)`
+- `proxy_authenticator(...)` support for both response-path `407` handling and HTTPS `CONNECT` tunnel authentication
+- `NoProxy` exclusions for exact hosts, domain suffixes, and loopback/localhost addresses
+- opt-in system proxy loading via `use_system_proxy(true)` from common `*_proxy` / `NO_PROXY` environment variables
+- environment `NO_PROXY` parsing for wildcard `*`, host/domain exclusions, and IP CIDR ranges
 - custom DNS resolver / TCP connector / TLS connector hooks
 - redirect handling with basic authority-sensitive header stripping
-- call timeout and connect timeout
+- call timeout and connect timeout, including proxy CONNECT handshake reads
 - typed request metadata via standard `http::Extensions`
 - connection pooling via `hyper-util`
 - default Tokio runtime integration
 - default rustls TLS connector with platform verifier or native roots fallback
 - response body wrappers with body-end and connection-release events
-- examples and integration tests for HTTP, redirect, custom DNS, interceptors, events, and TLS
+- examples and integration tests for HTTP, cookies, auth, proxy, redirect, custom DNS, interceptors, events, and TLS
 
 ## Verification
 
