@@ -31,7 +31,7 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
-- [docs/tasks.md](docs/tasks.md): active / deferred execution tracker
+- [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start
 

@@ -28,7 +28,7 @@ openwire/
 ├── crates/openwire-test     test support
 └── docs/
     ├── DESIGN.md            canonical technical design
-    └── tasks.md             active / deferred execution tracker
+    └── tasks.md             deferred follow-on tracker
 ```
 
 Layering rules:
@@ -496,7 +496,7 @@ That local coverage remains the primary verification layer for:
 - retry / redirect / auth event ordering
 - response-body failure and half-close handling
 
-Accepted next-step design:
+Current live-validation architecture:
 
 - add a separate live-network integration test target under
   `crates/openwire/tests/`
@@ -527,7 +527,7 @@ Live-network suite rules:
 - live tests must not become the only coverage for any behavior that depends on
   strict timing or server-side fault injection
 
-Phase-1 zero-config public targets:
+Current zero-config public targets:
 
 - `https://httpbingo.org/` for HTTP methods, headers, cookies, redirects,
   status codes, delays, streaming, range, auth, and cache / ETag semantics
@@ -535,14 +535,14 @@ Phase-1 zero-config public targets:
 - `https://postman-echo.com/` for a second public echo surface
 - `https://jsonplaceholder.typicode.com/` for basic JSON REST smoke checks
 
-Phase-1 live coverage is intentionally limited to:
+Current live coverage is intentionally limited to:
 
 - request / response interoperability against real public origins
 - DNS + TCP + TLS establishment against the public internet
 - redirect following, cookie-jar roundtrip, timeout, and basic auth smoke paths
 - public JSON response parsing and broad header behavior
 
-The following remain local-only in the first live-validation phase:
+The following remain local-only:
 
 - custom proxy and proxy-auth flows
 - fast-fallback race timing
@@ -550,11 +550,11 @@ The following remain local-only in the first live-validation phase:
 - HTTP/2 multiplexing and pool reuse detail
 - cache semantics beyond narrow smoke coverage
 
-Configured external APIs such as GitHub, Webhook.site, or ReqRes are explicitly
-deferred to a later verification phase because they introduce tokens, temporary
-URLs, rate limits, or project provisioning.
+Configured external APIs such as GitHub, Webhook.site, or ReqRes remain outside
+the baseline live suite because they introduce tokens, temporary URLs, rate
+limits, or project provisioning.
 
-Exact invocation contract for the planned live suite:
+Exact invocation contract for the live suite:
 
 ```bash
 cargo test -p openwire --test live_network -- --ignored --test-threads=1
@@ -571,7 +571,7 @@ Automation contract for repository-hosted execution:
   `cargo test -p openwire --test live_network -- --ignored --test-threads=1`
 - it must never become a dependency of the `CI Gate` job in `.github/workflows/ci.yml`
 
-Current live-network coverage on this branch includes:
+Current live-network coverage includes:
 
 - `httpbingo` GET / POST echo smoke checks
 - `httpbingo` redirect-following and no-redirect client behavior
@@ -581,7 +581,7 @@ Current live-network coverage on this branch includes:
 - `jsonplaceholder` GET / POST JSON REST smoke checks
 
 TLS-version-policy live checks against `tls-v1-*` `badssl` endpoints remain
-deferred to a later slice because zero-config outcomes vary with the active
+deferred because zero-config outcomes vary with the active
 platform verifier and OS certificate / policy defaults.
 
 Live-suite maintenance rules:
@@ -596,7 +596,7 @@ Live-suite maintenance rules:
 - keep the live suite opt-in and serial unless there is strong evidence that a
   parallel contract remains stable across providers
 
-Deferred follow-on themes after the first live-validation slice:
+Deferred follow-on themes outside the baseline live suite:
 
 - GitHub REST API: unauthenticated public metadata reads such as
   `GET https://api.github.com/repos/peterich-rs/openwire` work within the
