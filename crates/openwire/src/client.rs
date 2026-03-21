@@ -21,9 +21,7 @@ use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
 use crate::proxy::{system_proxies_from_env, Proxy};
-use crate::transport::{
-    build_hyper_client, ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService,
-};
+use crate::transport::{ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService};
 
 #[derive(Clone)]
 pub struct Client {
@@ -260,7 +258,9 @@ impl ClientBuilder {
         };
 
         let transport = TransportService::new(
-            build_hyper_client(connector, &self.transport),
+            connector,
+            self.transport.clone(),
+            self.runtime.clone(),
             exchange_finder,
         );
         let service = build_service_chain(

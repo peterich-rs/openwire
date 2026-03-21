@@ -114,10 +114,10 @@ User API
                 -> derive Address
                 -> ExchangeFinder
                   -> ConnectionPool lookup / reserve
-                -> with_call_context (tokio::task_local propagation)
-                -> with_request_address (temporary address propagation)
-                -> hyper_util::client::legacy::Client
-                  -> if pool miss:
+                  -> if hit:
+                    -> owned bound connection sender lookup
+                    -> direct hyper request execution
+                  -> if miss:
                     -> ConnectorStack
                       -> RoutePlanner
                       -> proxy-aware route construction
@@ -127,8 +127,10 @@ User API
                         -> winner TLS
                       -> tcp (sequential RoutePlan dial for proxy routes)
                       -> tls
-                  -> hyper request execution
-                -> observe actual connection into ConnectionPool
+                    -> hyper::client::conn::http1 or http2 handshake
+                    -> spawn owned connection task
+                    -> insert bound connection into ConnectionPool
+                    -> direct hyper request execution
           -> store_response_cookies()
           -> authenticate_response()
           -> redirect decision
@@ -287,20 +289,18 @@ Important baseline details to preserve during migration:
 
 - cookie and auth behavior currently lives in the follow-up coordinator, not in transport
 - exact-address derivation and pool lookup now happen in `TransportService` via `ExchangeFinder`
+- pool hits now execute through OpenWire-owned bound connection handles instead
+  of a separate runtime pool
 - the miss path now builds proxy-aware routes through `RoutePlanner`, but the
   full proxy policy boundary still partly lives in `ConnectorStack`
 - direct-route cold connects now run through `FastFallbackDialer`; proxy routes
   still dial sequentially
-- `tokio::task_local!` currently exists only because `hyper_util::client::legacy::Client` does not expose OpenWire-owned context flow
+- protocol binding now happens in `TransportService` via
+  `hyper::client::conn::http1` / `http2`
 - response-body lifecycle currently drives connection release bookkeeping
-- the initial `hyper-util` migration boundary is explicit:
-  - retain `hyper_util::client::legacy::Client` only until the owned
-    protocol-binding/runtime path lands
-  - retain `hyper_util::client::legacy::connect::{Connection, Connected}` only
-    as a temporary connection-metadata shim while connector/TLS integration is
-    still using the legacy client path
-  - replace `hyper_util::rt::{TokioIo, TokioExecutor, TokioTimer}` with
-    OpenWire-owned Tokio adapters before direct binding work
+- retained `hyper-util` usage is now limited to
+  `hyper_util::client::legacy::connect::{Connection, Connected}` as a temporary
+  metadata shim around connector/TLS integration
 
 ## 12. Threading And Synchronization
 
@@ -317,13 +317,12 @@ Current baseline:
   - atomics for global IDs and per-call connection-established flag
   - `RwLock` for the default cookie jar
   - `Mutex<HashMap<Address, Vec<RealConnection>>>` inside `ConnectionPool`
-  - `tokio::task_local!` for `CallContext` and temporary request `Address`
-    propagation into the legacy connector path
+  - `Mutex<HashMap<ConnectionId, ...>>` inside the owned bound-connection
+    registry in `TransportService`
 
 Target guidance:
 
 - do not hold pool locks across DNS, TCP, TLS, or protocol-binding awaits
-- replace task-local context propagation with explicit flow
 - derive reuse from pool-owned `RealConnection` state
 - add background tasks only for clearly owned responsibilities such as eviction or keep-alives
 

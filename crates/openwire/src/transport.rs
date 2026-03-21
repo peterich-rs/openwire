@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,17 +12,16 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, Status
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use hyper::client::conn::{http1, http2};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use hyper_util::client::legacy::Client as HyperClient;
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, CallContext, ConnectionInfo, DnsResolver,
-    Exchange, RequestBody, ResponseBody, TcpConnector, TlsConnector, TokioExecutor, TokioIo,
-    TokioTimer, WireError,
+    next_connection_id, BoxConnection, BoxFuture, CallContext, ConnectionId, ConnectionInfo,
+    DnsResolver, Exchange, RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector,
+    TokioExecutor, TokioIo, TokioTimer, WireError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
-use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
@@ -29,18 +29,11 @@ use crate::auth::{
     SharedAuthenticator,
 };
 use crate::connection::{
-    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, RouteKind, RoutePlanner,
+    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, Route, RouteKind,
+    RoutePlanner, UriScheme,
 };
 use crate::proxy::Proxy;
 use crate::trace::PolicyTraceContext;
-
-tokio::task_local! {
-    static CURRENT_CALL_CONTEXT: CallContext;
-}
-
-tokio::task_local! {
-    static CURRENT_REQUEST_ADDRESS: Address;
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemDnsResolver;
@@ -215,88 +208,67 @@ struct ConnectTunnelParams<'a> {
     connect_timeout: Option<Duration>,
 }
 
-impl Service<Uri> for ConnectorStack {
-    type Response = BoxConnection;
-    type Error = WireError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let dns_resolver = self.dns_resolver.clone();
-        let tcp_connector = self.tcp_connector.clone();
-        let tls_connector = self.tls_connector.clone();
-        let connect_timeout = self.connect_timeout;
-        let proxies = self.proxies.clone();
-        let route_planner = self.route_planner.clone();
+impl ConnectorStack {
+    async fn connect(
+        &self,
+        ctx: CallContext,
+        uri: Uri,
+        address: Address,
+    ) -> Result<BoxConnection, WireError> {
+        let proxy = self.proxies.iter().find(|proxy| proxy.matches(&uri));
         let proxy_connect_deps = ProxyConnectDeps {
-            dns_resolver,
-            tcp_connector,
-            tls_connector,
+            dns_resolver: self.dns_resolver.clone(),
+            tcp_connector: self.tcp_connector.clone(),
+            tls_connector: self.tls_connector.clone(),
             proxy_authenticator: self.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
-            connect_timeout,
+            connect_timeout: self.connect_timeout,
         };
-        let span = tracing::Span::current();
 
-        Box::pin(
-            async move {
-                let ctx = current_call_context()?;
-                let proxy = proxies.iter().find(|proxy| proxy.matches(&uri));
-                let address = current_request_address()
-                    .map(Ok)
-                    .unwrap_or_else(|| Address::from_uri(&uri, proxy))?;
+        if let Some(proxy) = proxy {
+            if proxy.intercepts_http()
+                && uri
+                    .scheme_str()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+            {
+                return connect_via_http_forward_proxy(
+                    ctx,
+                    address,
+                    self.route_planner.clone(),
+                    proxy_connect_deps.dns_resolver.clone(),
+                    proxy_connect_deps.tcp_connector.clone(),
+                    proxy_connect_deps.connect_timeout,
+                )
+                .await;
+            }
 
-                if let Some(proxy) = proxy {
-                    if proxy.intercepts_http()
-                        && uri
-                            .scheme_str()
-                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
-                    {
-                        return connect_via_http_forward_proxy(
-                            ctx,
-                            address,
-                            route_planner.clone(),
-                            proxy_connect_deps.dns_resolver.clone(),
-                            proxy_connect_deps.tcp_connector.clone(),
-                            proxy_connect_deps.connect_timeout,
-                        )
-                        .await;
-                    }
-
-                    if proxy.intercepts_https()
-                        && uri
-                            .scheme_str()
-                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-                    {
-                        return connect_via_http_proxy(
-                            ctx,
-                            uri,
-                            address,
-                            route_planner,
-                            proxy_connect_deps,
-                        )
-                        .await;
-                    }
-                }
-
-                connect_direct(
+            if proxy.intercepts_https()
+                && uri
+                    .scheme_str()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+            {
+                return connect_via_http_proxy(
                     ctx,
                     uri,
                     address,
-                    route_planner,
-                    proxy_connect_deps.dns_resolver,
-                    proxy_connect_deps.tcp_connector,
-                    proxy_connect_deps.tls_connector,
-                    proxy_connect_deps.connect_timeout,
+                    self.route_planner.clone(),
+                    proxy_connect_deps,
                 )
-                .await
+                .await;
             }
-            .instrument(span)
-            .with_current_subscriber(),
+        }
+
+        connect_direct(
+            ctx,
+            uri,
+            address,
+            self.route_planner.clone(),
+            self.dns_resolver.clone(),
+            self.tcp_connector.clone(),
+            self.tls_connector.clone(),
+            self.connect_timeout,
         )
+        .await
     }
 }
 
@@ -811,21 +783,359 @@ impl hyper::rt::Write for ProxiedConnection {
     }
 }
 
+#[derive(Clone, Default)]
+struct ConnectionBindings {
+    inner: Arc<Mutex<HashMap<ConnectionId, ConnectionBinding>>>,
+}
+
+enum ConnectionBinding {
+    Http1(Http1Binding),
+    Http2(Http2Binding),
+}
+
+struct Http1Binding {
+    info: ConnectionInfo,
+    sender: Option<http1::SendRequest<RequestBody>>,
+}
+
+struct Http2Binding {
+    info: ConnectionInfo,
+    sender: http2::SendRequest<RequestBody>,
+}
+
+enum AcquiredBinding {
+    Http1 {
+        info: ConnectionInfo,
+        sender: http1::SendRequest<RequestBody>,
+    },
+    Http2 {
+        info: ConnectionInfo,
+        sender: http2::SendRequest<RequestBody>,
+    },
+}
+
+impl ConnectionBindings {
+    fn insert_http1(
+        &self,
+        connection_id: ConnectionId,
+        info: ConnectionInfo,
+        sender: http1::SendRequest<RequestBody>,
+    ) {
+        self.inner.lock().expect("connection bindings lock").insert(
+            connection_id,
+            ConnectionBinding::Http1(Http1Binding {
+                info,
+                sender: Some(sender),
+            }),
+        );
+    }
+
+    fn insert_http2(
+        &self,
+        connection_id: ConnectionId,
+        info: ConnectionInfo,
+        sender: http2::SendRequest<RequestBody>,
+    ) {
+        self.inner.lock().expect("connection bindings lock").insert(
+            connection_id,
+            ConnectionBinding::Http2(Http2Binding { info, sender }),
+        );
+    }
+
+    fn acquire(&self, connection_id: ConnectionId) -> Option<AcquiredBinding> {
+        let mut bindings = self.inner.lock().expect("connection bindings lock");
+        let mut remove_stale = false;
+        let acquired = match bindings.get_mut(&connection_id)? {
+            ConnectionBinding::Http1(binding) => {
+                let sender = binding.sender.take()?;
+                if sender.is_closed() {
+                    remove_stale = true;
+                    None
+                } else {
+                    Some(AcquiredBinding::Http1 {
+                        info: binding.info.clone(),
+                        sender,
+                    })
+                }
+            }
+            ConnectionBinding::Http2(binding) => {
+                if binding.sender.is_closed() {
+                    remove_stale = true;
+                    None
+                } else {
+                    Some(AcquiredBinding::Http2 {
+                        info: binding.info.clone(),
+                        sender: binding.sender.clone(),
+                    })
+                }
+            }
+        };
+        if remove_stale {
+            bindings.remove(&connection_id);
+        }
+        acquired
+    }
+
+    fn release_http1(
+        &self,
+        connection_id: ConnectionId,
+        sender: http1::SendRequest<RequestBody>,
+    ) -> bool {
+        if sender.is_closed() {
+            self.remove(connection_id);
+            return false;
+        }
+
+        let mut bindings = self.inner.lock().expect("connection bindings lock");
+        let Some(ConnectionBinding::Http1(binding)) = bindings.get_mut(&connection_id) else {
+            return false;
+        };
+        debug_assert!(
+            binding.sender.is_none(),
+            "HTTP/1 sender should be checked out"
+        );
+        binding.sender = Some(sender);
+        true
+    }
+
+    fn remove(&self, connection_id: ConnectionId) {
+        self.inner
+            .lock()
+            .expect("connection bindings lock")
+            .remove(&connection_id);
+    }
+}
+
+struct SelectedConnection {
+    connection: crate::connection::RealConnection,
+    binding: AcquiredBinding,
+    reused: bool,
+}
+
+struct BoundResponse {
+    response: Response<Incoming>,
+    release: ResponseLease,
+    reused: bool,
+}
+
+enum ResponseLease {
+    Http1 {
+        connection: crate::connection::RealConnection,
+        bindings: Arc<ConnectionBindings>,
+        sender: http1::SendRequest<RequestBody>,
+        reusable: bool,
+    },
+    Http2 {
+        connection: crate::connection::RealConnection,
+    },
+}
+
 #[derive(Clone)]
 pub(crate) struct TransportService {
-    pub(crate) client: HyperClient<ConnectorStack, RequestBody>,
+    connector: ConnectorStack,
+    config: crate::client::TransportConfig,
+    runtime: Arc<dyn Runtime>,
     exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
 }
 
 impl TransportService {
     pub(crate) fn new(
-        client: HyperClient<ConnectorStack, RequestBody>,
+        connector: ConnectorStack,
+        config: crate::client::TransportConfig,
+        runtime: Arc<dyn Runtime>,
         exchange_finder: Arc<ExchangeFinder>,
     ) -> Self {
         Self {
-            client,
+            connector,
+            config,
+            runtime,
             exchange_finder,
+            bindings: Arc::new(ConnectionBindings::default()),
         }
+    }
+
+    async fn execute_exchange(
+        self,
+        exchange: Exchange,
+    ) -> Result<Response<ResponseBody>, WireError> {
+        let (request, ctx, attempt) = exchange.into_parts();
+        let prepared = self.exchange_finder.prepare(&request)?;
+        let request_body_len = request.body().replayable_len();
+        let policy_trace = request
+            .extensions()
+            .get::<PolicyTraceContext>()
+            .copied()
+            .unwrap_or_default();
+
+        let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
+        async move {
+            let selected = self
+                .acquire_connection(&prepared, &request, ctx.clone(), tracing::Span::current())
+                .await?;
+            let response = send_bound_request(
+                request,
+                selected,
+                self.exchange_finder.clone(),
+                self.bindings.clone(),
+            )
+            .await?;
+
+            if let Some(bytes) = request_body_len {
+                ctx.listener().request_body_end(&ctx, bytes);
+            }
+
+            let connection_info = response
+                .response
+                .extensions()
+                .get::<ConnectionInfo>()
+                .cloned()
+                .expect("owned response should carry connection info");
+            ctx.listener()
+                .connection_acquired(&ctx, connection_info.id, response.reused);
+            let span = tracing::Span::current();
+            span.record("connection_id", connection_info.id.as_u64());
+            span.record("connection_reused", response.reused);
+
+            ctx.listener().response_headers_start(&ctx);
+            let (parts, body) = response.response.into_parts();
+            let body = ObservedIncomingBody::wrap(
+                body,
+                ctx.clone(),
+                attempt,
+                Some(response.release),
+                self.exchange_finder.clone(),
+                tracing::Span::current(),
+            );
+            let response = Response::from_parts(parts, body);
+            ctx.listener().response_headers_end(&ctx, &response);
+            Ok(response)
+        }
+        .instrument(call_span)
+        .await
+    }
+
+    async fn acquire_connection(
+        &self,
+        prepared: &crate::connection::PreparedExchange,
+        request: &Request<RequestBody>,
+        ctx: CallContext,
+        span: tracing::Span,
+    ) -> Result<SelectedConnection, WireError> {
+        if let Some(connection) = prepared.reserved_connection() {
+            if let Some(binding) = self.bindings.acquire(connection.id()) {
+                return Ok(SelectedConnection {
+                    connection: connection.clone(),
+                    binding,
+                    reused: true,
+                });
+            }
+
+            let _ = self.exchange_finder.pool().remove(connection.id());
+        }
+
+        self.bind_fresh_connection(prepared, request, ctx, span)
+            .await
+    }
+
+    async fn bind_fresh_connection(
+        &self,
+        prepared: &crate::connection::PreparedExchange,
+        request: &Request<RequestBody>,
+        ctx: CallContext,
+        span: tracing::Span,
+    ) -> Result<SelectedConnection, WireError> {
+        let stream = self
+            .connector
+            .connect(ctx, request.uri().clone(), prepared.address().clone())
+            .await?;
+        let connected = stream.connected();
+        let info = connection_info_from_connected(&connected);
+        let protocol = determine_protocol(prepared.address(), &connected);
+        let route = Route::from_observed(prepared.address().clone(), info.remote_addr);
+        let connection = crate::connection::RealConnection::with_id(info.id, route, protocol);
+        let _ = connection.try_acquire();
+        self.exchange_finder.pool().insert(connection.clone());
+
+        match protocol {
+            ConnectionProtocol::Http1 => {
+                let (sender, task) = bind_http1(stream).await?;
+                self.bindings.insert_http1(info.id, info, sender);
+                self.spawn_http1_task(connection.clone(), task, span)?;
+            }
+            ConnectionProtocol::Http2 => {
+                let (sender, task) = bind_http2(stream, &self.config).await?;
+                self.bindings.insert_http2(info.id, info, sender);
+                self.spawn_http2_task(connection.clone(), task, span)?;
+            }
+        }
+
+        let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
+            self.bindings.remove(connection.id());
+            let _ = self.exchange_finder.pool().remove(connection.id());
+            WireError::internal(
+                "freshly bound connection was not available for request execution",
+                io::Error::other("bound connection missing immediately after insert"),
+            )
+        })?;
+
+        Ok(SelectedConnection {
+            connection,
+            binding,
+            reused: false,
+        })
+    }
+
+    fn spawn_http1_task(
+        &self,
+        connection: crate::connection::RealConnection,
+        task: http1::Connection<BoxConnection, RequestBody>,
+        span: tracing::Span,
+    ) -> Result<(), WireError> {
+        let connection_id = connection.id();
+        let bindings = self.bindings.clone();
+        let pool = self.exchange_finder.pool().clone();
+        self.runtime.spawn(Box::pin(
+            async move {
+                let result = task.await;
+                bindings.remove(connection_id);
+                let _ = pool.remove(connection_id);
+                if let Err(error) = result {
+                    tracing::debug!(
+                        connection_id = connection_id.as_u64(),
+                        error = %error,
+                        "owned HTTP/1 connection task failed",
+                    );
+                }
+            }
+            .instrument(span),
+        ))
+    }
+
+    fn spawn_http2_task(
+        &self,
+        connection: crate::connection::RealConnection,
+        task: http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        span: tracing::Span,
+    ) -> Result<(), WireError> {
+        let connection_id = connection.id();
+        let bindings = self.bindings.clone();
+        let pool = self.exchange_finder.pool().clone();
+        self.runtime.spawn(Box::pin(
+            async move {
+                let result = task.await;
+                bindings.remove(connection_id);
+                let _ = pool.remove(connection_id);
+                if let Err(error) = result {
+                    tracing::debug!(
+                        connection_id = connection_id.as_u64(),
+                        error = %error,
+                        "owned HTTP/2 connection task failed",
+                    );
+                }
+            }
+            .instrument(span),
+        ))
     }
 }
 
@@ -839,78 +1149,7 @@ impl Service<Exchange> for TransportService {
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let client = self.client.clone();
-        let exchange_finder = self.exchange_finder.clone();
-        Box::pin(async move {
-            let (request, ctx, attempt) = exchange.into_parts();
-            let prepared = exchange_finder.prepare(&request)?;
-            let request_body_len = request.body().replayable_len();
-            let policy_trace = request
-                .extensions()
-                .get::<PolicyTraceContext>()
-                .copied()
-                .unwrap_or_default();
-
-            let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
-
-            async move {
-                let request_address = prepared.address().clone();
-                let result = with_call_context(
-                    ctx.clone(),
-                    with_request_address(request_address, async move {
-                        client.request(request).await.map_err(map_client_error)
-                    }),
-                )
-                .await;
-                let response = match result {
-                    Ok(response) => response,
-                    Err(error) => {
-                        exchange_finder.discard_prepared(&prepared);
-                        return Err(error);
-                    }
-                };
-
-                if let Some(bytes) = request_body_len {
-                    ctx.listener().request_body_end(&ctx, bytes);
-                }
-
-                let connection_info = response.extensions().get::<ConnectionInfo>().cloned();
-                let mut observed_connection = None;
-                if let Some(info) = &connection_info {
-                    let protocol = if response.version() == Version::HTTP_2 {
-                        ConnectionProtocol::Http2
-                    } else {
-                        ConnectionProtocol::Http1
-                    };
-                    let observed = exchange_finder.observe_connection(&prepared, info, protocol);
-                    let reused = observed.reused();
-                    observed_connection = Some(observed.connection().clone());
-                    ctx.listener().connection_acquired(&ctx, info.id, reused);
-                    let span = tracing::Span::current();
-                    span.record("connection_id", info.id.as_u64());
-                    span.record("connection_reused", reused);
-                } else {
-                    exchange_finder.discard_prepared(&prepared);
-                }
-
-                ctx.listener().response_headers_start(&ctx);
-                let (parts, body) = response.into_parts();
-                let body = ObservedIncomingBody::wrap(
-                    body,
-                    ctx.clone(),
-                    attempt,
-                    observed_connection,
-                    exchange_finder.clone(),
-                    tracing::Span::current(),
-                );
-                let response = Response::from_parts(parts, body);
-                ctx.listener().response_headers_end(&ctx, &response);
-
-                Ok(response)
-            }
-            .instrument(call_span)
-            .await
-        })
+        Box::pin(self.clone().execute_exchange(exchange))
     }
 }
 
@@ -940,29 +1179,12 @@ fn attempt_span(
     )
 }
 
-pub(crate) fn build_hyper_client(
-    connector: ConnectorStack,
-    config: &crate::client::TransportConfig,
-) -> HyperClient<ConnectorStack, RequestBody> {
-    let mut builder = HyperClient::builder(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
-    builder.pool_timer(TokioTimer::new());
-    builder.pool_max_idle_per_host(config.pool_max_idle_per_host);
-    builder.retry_canceled_requests(config.retry_canceled_requests);
-    builder.pool_idle_timeout(config.pool_idle_timeout);
-    if let Some(interval) = config.http2_keep_alive_interval {
-        builder.http2_keep_alive_interval(interval);
-        builder.http2_keep_alive_while_idle(config.http2_keep_alive_while_idle);
-    }
-    builder.build(connector)
-}
-
 struct ObservedIncomingBody {
     inner: Incoming,
     ctx: CallContext,
     attempt: u32,
     bytes_read: u64,
-    connection: Option<crate::connection::RealConnection>,
+    release: Option<ResponseLease>,
     exchange_finder: Arc<ExchangeFinder>,
     span: tracing::Span,
     finished: bool,
@@ -973,7 +1195,7 @@ impl ObservedIncomingBody {
         body: Incoming,
         ctx: CallContext,
         attempt: u32,
-        connection: Option<crate::connection::RealConnection>,
+        release: Option<ResponseLease>,
         exchange_finder: Arc<ExchangeFinder>,
         span: tracing::Span,
     ) -> ResponseBody {
@@ -983,7 +1205,7 @@ impl ObservedIncomingBody {
                 ctx,
                 attempt,
                 bytes_read: 0,
-                connection,
+                release,
                 exchange_finder,
                 span,
                 finished: false,
@@ -1019,7 +1241,7 @@ impl ObservedIncomingBody {
             );
         });
         self.ctx.listener().response_body_failed(&self.ctx, error);
-        self.release_connection();
+        self.discard_connection();
     }
 
     fn finish_abandoned(&mut self) {
@@ -1027,15 +1249,66 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
-        self.release_connection();
+        self.discard_connection();
     }
 
     fn release_connection(&mut self) {
-        if let Some(connection) = &self.connection {
-            let _ = self.exchange_finder.release(connection);
-            self.ctx
-                .listener()
-                .connection_released(&self.ctx, connection.id());
+        if let Some(release) = self.release.take() {
+            match release {
+                ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    sender,
+                    reusable,
+                } => {
+                    if reusable
+                        && bindings.release_http1(connection.id(), sender)
+                        && self.exchange_finder.release(&connection)
+                    {
+                        self.ctx
+                            .listener()
+                            .connection_released(&self.ctx, connection.id());
+                        return;
+                    }
+
+                    bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+                ResponseLease::Http2 { connection } => {
+                    let _ = self.exchange_finder.release(&connection);
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+            }
+        }
+    }
+
+    fn discard_connection(&mut self) {
+        if let Some(release) = self.release.take() {
+            match release {
+                ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    ..
+                } => {
+                    bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+                ResponseLease::Http2 { connection } => {
+                    connection.mark_unhealthy();
+                    let _ = self.exchange_finder.release(&connection);
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+            }
         }
     }
 }
@@ -1084,23 +1357,170 @@ impl Body for ObservedIncomingBody {
     }
 }
 
-fn map_client_error(error: hyper_util::client::legacy::Error) -> WireError {
-    if error.is_connect() {
-        if let Some(source) = find_wire_error(&error) {
-            return source.clone();
+async fn send_bound_request(
+    request: Request<RequestBody>,
+    selected: SelectedConnection,
+    exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
+) -> Result<BoundResponse, WireError> {
+    let connection = selected.connection;
+    let reused = selected.reused;
+    let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
+
+    match selected.binding {
+        AcquiredBinding::Http1 { info, mut sender } => {
+            sender.ready().await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let mut response = sender.send_request(request).await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let reusable = http1_response_allows_reuse(&response);
+            response.extensions_mut().insert(info);
+            Ok(BoundResponse {
+                response,
+                release: ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    sender,
+                    reusable,
+                },
+                reused,
+            })
         }
-        return WireError::connect("transport connection failed", error);
+        AcquiredBinding::Http2 { info, mut sender } => {
+            sender.ready().await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let mut response = sender.send_request(request).await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            response.extensions_mut().insert(info);
+            Ok(BoundResponse {
+                response,
+                release: ResponseLease::Http2 { connection },
+                reused,
+            })
+        }
+    }
+}
+
+async fn bind_http1(
+    stream: BoxConnection,
+) -> Result<
+    (
+        http1::SendRequest<RequestBody>,
+        http1::Connection<BoxConnection, RequestBody>,
+    ),
+    WireError,
+> {
+    http1::Builder::new()
+        .handshake(stream)
+        .await
+        .map_err(|error| WireError::protocol("HTTP/1.1 client handshake failed", error))
+}
+
+async fn bind_http2(
+    stream: BoxConnection,
+    config: &crate::client::TransportConfig,
+) -> Result<
+    (
+        http2::SendRequest<RequestBody>,
+        http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+    ),
+    WireError,
+> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder.timer(TokioTimer::new());
+    if let Some(interval) = config.http2_keep_alive_interval {
+        builder.keep_alive_interval(interval);
+        builder.keep_alive_while_idle(config.http2_keep_alive_while_idle);
+    }
+    builder
+        .handshake(stream)
+        .await
+        .map_err(|error| WireError::protocol("HTTP/2 client handshake failed", error))
+}
+
+fn determine_protocol(address: &Address, connected: &Connected) -> ConnectionProtocol {
+    if address.scheme() == UriScheme::Http {
+        ConnectionProtocol::Http1
+    } else if connected.is_negotiated_h2() {
+        ConnectionProtocol::Http2
+    } else {
+        ConnectionProtocol::Http1
+    }
+}
+
+fn prepare_bound_request(
+    mut request: Request<RequestBody>,
+    protocol: ConnectionProtocol,
+    route_kind: &RouteKind,
+) -> Result<Request<RequestBody>, WireError> {
+    if protocol != ConnectionProtocol::Http1
+        || matches!(route_kind, RouteKind::HttpForwardProxy { .. })
+    {
+        return Ok(request);
     }
 
-    if let Some(source) = std::error::Error::source(&error) {
-        if let Some(source) = source.downcast_ref::<hyper::Error>() {
-            if source.is_canceled() {
-                return WireError::canceled("request canceled");
-            }
-            if source.is_timeout() {
-                return WireError::timeout("request timed out");
-            }
+    let origin_form = request
+        .uri()
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    *request.uri_mut() = origin_form.parse().map_err(|error| {
+        WireError::internal(
+            "failed to normalize request URI for direct HTTP/1.1 binding",
+            error,
+        )
+    })?;
+    Ok(request)
+}
+
+fn http1_response_allows_reuse(response: &Response<Incoming>) -> bool {
+    if response.version() == Version::HTTP_10 {
+        return false;
+    }
+
+    !response.headers().get("connection").is_some_and(|value| {
+        value
+            .to_str()
+            .map(|value| value.eq_ignore_ascii_case("close"))
+            .unwrap_or(false)
+    })
+}
+
+fn cleanup_failed_request(
+    connection: &crate::connection::RealConnection,
+    exchange_finder: &Arc<ExchangeFinder>,
+    bindings: &Arc<ConnectionBindings>,
+) {
+    match connection.protocol() {
+        ConnectionProtocol::Http1 => {
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
         }
+        ConnectionProtocol::Http2 => {
+            connection.mark_unhealthy();
+            let _ = exchange_finder.release(connection);
+        }
+    }
+}
+
+fn map_hyper_error(error: hyper::Error) -> WireError {
+    if let Some(source) = find_wire_error(&error) {
+        return source.clone();
+    }
+
+    if error.is_canceled() {
+        return WireError::canceled("request canceled");
+    }
+    if error.is_timeout() {
+        return WireError::timeout("request timed out");
     }
 
     WireError::protocol("transport request failed", error)
@@ -1117,31 +1537,15 @@ fn find_wire_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&
     None
 }
 
-fn current_call_context() -> Result<CallContext, WireError> {
-    CURRENT_CALL_CONTEXT
-        .try_with(Clone::clone)
-        .map_err(|error| {
-            WireError::internal(
-                "call context unavailable inside connector stack",
-                io::Error::other(error.to_string()),
-            )
+fn connection_info_from_connected(connected: &Connected) -> ConnectionInfo {
+    let mut extensions = http::Extensions::new();
+    connected.get_extras(&mut extensions);
+    extensions
+        .remove::<ConnectionInfo>()
+        .unwrap_or(ConnectionInfo {
+            id: next_connection_id(),
+            remote_addr: None,
+            local_addr: None,
+            tls: false,
         })
-}
-
-pub(crate) async fn with_call_context<F, T>(ctx: CallContext, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    CURRENT_CALL_CONTEXT.scope(ctx, future).await
-}
-
-async fn with_request_address<F, T>(address: Address, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    CURRENT_REQUEST_ADDRESS.scope(address, future).await
-}
-
-fn current_request_address() -> Option<Address> {
-    CURRENT_REQUEST_ADDRESS.try_with(Clone::clone).ok()
 }

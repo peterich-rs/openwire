@@ -113,7 +113,7 @@ OpenWire.
 | P5-002 | `DONE` | Thread `Address` derivation into request attempts before transport execution | P2-001 | Per-attempt code can derive stable connection keys |
 | P5-003 | `DONE` | Route pool hit requests through pooled `RealConnection` handles instead of `hyper_util` pool lookup | P5-001 | Existing reuse integration tests pass against owned pool lookup |
 | P5-004 | `DONE` | Route pool miss requests into planner + dialer path | P5-001 | Miss path is covered by integration tests |
-| P5-005 | `TODO` | Eliminate `tokio::task_local!` for `CallContext` propagation in the acquisition path | P5-003 | Connector and acquisition code receive explicit context |
+| P5-005 | `DONE` | Eliminate `tokio::task_local!` for `CallContext` propagation in the acquisition path | P5-003 | Connector and acquisition code receive explicit context |
 
 ## Phase 6: Fast Fallback Direct Routes
 
@@ -137,11 +137,11 @@ state directly through `hyper`.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P7-001 | `TODO` | Add direct HTTP/1.1 protocol binding via `hyper::client::conn::http1` | P3-001, P6-004 | Requests can execute without `hyper_util::client::legacy::Client` on HTTP/1.1 |
-| P7-002 | `TODO` | Add direct HTTP/2 protocol binding via `hyper::client::conn::http2` | P3-001, P6-004 | Requests can execute without `hyper_util::client::legacy::Client` on HTTP/2 |
-| P7-003 | `TODO` | Preserve connection metadata propagation into responses under the owned protocol path | P7-001 | Existing connection info tests continue to pass |
-| P7-004 | `TODO` | Preserve response-body lifecycle wrapping and release bookkeeping under the owned protocol path | P7-001 | Existing body-end/body-failure tests continue to pass |
-| P7-005 | `TODO` | Preserve current event ordering guarantees while running through the owned binding path | P7-001 | Existing lifecycle integration tests continue to pass |
+| P7-001 | `DONE` | Add direct HTTP/1.1 protocol binding via `hyper::client::conn::http1` | P3-001, P6-004 | Requests can execute without `hyper_util::client::legacy::Client` on HTTP/1.1 |
+| P7-002 | `DONE` | Add direct HTTP/2 protocol binding via `hyper::client::conn::http2` | P3-001, P6-004 | Requests can execute without `hyper_util::client::legacy::Client` on HTTP/2 |
+| P7-003 | `DONE` | Preserve connection metadata propagation into responses under the owned protocol path | P7-001 | Existing connection info tests continue to pass |
+| P7-004 | `DONE` | Preserve response-body lifecycle wrapping and release bookkeeping under the owned protocol path | P7-001 | Existing body-end/body-failure tests continue to pass |
+| P7-005 | `DONE` | Preserve current event ordering guarantees while running through the owned binding path | P7-001 | Existing lifecycle integration tests continue to pass |
 
 ## Phase 8: HTTP/1.1 Pool Reuse
 
@@ -150,9 +150,9 @@ fully generalized.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P8-001 | `TODO` | Mark HTTP/1.1 `RealConnection` busy during an active exchange | P7-001 | Pool refuses parallel reuse on the same HTTP/1.1 connection |
-| P8-002 | `TODO` | Return reusable HTTP/1.1 connections to idle state after response body lifecycle completes | P8-001 | Existing reuse integration tests pass |
-| P8-003 | `TODO` | Drop broken or abandoned HTTP/1.1 connections instead of reusing them | P8-001 | Tests cover body failure and abandonment paths |
+| P8-001 | `DONE` | Mark HTTP/1.1 `RealConnection` busy during an active exchange | P7-001 | Pool refuses parallel reuse on the same HTTP/1.1 connection |
+| P8-002 | `DONE` | Return reusable HTTP/1.1 connections to idle state after response body lifecycle completes | P8-001 | Existing reuse integration tests pass |
+| P8-003 | `DONE` | Drop broken or abandoned HTTP/1.1 connections instead of reusing them | P8-001 | Tests cover body failure and abandonment paths |
 | P8-004 | `TODO` | Add idle timeout and max idle per address enforcement for HTTP/1.1 | P4-006 | Pool eviction tests pass |
 
 ## Phase 9: HTTP/2 Multiplex Reuse
@@ -161,10 +161,10 @@ The goal is to let OpenWire own HTTP/2 multiplexing decisions and state.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P9-001 | `TODO` | Add HTTP/2-capable `RealConnection` state with multiplex metadata | P7-002 | Pool can distinguish H1 and H2 connection behavior |
-| P9-002 | `TODO` | Route multiple exchanges over one HTTP/2 connection when eligible | P9-001 | Existing HTTP/2 multiplex test continues to pass on owned path |
+| P9-001 | `DONE` | Add HTTP/2-capable `RealConnection` state with multiplex metadata | P7-002 | Pool can distinguish H1 and H2 connection behavior |
+| P9-002 | `DONE` | Route multiple exchanges over one HTTP/2 connection when eligible | P9-001 | Existing HTTP/2 multiplex test continues to pass on owned path |
 | P9-003 | `TODO` | Track conservative stream usage limits in pool state | P9-001 | Tests prove no invalid reuse under active load |
-| P9-004 | `TODO` | Integrate HTTP/2 keep-alive settings with the owned connection model | P9-001 | Existing keep-alive config still plumbed correctly |
+| P9-004 | `DONE` | Integrate HTTP/2 keep-alive settings with the owned connection model | P9-001 | Existing keep-alive config still plumbed correctly |
 
 ## Phase 10: Proxy Route Ownership
 
@@ -209,10 +209,10 @@ path.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P13-001 | `TODO` | Remove `hyper_util::client::legacy::Client` from `TransportService` | P7-001, P8-002, P9-002 | Runtime request path no longer builds through legacy client |
+| P13-001 | `DONE` | Remove `hyper_util::client::legacy::Client` from `TransportService` | P7-001, P8-002, P9-002 | Runtime request path no longer builds through legacy client |
 | P13-002 | `TODO` | Remove now-unused `hyper-util` client-side feature flags from crate manifests | P13-001 | Dependency graph reduced and verified |
 | P13-003 | `TODO` | Audit remaining `hyper-util` usage and keep only intentionally retained adapters or remove the crate entirely | P13-001 | Manifest and code references match the design decision |
-| P13-004 | `TODO` | Refresh README and docs to reflect the new owned connection core baseline | P13-001 | Documentation no longer describes legacy client as the runtime core |
+| P13-004 | `DONE` | Refresh README and docs to reflect the new owned connection core baseline | P13-001 | Documentation no longer describes legacy client as the runtime core |
 
 ## Phase 14: Deferred Work
 
@@ -230,14 +230,15 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P5-005`
-2. `P7-001` through `P7-005`
-3. `P8-001` through `P8-004`
+1. `P8-004`
+2. `P9-003`
+3. `P10-001` through `P10-005`
 
 Rationale:
 
-- the remaining acquisition gap is removing temporary task-local propagation
-- direct-route fast fallback is landed, so the next missing ownership slice is
-  direct protocol binding
-- HTTP/1.1 busy/idle pool semantics should follow once requests can execute on
-  owned connections
+- the owned connection runtime path is landed, but HTTP/1.1 eviction policy is
+  still only configuration without enforcement
+- HTTP/2 multiplex reuse works, but the pool still needs conservative stream
+  limit accounting before the concurrency model is considered hardened
+- proxy route generation and ownership are now the next major boundary still
+  split between planner and connector branching

@@ -19,7 +19,7 @@ This workspace uses:
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical technical design
 - [docs/tasks.md](docs/tasks.md): step-by-step execution tracker
-- The next architecture stage is the self-owned connection core: OpenWire will keep `hyper` as the protocol engine while reclaiming connection acquisition, route planning, pooling, and fast fallback from `hyper-util`'s legacy client path
+- OpenWire now uses an owned connection core: it keeps `hyper` for HTTP protocol state while owning acquisition, route planning, pooling, fast fallback, and direct protocol binding
 
 ## Current API
 
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - redirect handling with basic authority-sensitive header stripping
 - call timeout and connect timeout, including proxy CONNECT handshake reads
 - typed request metadata via standard `http::Extensions`
-- connection pooling via `hyper-util`
+- owned connection pooling with direct `hyper::client::conn::http1` and `hyper::client::conn::http2` bindings
 - HTTP/2 over TLS via rustls ALPN negotiation
 - default Tokio runtime integration
 - default rustls TLS connector with platform verifier or native roots fallback
