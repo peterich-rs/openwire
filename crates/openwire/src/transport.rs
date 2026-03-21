@@ -1,7 +1,6 @@
-use std::collections::HashSet;
-use std::future::Future;
+use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -13,43 +12,28 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, Status
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use hyper::client::conn::{http1, http2};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioIo;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, CallContext, ConnectionInfo, DnsResolver,
-    Exchange, RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector, WireError,
+    next_connection_id, BoxConnection, BoxFuture, CallContext, CoalescingInfo, ConnectionId,
+    ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime, TcpConnector,
+    TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
     AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
     SharedAuthenticator,
 };
-use crate::proxy::Proxy;
+use crate::connection::{
+    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, Route,
+    RouteKind, RoutePlan, RoutePlanner, UriScheme,
+};
 use crate::trace::PolicyTraceContext;
-
-tokio::task_local! {
-    static CURRENT_CALL_CONTEXT: CallContext;
-}
-
-#[derive(Clone)]
-pub struct TokioRuntime;
-
-impl Runtime for TokioRuntime {
-    fn spawn(&self, future: openwire_core::BoxFuture<()>) -> Result<(), WireError> {
-        tokio::spawn(future);
-        Ok(())
-    }
-
-    fn sleep(&self, duration: Duration) -> openwire_core::BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemDnsResolver;
@@ -102,9 +86,8 @@ impl TcpConnector for TokioTcpConnector {
             let connect = tokio::net::TcpStream::connect(addr);
             let stream = match timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, connect).await {
-                    Ok(result) => {
-                        result.map_err(|error| WireError::connect("TCP connect failed", error))?
-                    }
+                    Ok(result) => result
+                        .map_err(|error| WireError::tcp_connect("TCP connect failed", error))?,
                     Err(_error) => {
                         let error = WireError::connect_timeout(format!(
                             "connection timed out after {timeout:?}"
@@ -115,12 +98,12 @@ impl TcpConnector for TokioTcpConnector {
                 },
                 None => connect
                     .await
-                    .map_err(|error| WireError::connect("TCP connect failed", error))?,
+                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error))?,
             };
 
-            stream
-                .set_nodelay(true)
-                .map_err(|error| WireError::connect("failed to configure TCP_NODELAY", error))?;
+            stream.set_nodelay(true).map_err(|error| {
+                WireError::tcp_connect("failed to configure TCP_NODELAY", error)
+            })?;
 
             let info = ConnectionInfo {
                 id: next_connection_id(),
@@ -197,14 +180,13 @@ pub(crate) struct ConnectorStack {
     pub(crate) tcp_connector: Arc<dyn TcpConnector>,
     pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
     pub(crate) connect_timeout: Option<Duration>,
-    pub(crate) proxies: Vec<Proxy>,
+    pub(crate) route_planner: RoutePlanner,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_proxy_auth_attempts: usize,
 }
 
 #[derive(Clone)]
 struct ProxyConnectDeps {
-    dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     proxy_authenticator: Option<SharedAuthenticator>,
@@ -223,145 +205,112 @@ struct ConnectTunnelParams<'a> {
     connect_timeout: Option<Duration>,
 }
 
-impl Service<Uri> for ConnectorStack {
-    type Response = BoxConnection;
-    type Error = WireError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+impl ConnectorStack {
+    async fn route_plan(
+        &self,
+        ctx: CallContext,
+        address: &Address,
+    ) -> Result<RoutePlan, WireError> {
+        let (dns_host, dns_port) = self.route_planner.dns_target(address);
+        let resolved_addrs = self
+            .dns_resolver
+            .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
+            .await?;
+        Ok(self.route_planner.plan(address.clone(), resolved_addrs))
     }
 
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let dns_resolver = self.dns_resolver.clone();
-        let tcp_connector = self.tcp_connector.clone();
-        let tls_connector = self.tls_connector.clone();
-        let connect_timeout = self.connect_timeout;
-        let proxies = self.proxies.clone();
-        let proxy_connect_deps = ProxyConnectDeps {
-            dns_resolver,
-            tcp_connector,
-            tls_connector,
+    fn proxy_connect_deps(&self) -> ProxyConnectDeps {
+        ProxyConnectDeps {
+            tcp_connector: self.tcp_connector.clone(),
+            tls_connector: self.tls_connector.clone(),
             proxy_authenticator: self.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
-            connect_timeout,
-        };
+            connect_timeout: self.connect_timeout,
+        }
+    }
+}
 
-        Box::pin(async move {
-            let ctx = current_call_context()?;
-            if let Some(proxy) = proxies.iter().find(|proxy| proxy.matches(&uri)) {
-                if proxy.intercepts_http()
-                    && uri
-                        .scheme_str()
-                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
-                {
-                    return connect_via_http_forward_proxy(
-                        ctx,
-                        proxy,
-                        proxy_connect_deps.dns_resolver.clone(),
-                        proxy_connect_deps.tcp_connector.clone(),
-                        proxy_connect_deps.connect_timeout,
-                    )
-                    .await;
-                }
+async fn connect_route_plan(
+    ctx: CallContext,
+    uri: Uri,
+    route_plan: RoutePlan,
+    deps: ProxyConnectDeps,
+) -> Result<BoxConnection, WireError> {
+    let Some(first_route) = route_plan.route(0) else {
+        return Err(WireError::route_exhausted("route plan produced no routes"));
+    };
 
-                if proxy.intercepts_https()
-                    && uri
-                        .scheme_str()
-                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-                {
-                    return connect_via_http_proxy(ctx, uri, proxy, proxy_connect_deps).await;
-                }
-            }
-
+    match first_route.kind() {
+        RouteKind::Direct { .. } => {
             connect_direct(
                 ctx,
                 uri,
-                proxy_connect_deps.dns_resolver,
-                proxy_connect_deps.tcp_connector,
-                proxy_connect_deps.tls_connector,
-                proxy_connect_deps.connect_timeout,
+                route_plan,
+                deps.tcp_connector,
+                deps.tls_connector,
+                deps.connect_timeout,
             )
             .await
-        })
+        }
+        RouteKind::HttpForwardProxy { .. } => {
+            connect_via_http_forward_proxy(
+                ctx,
+                route_plan,
+                deps.tcp_connector,
+                deps.connect_timeout,
+            )
+            .await
+        }
+        RouteKind::ConnectProxy { .. } => connect_via_http_proxy(ctx, uri, route_plan, deps).await,
+        RouteKind::SocksProxy { .. } => connect_via_socks_proxy(ctx, uri, route_plan, deps).await,
     }
 }
 
 async fn connect_direct(
     ctx: CallContext,
     uri: Uri,
-    dns_resolver: Arc<dyn DnsResolver>,
+    route_plan: RoutePlan,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let host = uri
-        .host()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?
-        .to_owned();
-
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
-    let port = default_port(&uri)?;
-
-    let addrs = dns_resolver.resolve(ctx.clone(), host, port).await?;
-    let mut last_error = None;
-
-    for addr in addrs {
-        match tcp_connector
-            .connect(ctx.clone(), addr, connect_timeout)
-            .await
-        {
-            Ok(stream) => {
-                if scheme.eq_ignore_ascii_case("https") {
-                    let tls_connector = tls_connector.clone().ok_or_else(|| {
-                        WireError::tls(
-                            "HTTPS requested but no TLS connector is configured",
-                            io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
-                        )
-                    })?;
-                    return tls_connector.connect(ctx.clone(), uri, stream).await;
-                }
-                return Ok(stream);
-            }
-            Err(error) => {
-                ctx.listener().connect_failed(&ctx, addr, &error);
-                last_error = Some(error);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no address connected"),
+    let connect_span = tracing::Span::current();
+    let (stream, outcome) = FastFallbackDialer
+        .dial_direct(
+            ctx.clone(),
+            uri,
+            route_plan,
+            tcp_connector,
+            tls_connector,
+            connect_timeout,
         )
-    }))
+        .instrument(connect_span)
+        .with_current_subscriber()
+        .await?;
+    let span = tracing::Span::current();
+    record_fast_fallback_trace(&span, outcome);
+    Ok(stream)
+}
+
+fn record_fast_fallback_trace(span: &tracing::Span, outcome: FastFallbackOutcome) {
+    span.record("route_count", outcome.route_count as u64);
+    span.record("fast_fallback_enabled", outcome.fast_fallback_enabled);
+    span.record("connect_race_id", outcome.race_id);
+    span.record("connect_winner", outcome.winner_index as u64);
 }
 
 async fn connect_via_http_forward_proxy(
     ctx: CallContext,
-    proxy: &Proxy,
-    dns_resolver: Arc<dyn DnsResolver>,
+    route_plan: RoutePlan,
     tcp_connector: Arc<dyn TcpConnector>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let proxy_host = proxy
-        .target()
-        .host_str()
-        .ok_or_else(|| WireError::invalid_request("proxy URL is missing a host"))?
-        .to_owned();
-    let proxy_port = proxy.target().port_or_known_default().ok_or_else(|| {
-        WireError::invalid_request("proxy URL is missing a port and has no known default")
-    })?;
-
-    let addrs = dns_resolver
-        .resolve(ctx.clone(), proxy_host, proxy_port)
-        .await?;
     let mut last_error = None;
 
-    for addr in addrs {
+    for route in route_plan.iter() {
+        let &RouteKind::HttpForwardProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
         match tcp_connector
             .connect(ctx.clone(), addr, connect_timeout)
             .await
@@ -377,17 +326,14 @@ async fn connect_via_http_forward_proxy(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no proxy socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no proxy address connected"),
-        )
+        WireError::route_exhausted("no proxy socket addresses could be connected")
     }))
 }
 
 async fn connect_via_http_proxy(
     ctx: CallContext,
     target_uri: Uri,
-    proxy: &Proxy,
+    route_plan: RoutePlan,
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let target_scheme = target_uri
@@ -398,23 +344,12 @@ async fn connect_via_http_proxy(
             "configured proxy currently supports HTTPS requests only",
         ));
     }
-
-    let proxy_host = proxy
-        .target()
-        .host_str()
-        .ok_or_else(|| WireError::invalid_request("proxy URL is missing a host"))?
-        .to_owned();
-    let proxy_port = proxy.target().port_or_known_default().ok_or_else(|| {
-        WireError::invalid_request("proxy URL is missing a port and has no known default")
-    })?;
-
-    let addrs = deps
-        .dns_resolver
-        .resolve(ctx.clone(), proxy_host, proxy_port)
-        .await?;
     let mut last_error = None;
 
-    for addr in addrs {
+    for route in route_plan.iter() {
+        let &RouteKind::ConnectProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
         match deps
             .tcp_connector
             .connect(ctx.clone(), addr, deps.connect_timeout)
@@ -459,10 +394,72 @@ async fn connect_via_http_proxy(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no proxy socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no proxy address connected"),
-        )
+        WireError::route_exhausted("no proxy socket addresses could be connected")
+    }))
+}
+
+async fn connect_via_socks_proxy(
+    ctx: CallContext,
+    target_uri: Uri,
+    route_plan: RoutePlan,
+    deps: ProxyConnectDeps,
+) -> Result<BoxConnection, WireError> {
+    let mut last_error = None;
+
+    for route in route_plan.iter() {
+        let &RouteKind::SocksProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
+        match deps
+            .tcp_connector
+            .connect(ctx.clone(), addr, deps.connect_timeout)
+            .await
+        {
+            Ok(stream) => {
+                let tunneled = match establish_socks5_tunnel(
+                    ctx.clone(),
+                    &target_uri,
+                    addr,
+                    stream,
+                    deps.connect_timeout,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        ctx.listener().connect_failed(&ctx, addr, &error);
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+
+                let proxied = Box::new(ProxiedConnection { inner: tunneled }) as BoxConnection;
+                if target_uri
+                    .scheme_str()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                {
+                    let tls_connector = deps.tls_connector.clone().ok_or_else(|| {
+                        WireError::tls(
+                            "HTTPS requested but no TLS connector is configured",
+                            io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
+                        )
+                    })?;
+                    return tls_connector
+                        .connect(ctx.clone(), target_uri, proxied)
+                        .await;
+                }
+
+                return Ok(proxied);
+            }
+            Err(error) => {
+                ctx.listener().connect_failed(&ctx, addr, &error);
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        WireError::route_exhausted("no proxy socket addresses could be connected")
     }))
 }
 
@@ -542,6 +539,39 @@ async fn establish_connect_tunnel(
     }
 }
 
+async fn establish_socks5_tunnel(
+    ctx: CallContext,
+    target_uri: &Uri,
+    proxy_addr: SocketAddr,
+    stream: BoxConnection,
+    timeout: Option<Duration>,
+) -> Result<BoxConnection, WireError> {
+    let host = target_uri
+        .host()
+        .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?;
+    let port = target_uri.port_u16().unwrap_or_else(|| {
+        if target_uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    let mut stream = TokioIo::new(stream);
+
+    socks5_write_client_greeting(&mut stream, timeout).await?;
+    socks5_read_server_choice(&mut stream, timeout).await?;
+    socks5_write_connect_request(&mut stream, host, port, timeout).await?;
+    socks5_read_connect_response(&mut stream, timeout).await?;
+    tracing::debug!(
+        call_id = ctx.call_id().as_u64(),
+        proxy_addr = %proxy_addr,
+        target_host = host,
+        target_port = port,
+        "established SOCKS5 tunnel"
+    );
+    Ok(stream.into_inner())
+}
+
 enum ConnectTunnelOutcome {
     Established(BoxConnection),
     Response(ConnectResponseHead),
@@ -566,11 +596,11 @@ async fn send_connect_request(
     stream
         .write_all(connect_request.as_bytes())
         .await
-        .map_err(|error| WireError::connect("failed to write proxy CONNECT request", error))?;
+        .map_err(|error| WireError::proxy_tunnel("failed to write proxy CONNECT request", error))?;
     stream
         .flush()
         .await
-        .map_err(|error| WireError::connect("failed to flush proxy CONNECT request", error))?;
+        .map_err(|error| WireError::proxy_tunnel("failed to flush proxy CONNECT request", error))?;
 
     let head = read_connect_response(&mut stream, connect_timeout).await?;
     if head.status == StatusCode::OK {
@@ -623,12 +653,11 @@ async fn read_connect_response_inner(
     let mut response = Vec::with_capacity(1024);
     let mut buf = [0u8; 512];
     loop {
-        let read = stream
-            .read(&mut buf)
-            .await
-            .map_err(|error| WireError::connect("failed to read proxy CONNECT response", error))?;
+        let read = stream.read(&mut buf).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read proxy CONNECT response", error)
+        })?;
         if read == 0 {
-            return Err(WireError::connect(
+            return Err(WireError::proxy_tunnel(
                 "proxy closed connection during CONNECT",
                 io::Error::new(io::ErrorKind::UnexpectedEof, "proxy closed connection"),
             ));
@@ -638,7 +667,7 @@ async fn read_connect_response_inner(
             break;
         }
         if response.len() > 8192 {
-            return Err(WireError::connect(
+            return Err(WireError::proxy_tunnel(
                 "proxy CONNECT response headers exceeded 8KiB",
                 io::Error::new(io::ErrorKind::InvalidData, "proxy response too large"),
             ));
@@ -648,9 +677,191 @@ async fn read_connect_response_inner(
     parse_connect_response_head(&response)
 }
 
+async fn socks5_write_client_greeting(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    socks5_timeout(timeout, async {
+        stream
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .map_err(|error| WireError::proxy_tunnel("failed to write SOCKS5 greeting", error))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| WireError::proxy_tunnel("failed to flush SOCKS5 greeting", error))
+    })
+    .await
+}
+
+async fn socks5_read_server_choice(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut response = [0u8; 2];
+    socks5_timeout(timeout, async {
+        stream.read_exact(&mut response).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read SOCKS5 greeting response", error)
+        })
+    })
+    .await?;
+
+    if response[0] != 0x05 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 proxy returned unsupported version {}",
+            response[0]
+        )));
+    }
+    if response[1] != 0x00 {
+        return Err(WireError::proxy_tunnel_non_retryable(
+            "SOCKS5 proxy does not support no-auth authentication",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn socks5_write_connect_request(
+    stream: &mut TokioIo<BoxConnection>,
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut request = vec![0x05, 0x01, 0x00];
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
+        }
+        Ok(IpAddr::V6(ip)) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            if host.len() > u8::MAX as usize {
+                return Err(WireError::invalid_request(
+                    "SOCKS5 target host exceeds 255 bytes",
+                ));
+            }
+            request.push(0x03);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+
+    socks5_timeout(timeout, async {
+        stream.write_all(&request).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to write SOCKS5 connect request", error)
+        })?;
+        stream.flush().await.map_err(|error| {
+            WireError::proxy_tunnel("failed to flush SOCKS5 connect request", error)
+        })
+    })
+    .await
+}
+
+async fn socks5_read_connect_response(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut head = [0u8; 4];
+    socks5_timeout(timeout, async {
+        stream.read_exact(&mut head).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read SOCKS5 connect response", error)
+        })
+    })
+    .await?;
+
+    if head[0] != 0x05 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 proxy returned unsupported version {}",
+            head[0]
+        )));
+    }
+    if head[1] != 0x00 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 connect failed: {}",
+            socks5_reply_reason(head[1])
+        )));
+    }
+
+    match head[3] {
+        0x01 => {
+            let mut remainder = [0u8; 6];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 IPv4 bind address", error)
+                })
+            })
+            .await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut len).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 bind host length", error)
+                })
+            })
+            .await?;
+            let mut remainder = vec![0u8; len[0] as usize + 2];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 bind host", error)
+                })
+            })
+            .await?;
+        }
+        0x04 => {
+            let mut remainder = [0u8; 18];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 IPv6 bind address", error)
+                })
+            })
+            .await?;
+        }
+        atyp => {
+            return Err(WireError::proxy_tunnel_non_retryable(format!(
+                "SOCKS5 proxy returned unknown address type {atyp}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn socks5_timeout<T>(
+    timeout: Option<Duration>,
+    future: impl std::future::Future<Output = Result<T, WireError>>,
+) -> Result<T, WireError> {
+    if let Some(timeout) = timeout {
+        return tokio::time::timeout(timeout, future).await.map_err(|_| {
+            WireError::connect_timeout(format!("SOCKS5 handshake timed out after {timeout:?}"))
+        })?;
+    }
+
+    future.await
+}
+
+fn socks5_reply_reason(code: u8) -> &'static str {
+    match code {
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "unknown failure",
+    }
+}
+
 fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, WireError> {
-    let head = std::str::from_utf8(response)
-        .map_err(|error| WireError::connect("proxy CONNECT response was not valid UTF-8", error))?;
+    let head = std::str::from_utf8(response).map_err(|error| {
+        WireError::proxy_tunnel("proxy CONNECT response was not valid UTF-8", error)
+    })?;
     let head = head
         .split_once("\r\n\r\n")
         .map(|(head, _)| head)
@@ -659,7 +870,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, W
     let status_line = lines
         .next()
         .ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 "proxy returned an empty CONNECT response",
                 io::Error::new(io::ErrorKind::InvalidData, "empty proxy response"),
             )
@@ -674,19 +885,19 @@ fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, W
         }
 
         let (name, value) = line.split_once(':').ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header line: {line}"),
                 io::Error::new(io::ErrorKind::InvalidData, "malformed proxy header"),
             )
         })?;
         let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header name {name:?}"),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
         let value = HeaderValue::from_str(value.trim()).map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header value for {}", name.as_str()),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
@@ -705,7 +916,7 @@ fn parse_connect_status(status_line: &str) -> Result<StatusCode, WireError> {
     let mut parts = status_line.split_whitespace();
     let protocol = parts.next().unwrap_or_default();
     if protocol != "HTTP/1.1" && protocol != "HTTP/1.0" {
-        return Err(WireError::connect(
+        return Err(WireError::proxy_tunnel(
             format!("proxy CONNECT returned an invalid status line: {status_line}"),
             io::Error::new(io::ErrorKind::InvalidData, "invalid proxy status line"),
         ));
@@ -714,21 +925,21 @@ fn parse_connect_status(status_line: &str) -> Result<StatusCode, WireError> {
     let status = parts
         .next()
         .ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("proxy CONNECT returned an invalid status line: {status_line}"),
                 io::Error::new(io::ErrorKind::InvalidData, "missing proxy status code"),
             )
         })?
         .parse::<u16>()
         .map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("proxy CONNECT returned an invalid status line: {status_line}"),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
 
     StatusCode::from_u16(status).map_err(|error| {
-        WireError::connect(
+        WireError::proxy_tunnel(
             format!("proxy CONNECT returned an invalid status line: {status_line}"),
             io::Error::new(io::ErrorKind::InvalidData, error),
         )
@@ -758,7 +969,7 @@ fn sanitize_connect_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 fn proxy_connect_status_error(status_line: &str) -> WireError {
-    WireError::connect_non_retryable(format!("proxy CONNECT failed: {status_line}"))
+    WireError::proxy_tunnel_non_retryable(format!("proxy CONNECT failed: {status_line}"))
 }
 
 struct ProxiedConnection {
@@ -811,31 +1022,401 @@ impl hyper::rt::Write for ProxiedConnection {
     }
 }
 
-fn default_port(uri: &Uri) -> Result<u16, WireError> {
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
-    Ok(uri.port_u16().unwrap_or_else(|| {
-        if scheme.eq_ignore_ascii_case("https") {
-            443
-        } else {
-            80
+#[derive(Clone, Default)]
+struct ConnectionBindings {
+    inner: Arc<Mutex<HashMap<ConnectionId, ConnectionBinding>>>,
+}
+
+enum ConnectionBinding {
+    Http1(Http1Binding),
+    Http2(Http2Binding),
+}
+
+struct Http1Binding {
+    info: ConnectionInfo,
+    sender: Option<http1::SendRequest<RequestBody>>,
+}
+
+struct Http2Binding {
+    info: ConnectionInfo,
+    sender: http2::SendRequest<RequestBody>,
+}
+
+enum AcquiredBinding {
+    Http1 {
+        info: ConnectionInfo,
+        sender: http1::SendRequest<RequestBody>,
+    },
+    Http2 {
+        info: ConnectionInfo,
+        sender: http2::SendRequest<RequestBody>,
+    },
+}
+
+impl ConnectionBindings {
+    fn insert_http1(
+        &self,
+        connection_id: ConnectionId,
+        info: ConnectionInfo,
+        sender: http1::SendRequest<RequestBody>,
+    ) {
+        self.inner.lock().expect("connection bindings lock").insert(
+            connection_id,
+            ConnectionBinding::Http1(Http1Binding {
+                info,
+                sender: Some(sender),
+            }),
+        );
+    }
+
+    fn insert_http2(
+        &self,
+        connection_id: ConnectionId,
+        info: ConnectionInfo,
+        sender: http2::SendRequest<RequestBody>,
+    ) {
+        self.inner.lock().expect("connection bindings lock").insert(
+            connection_id,
+            ConnectionBinding::Http2(Http2Binding { info, sender }),
+        );
+    }
+
+    fn acquire(&self, connection_id: ConnectionId) -> Option<AcquiredBinding> {
+        let mut bindings = self.inner.lock().expect("connection bindings lock");
+        let mut remove_stale = false;
+        let acquired = match bindings.get_mut(&connection_id)? {
+            ConnectionBinding::Http1(binding) => {
+                let sender = binding.sender.take()?;
+                if sender.is_closed() {
+                    remove_stale = true;
+                    None
+                } else {
+                    Some(AcquiredBinding::Http1 {
+                        info: binding.info.clone(),
+                        sender,
+                    })
+                }
+            }
+            ConnectionBinding::Http2(binding) => {
+                if binding.sender.is_closed() {
+                    remove_stale = true;
+                    None
+                } else {
+                    Some(AcquiredBinding::Http2 {
+                        info: binding.info.clone(),
+                        sender: binding.sender.clone(),
+                    })
+                }
+            }
+        };
+        if remove_stale {
+            bindings.remove(&connection_id);
         }
-    }))
+        acquired
+    }
+
+    fn release_http1(
+        &self,
+        connection_id: ConnectionId,
+        sender: http1::SendRequest<RequestBody>,
+    ) -> bool {
+        if sender.is_closed() {
+            self.remove(connection_id);
+            return false;
+        }
+
+        let mut bindings = self.inner.lock().expect("connection bindings lock");
+        let Some(ConnectionBinding::Http1(binding)) = bindings.get_mut(&connection_id) else {
+            return false;
+        };
+        debug_assert!(
+            binding.sender.is_none(),
+            "HTTP/1 sender should be checked out"
+        );
+        binding.sender = Some(sender);
+        true
+    }
+
+    fn remove(&self, connection_id: ConnectionId) {
+        self.inner
+            .lock()
+            .expect("connection bindings lock")
+            .remove(&connection_id);
+    }
+}
+
+struct SelectedConnection {
+    connection: crate::connection::RealConnection,
+    binding: AcquiredBinding,
+    reused: bool,
+}
+
+struct BoundResponse {
+    response: Response<Incoming>,
+    release: ResponseLease,
+    reused: bool,
+}
+
+enum ResponseLease {
+    Http1 {
+        connection: crate::connection::RealConnection,
+        bindings: Arc<ConnectionBindings>,
+        sender: http1::SendRequest<RequestBody>,
+        reusable: bool,
+    },
+    Http2 {
+        connection: crate::connection::RealConnection,
+    },
 }
 
 #[derive(Clone)]
 pub(crate) struct TransportService {
-    pub(crate) client: HyperClient<ConnectorStack, RequestBody>,
-    connection_registry: Arc<Mutex<HashSet<openwire_core::ConnectionId>>>,
+    connector: ConnectorStack,
+    config: crate::client::TransportConfig,
+    runtime: Arc<dyn Runtime>,
+    exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
 }
 
 impl TransportService {
-    pub(crate) fn new(client: HyperClient<ConnectorStack, RequestBody>) -> Self {
+    pub(crate) fn new(
+        connector: ConnectorStack,
+        config: crate::client::TransportConfig,
+        runtime: Arc<dyn Runtime>,
+        exchange_finder: Arc<ExchangeFinder>,
+    ) -> Self {
         Self {
-            client,
-            connection_registry: Arc::new(Mutex::new(HashSet::new())),
+            connector,
+            config,
+            runtime,
+            exchange_finder,
+            bindings: Arc::new(ConnectionBindings::default()),
         }
+    }
+
+    async fn execute_exchange(
+        self,
+        exchange: Exchange,
+    ) -> Result<Response<ResponseBody>, WireError> {
+        let (request, ctx, attempt) = exchange.into_parts();
+        let prepared = self.exchange_finder.prepare(&request)?;
+        let request_body_len = request.body().replayable_len();
+        let policy_trace = request
+            .extensions()
+            .get::<PolicyTraceContext>()
+            .copied()
+            .unwrap_or_default();
+
+        let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
+        record_pool_lookup_trace(&call_span, &prepared);
+        async move {
+            ctx.listener()
+                .pool_lookup(&ctx, prepared.pool_hit(), prepared.pool_connection_id());
+            let selected = self
+                .acquire_connection(&prepared, &request, ctx.clone(), tracing::Span::current())
+                .await?;
+            let response = send_bound_request(
+                request,
+                selected,
+                self.exchange_finder.clone(),
+                self.bindings.clone(),
+            )
+            .await?;
+
+            if let Some(bytes) = request_body_len {
+                ctx.listener().request_body_end(&ctx, bytes);
+            }
+
+            let connection_info = response
+                .response
+                .extensions()
+                .get::<ConnectionInfo>()
+                .cloned()
+                .expect("owned response should carry connection info");
+            ctx.listener()
+                .connection_acquired(&ctx, connection_info.id, response.reused);
+            let span = tracing::Span::current();
+            span.record("connection_id", connection_info.id.as_u64());
+            span.record("connection_reused", response.reused);
+
+            ctx.listener().response_headers_start(&ctx);
+            let (parts, body) = response.response.into_parts();
+            let body = ObservedIncomingBody::wrap(
+                body,
+                ctx.clone(),
+                attempt,
+                Some(response.release),
+                self.exchange_finder.clone(),
+                tracing::Span::current(),
+            );
+            let response = Response::from_parts(parts, body);
+            ctx.listener().response_headers_end(&ctx, &response);
+            Ok(response)
+        }
+        .instrument(call_span)
+        .await
+    }
+
+    async fn acquire_connection(
+        &self,
+        prepared: &crate::connection::PreparedExchange,
+        request: &Request<RequestBody>,
+        ctx: CallContext,
+        span: tracing::Span,
+    ) -> Result<SelectedConnection, WireError> {
+        if let Some(connection) = prepared.reserved_connection() {
+            if let Some(binding) = self.bindings.acquire(connection.id()) {
+                return Ok(SelectedConnection {
+                    connection: connection.clone(),
+                    binding,
+                    reused: true,
+                });
+            }
+
+            let _ = self.exchange_finder.pool().remove(connection.id());
+        }
+
+        self.bind_fresh_connection(prepared, request, ctx, span)
+            .await
+    }
+
+    async fn bind_fresh_connection(
+        &self,
+        prepared: &crate::connection::PreparedExchange,
+        request: &Request<RequestBody>,
+        ctx: CallContext,
+        span: tracing::Span,
+    ) -> Result<SelectedConnection, WireError> {
+        let route_plan = self
+            .connector
+            .route_plan(ctx.clone(), prepared.address())
+            .await?;
+        if let Some(selected) = self.try_acquire_coalesced(prepared.address(), &route_plan) {
+            return Ok(selected);
+        }
+
+        let connect_span = tracing::Span::current();
+        let stream = connect_route_plan(
+            ctx,
+            request.uri().clone(),
+            route_plan,
+            self.connector.proxy_connect_deps(),
+        )
+        .instrument(connect_span)
+        .with_current_subscriber()
+        .await?;
+        let connected = stream.connected();
+        let info = connection_info_from_connected(&connected);
+        let coalescing = coalescing_info_from_connected(&connected);
+        let protocol = determine_protocol(prepared.address(), &connected);
+        let route = Route::from_observed(prepared.address().clone(), info.remote_addr);
+        let connection = crate::connection::RealConnection::with_id_and_coalescing(
+            info.id, route, protocol, coalescing,
+        );
+        let _ = connection.try_acquire();
+        self.exchange_finder.pool().insert(connection.clone());
+
+        match protocol {
+            ConnectionProtocol::Http1 => {
+                let (sender, task) = bind_http1(stream).await?;
+                self.bindings.insert_http1(info.id, info, sender);
+                self.spawn_http1_task(connection.clone(), task, span)?;
+            }
+            ConnectionProtocol::Http2 => {
+                let (sender, task) = bind_http2(stream, &self.config).await?;
+                self.bindings.insert_http2(info.id, info, sender);
+                self.spawn_http2_task(connection.clone(), task, span)?;
+            }
+        }
+
+        let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
+            self.bindings.remove(connection.id());
+            let _ = self.exchange_finder.pool().remove(connection.id());
+            WireError::internal(
+                "freshly bound connection was not available for request execution",
+                io::Error::other("bound connection missing immediately after insert"),
+            )
+        })?;
+
+        Ok(SelectedConnection {
+            connection,
+            binding,
+            reused: false,
+        })
+    }
+
+    fn try_acquire_coalesced(
+        &self,
+        address: &Address,
+        route_plan: &RoutePlan,
+    ) -> Option<SelectedConnection> {
+        let connection = self
+            .exchange_finder
+            .pool()
+            .acquire_coalesced(address, route_plan)?;
+        let binding = self.bindings.acquire(connection.id());
+        if let Some(binding) = binding {
+            return Some(SelectedConnection {
+                connection,
+                binding,
+                reused: true,
+            });
+        }
+
+        let _ = self.exchange_finder.pool().remove(connection.id());
+        None
+    }
+
+    fn spawn_http1_task(
+        &self,
+        connection: crate::connection::RealConnection,
+        task: http1::Connection<BoxConnection, RequestBody>,
+        span: tracing::Span,
+    ) -> Result<(), WireError> {
+        let connection_id = connection.id();
+        let bindings = self.bindings.clone();
+        let pool = self.exchange_finder.pool().clone();
+        self.runtime.spawn(Box::pin(
+            async move {
+                let result = task.await;
+                bindings.remove(connection_id);
+                let _ = pool.remove(connection_id);
+                if let Err(error) = result {
+                    tracing::debug!(
+                        connection_id = connection_id.as_u64(),
+                        error = %error,
+                        "owned HTTP/1 connection task failed",
+                    );
+                }
+            }
+            .instrument(span),
+        ))
+    }
+
+    fn spawn_http2_task(
+        &self,
+        connection: crate::connection::RealConnection,
+        task: http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        span: tracing::Span,
+    ) -> Result<(), WireError> {
+        let connection_id = connection.id();
+        let bindings = self.bindings.clone();
+        let pool = self.exchange_finder.pool().clone();
+        self.runtime.spawn(Box::pin(
+            async move {
+                let result = task.await;
+                bindings.remove(connection_id);
+                let _ = pool.remove(connection_id);
+                if let Err(error) = result {
+                    tracing::debug!(
+                        connection_id = connection_id.as_u64(),
+                        error = %error,
+                        "owned HTTP/2 connection task failed",
+                    );
+                }
+            }
+            .instrument(span),
+        ))
     }
 }
 
@@ -849,60 +1430,11 @@ impl Service<Exchange> for TransportService {
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let client = self.client.clone();
-        let connection_registry = self.connection_registry.clone();
-        Box::pin(async move {
-            let (request, ctx, attempt) = exchange.into_parts();
-            let request_body_len = request.body().replayable_len();
-            let policy_trace = request
-                .extensions()
-                .get::<PolicyTraceContext>()
-                .copied()
-                .unwrap_or_default();
-
-            let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
-
-            async move {
-                let response = with_call_context(ctx.clone(), async move {
-                    client.request(request).await.map_err(map_client_error)
-                })
-                .await?;
-
-                if let Some(bytes) = request_body_len {
-                    ctx.listener().request_body_end(&ctx, bytes);
-                }
-
-                let connection_info = response.extensions().get::<ConnectionInfo>().cloned();
-                if let Some(info) = &connection_info {
-                    let reused = {
-                        let mut seen = connection_registry
-                            .lock()
-                            .expect("connection registry lock");
-                        !seen.insert(info.id)
-                    };
-                    ctx.listener().connection_acquired(&ctx, info.id, reused);
-                    let span = tracing::Span::current();
-                    span.record("connection_id", info.id.as_u64());
-                    span.record("connection_reused", reused);
-                }
-
-                ctx.listener().response_headers_start(&ctx);
-                let (parts, body) = response.into_parts();
-                let body = ObservedIncomingBody::wrap(
-                    body,
-                    ctx.clone(),
-                    attempt,
-                    connection_info,
-                    tracing::Span::current(),
-                );
-                let response = Response::from_parts(parts, body);
-                ctx.listener().response_headers_end(&ctx, &response);
-
-                Ok(response)
-            }
-            .instrument(call_span)
-            .await
-        })
+        Box::pin(
+            self.clone()
+                .execute_exchange(exchange)
+                .with_current_subscriber(),
+        )
     }
 }
 
@@ -923,26 +1455,22 @@ fn attempt_span(
         auth_count = policy_trace.auth_count,
         method = %request.method(),
         uri = %request.uri(),
+        pool_hit = tracing::field::Empty,
+        pool_connection_id = tracing::field::Empty,
+        route_count = tracing::field::Empty,
+        fast_fallback_enabled = tracing::field::Empty,
+        connect_race_id = tracing::field::Empty,
+        connect_winner = tracing::field::Empty,
         connection_id = tracing::field::Empty,
         connection_reused = tracing::field::Empty,
     )
 }
 
-pub(crate) fn build_hyper_client(
-    connector: ConnectorStack,
-    config: &crate::client::TransportConfig,
-) -> HyperClient<ConnectorStack, RequestBody> {
-    let mut builder = HyperClient::builder(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
-    builder.pool_timer(TokioTimer::new());
-    builder.pool_max_idle_per_host(config.pool_max_idle_per_host);
-    builder.retry_canceled_requests(config.retry_canceled_requests);
-    builder.pool_idle_timeout(config.pool_idle_timeout);
-    if let Some(interval) = config.http2_keep_alive_interval {
-        builder.http2_keep_alive_interval(interval);
-        builder.http2_keep_alive_while_idle(config.http2_keep_alive_while_idle);
+fn record_pool_lookup_trace(span: &tracing::Span, prepared: &crate::connection::PreparedExchange) {
+    span.record("pool_hit", prepared.pool_hit());
+    if let Some(connection_id) = prepared.pool_connection_id() {
+        span.record("pool_connection_id", connection_id.as_u64());
     }
-    builder.build(connector)
 }
 
 struct ObservedIncomingBody {
@@ -950,7 +1478,8 @@ struct ObservedIncomingBody {
     ctx: CallContext,
     attempt: u32,
     bytes_read: u64,
-    connection_id: Option<openwire_core::ConnectionId>,
+    release: Option<ResponseLease>,
+    exchange_finder: Arc<ExchangeFinder>,
     span: tracing::Span,
     finished: bool,
 }
@@ -960,7 +1489,8 @@ impl ObservedIncomingBody {
         body: Incoming,
         ctx: CallContext,
         attempt: u32,
-        info: Option<ConnectionInfo>,
+        release: Option<ResponseLease>,
+        exchange_finder: Arc<ExchangeFinder>,
         span: tracing::Span,
     ) -> ResponseBody {
         ResponseBody::new(
@@ -969,7 +1499,8 @@ impl ObservedIncomingBody {
                 ctx,
                 attempt,
                 bytes_read: 0,
-                connection_id: info.map(|info| info.id),
+                release,
+                exchange_finder,
                 span,
                 finished: false,
             }
@@ -1004,7 +1535,7 @@ impl ObservedIncomingBody {
             );
         });
         self.ctx.listener().response_body_failed(&self.ctx, error);
-        self.release_connection();
+        self.discard_connection();
     }
 
     fn finish_abandoned(&mut self) {
@@ -1012,14 +1543,66 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
-        self.release_connection();
+        self.discard_connection();
     }
 
     fn release_connection(&mut self) {
-        if let Some(connection_id) = self.connection_id {
-            self.ctx
-                .listener()
-                .connection_released(&self.ctx, connection_id);
+        if let Some(release) = self.release.take() {
+            match release {
+                ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    sender,
+                    reusable,
+                } => {
+                    if reusable
+                        && bindings.release_http1(connection.id(), sender)
+                        && self.exchange_finder.release(&connection)
+                    {
+                        self.ctx
+                            .listener()
+                            .connection_released(&self.ctx, connection.id());
+                        return;
+                    }
+
+                    bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+                ResponseLease::Http2 { connection } => {
+                    let _ = self.exchange_finder.release(&connection);
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+            }
+        }
+    }
+
+    fn discard_connection(&mut self) {
+        if let Some(release) = self.release.take() {
+            match release {
+                ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    ..
+                } => {
+                    bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+                ResponseLease::Http2 { connection } => {
+                    connection.mark_unhealthy();
+                    let _ = self.exchange_finder.release(&connection);
+                    self.ctx
+                        .listener()
+                        .connection_released(&self.ctx, connection.id());
+                }
+            }
         }
     }
 }
@@ -1068,23 +1651,170 @@ impl Body for ObservedIncomingBody {
     }
 }
 
-fn map_client_error(error: hyper_util::client::legacy::Error) -> WireError {
-    if error.is_connect() {
-        if let Some(source) = find_wire_error(&error) {
-            return source.clone();
+async fn send_bound_request(
+    request: Request<RequestBody>,
+    selected: SelectedConnection,
+    exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
+) -> Result<BoundResponse, WireError> {
+    let connection = selected.connection;
+    let reused = selected.reused;
+    let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
+
+    match selected.binding {
+        AcquiredBinding::Http1 { info, mut sender } => {
+            sender.ready().await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let mut response = sender.send_request(request).await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let reusable = http1_response_allows_reuse(&response);
+            response.extensions_mut().insert(info);
+            Ok(BoundResponse {
+                response,
+                release: ResponseLease::Http1 {
+                    connection,
+                    bindings,
+                    sender,
+                    reusable,
+                },
+                reused,
+            })
         }
-        return WireError::connect("transport connection failed", error);
+        AcquiredBinding::Http2 { info, mut sender } => {
+            sender.ready().await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            let mut response = sender.send_request(request).await.map_err(|error| {
+                cleanup_failed_request(&connection, &exchange_finder, &bindings);
+                map_hyper_error(error)
+            })?;
+            response.extensions_mut().insert(info);
+            Ok(BoundResponse {
+                response,
+                release: ResponseLease::Http2 { connection },
+                reused,
+            })
+        }
+    }
+}
+
+async fn bind_http1(
+    stream: BoxConnection,
+) -> Result<
+    (
+        http1::SendRequest<RequestBody>,
+        http1::Connection<BoxConnection, RequestBody>,
+    ),
+    WireError,
+> {
+    http1::Builder::new()
+        .handshake(stream)
+        .await
+        .map_err(|error| WireError::protocol_binding("HTTP/1.1 client handshake failed", error))
+}
+
+async fn bind_http2(
+    stream: BoxConnection,
+    config: &crate::client::TransportConfig,
+) -> Result<
+    (
+        http2::SendRequest<RequestBody>,
+        http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+    ),
+    WireError,
+> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder.timer(TokioTimer::new());
+    if let Some(interval) = config.http2_keep_alive_interval {
+        builder.keep_alive_interval(interval);
+        builder.keep_alive_while_idle(config.http2_keep_alive_while_idle);
+    }
+    builder
+        .handshake(stream)
+        .await
+        .map_err(|error| WireError::protocol_binding("HTTP/2 client handshake failed", error))
+}
+
+fn determine_protocol(address: &Address, connected: &Connected) -> ConnectionProtocol {
+    if address.scheme() == UriScheme::Http {
+        ConnectionProtocol::Http1
+    } else if connected.is_negotiated_h2() {
+        ConnectionProtocol::Http2
+    } else {
+        ConnectionProtocol::Http1
+    }
+}
+
+fn prepare_bound_request(
+    mut request: Request<RequestBody>,
+    protocol: ConnectionProtocol,
+    route_kind: &RouteKind,
+) -> Result<Request<RequestBody>, WireError> {
+    if protocol != ConnectionProtocol::Http1
+        || matches!(route_kind, RouteKind::HttpForwardProxy { .. })
+    {
+        return Ok(request);
     }
 
-    if let Some(source) = std::error::Error::source(&error) {
-        if let Some(source) = source.downcast_ref::<hyper::Error>() {
-            if source.is_canceled() {
-                return WireError::canceled("request canceled");
-            }
-            if source.is_timeout() {
-                return WireError::timeout("request timed out");
-            }
+    let origin_form = request
+        .uri()
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    *request.uri_mut() = origin_form.parse().map_err(|error| {
+        WireError::internal(
+            "failed to normalize request URI for direct HTTP/1.1 binding",
+            error,
+        )
+    })?;
+    Ok(request)
+}
+
+fn http1_response_allows_reuse(response: &Response<Incoming>) -> bool {
+    if response.version() == Version::HTTP_10 {
+        return false;
+    }
+
+    !response.headers().get("connection").is_some_and(|value| {
+        value
+            .to_str()
+            .map(|value| value.eq_ignore_ascii_case("close"))
+            .unwrap_or(false)
+    })
+}
+
+fn cleanup_failed_request(
+    connection: &crate::connection::RealConnection,
+    exchange_finder: &Arc<ExchangeFinder>,
+    bindings: &Arc<ConnectionBindings>,
+) {
+    match connection.protocol() {
+        ConnectionProtocol::Http1 => {
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
         }
+        ConnectionProtocol::Http2 => {
+            connection.mark_unhealthy();
+            let _ = exchange_finder.release(connection);
+        }
+    }
+}
+
+fn map_hyper_error(error: hyper::Error) -> WireError {
+    if let Some(source) = find_wire_error(&error) {
+        return source.clone();
+    }
+
+    if error.is_canceled() {
+        return WireError::canceled("request canceled");
+    }
+    if error.is_timeout() {
+        return WireError::timeout("request timed out");
     }
 
     WireError::protocol("transport request failed", error)
@@ -1101,20 +1831,176 @@ fn find_wire_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&
     None
 }
 
-fn current_call_context() -> Result<CallContext, WireError> {
-    CURRENT_CALL_CONTEXT
-        .try_with(Clone::clone)
-        .map_err(|error| {
-            WireError::internal(
-                "call context unavailable inside connector stack",
-                io::Error::other(error.to_string()),
-            )
+fn connection_info_from_connected(connected: &Connected) -> ConnectionInfo {
+    let mut extensions = http::Extensions::new();
+    connected.get_extras(&mut extensions);
+    extensions
+        .remove::<ConnectionInfo>()
+        .unwrap_or(ConnectionInfo {
+            id: next_connection_id(),
+            remote_addr: None,
+            local_addr: None,
+            tls: false,
         })
 }
 
-pub(crate) async fn with_call_context<F, T>(ctx: CallContext, future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    CURRENT_CALL_CONTEXT.scope(ctx, future).await
+fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
+    let mut extensions = http::Extensions::new();
+    connected.get_extras(&mut extensions);
+    extensions.remove::<CoalescingInfo>().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Id, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    use super::{record_fast_fallback_trace, FastFallbackOutcome};
+
+    #[derive(Clone, Debug)]
+    struct CapturedSpan {
+        name: String,
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct TraceCaptureInner {
+        span_order: Vec<u64>,
+        spans: HashMap<u64, CapturedSpan>,
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture {
+        inner: Arc<Mutex<TraceCaptureInner>>,
+    }
+
+    impl TraceCapture {
+        fn spans_named(&self, name: &str) -> Vec<CapturedSpan> {
+            let inner = self.inner.lock().expect("trace capture lock");
+            inner
+                .span_order
+                .iter()
+                .filter_map(|id| inner.spans.get(id))
+                .filter(|span| span.name == name)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl<S> Layer<S> for TraceCapture
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &Id,
+            _ctx: LayerContext<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            attrs.record(&mut visitor);
+            let mut inner = self.inner.lock().expect("trace capture lock");
+            let id = id.into_u64();
+            inner.span_order.push(id);
+            inner.spans.insert(
+                id,
+                CapturedSpan {
+                    name: attrs.metadata().name().to_owned(),
+                    fields: visitor.fields,
+                },
+            );
+        }
+
+        fn on_record(
+            &self,
+            id: &Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: LayerContext<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            values.record(&mut visitor);
+            if let Some(span) = self
+                .inner
+                .lock()
+                .expect("trace capture lock")
+                .spans
+                .get_mut(&id.into_u64())
+            {
+                span.fields.extend(visitor.fields);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        fields: HashMap<String, String>,
+    }
+
+    impl Visit for FieldCapture {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[test]
+    fn record_fast_fallback_trace_records_expected_attempt_fields() {
+        let trace = TraceCapture::default();
+        let subscriber = tracing_subscriber::registry().with(trace.clone());
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(subscriber), || {
+            let span = tracing::debug_span!(
+                "openwire.attempt",
+                route_count = tracing::field::Empty,
+                fast_fallback_enabled = tracing::field::Empty,
+                connect_race_id = tracing::field::Empty,
+                connect_winner = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            record_fast_fallback_trace(
+                &span,
+                FastFallbackOutcome {
+                    race_id: 7,
+                    route_count: 2,
+                    winner_index: 1,
+                    fast_fallback_enabled: true,
+                },
+            );
+        });
+
+        let spans = trace.spans_named("openwire.attempt");
+        assert_eq!(spans.len(), 1, "spans = {spans:?}");
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("route_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            span.fields.get("fast_fallback_enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            span.fields.get("connect_race_id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            span.fields.get("connect_winner").map(String::as_str),
+            Some("1")
+        );
+    }
 }

@@ -7,27 +7,6 @@ use thiserror::Error;
 
 pub type BoxError = Arc<dyn StdError + Send + Sync>;
 
-#[derive(Debug)]
-struct ConnectTimeoutMarker;
-#[derive(Debug)]
-struct NonRetryableConnectMarker;
-
-impl fmt::Display for ConnectTimeoutMarker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("connect timeout")
-    }
-}
-
-impl StdError for ConnectTimeoutMarker {}
-
-impl fmt::Display for NonRetryableConnectMarker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("non-retryable connect failure")
-    }
-}
-
-impl StdError for NonRetryableConnectMarker {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WireErrorKind {
     InvalidRequest,
@@ -63,11 +42,29 @@ impl fmt::Display for WireErrorKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EstablishmentStage {
+    Dns,
+    Tcp,
+    Tls,
+    ProtocolBinding,
+    ProxyTunnel,
+    RouteExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EstablishmentContext {
+    stage: EstablishmentStage,
+    retryable: bool,
+    connect_timeout: bool,
+}
+
 #[derive(Debug, Clone, Error)]
 #[error("{kind}: {message}")]
 pub struct WireError {
     kind: WireErrorKind,
     message: Cow<'static, str>,
+    establishment: Option<EstablishmentContext>,
     #[source]
     source: Option<BoxError>,
 }
@@ -77,6 +74,7 @@ impl WireError {
         Self {
             kind,
             message: message.into(),
+            establishment: None,
             source: None,
         }
     }
@@ -92,6 +90,7 @@ impl WireError {
         Self {
             kind,
             message: message.into(),
+            establishment: None,
             source: Some(Arc::new(source)),
         }
     }
@@ -104,18 +103,22 @@ impl WireError {
         self.message.as_ref()
     }
 
+    pub fn establishment_stage(&self) -> Option<EstablishmentStage> {
+        self.establishment.map(|context| context.stage)
+    }
+
+    pub fn is_retryable_establishment(&self) -> bool {
+        self.establishment.is_some_and(|context| context.retryable)
+    }
+
     pub fn is_connect_timeout(&self) -> bool {
-        self.source
-            .as_deref()
-            .and_then(|source| source.downcast_ref::<ConnectTimeoutMarker>())
-            .is_some()
+        self.establishment
+            .is_some_and(|context| context.connect_timeout)
     }
 
     pub fn is_non_retryable_connect(&self) -> bool {
-        self.source
-            .as_deref()
-            .and_then(|source| source.downcast_ref::<NonRetryableConnectMarker>())
-            .is_some()
+        self.establishment
+            .is_some_and(|context| context.stage == EstablishmentStage::Tcp && !context.retryable)
     }
 
     pub fn invalid_request(message: impl Into<Cow<'static, str>>) -> Self {
@@ -127,7 +130,9 @@ impl WireError {
     }
 
     pub fn connect_timeout(message: impl Into<Cow<'static, str>>) -> Self {
-        Self::with_source(WireErrorKind::Timeout, message, ConnectTimeoutMarker)
+        Self::new(WireErrorKind::Timeout, message)
+            .with_establishment(EstablishmentStage::Tcp, true)
+            .with_connect_timeout()
     }
 
     pub fn canceled(message: impl Into<Cow<'static, str>>) -> Self {
@@ -148,8 +153,17 @@ impl WireError {
         Self::with_source(WireErrorKind::Connect, message, source)
     }
 
+    pub fn tcp_connect<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::with_source(WireErrorKind::Connect, message, source)
+            .with_establishment(EstablishmentStage::Tcp, true)
+    }
+
     pub fn connect_non_retryable(message: impl Into<Cow<'static, str>>) -> Self {
-        Self::with_source(WireErrorKind::Connect, message, NonRetryableConnectMarker)
+        Self::new(WireErrorKind::Connect, message)
+            .with_establishment(EstablishmentStage::Tcp, false)
     }
 
     pub fn tls<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
@@ -157,6 +171,15 @@ impl WireError {
         E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Tls, message, source)
+            .with_establishment(EstablishmentStage::Tls, true)
+    }
+
+    pub fn tls_non_retryable<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::with_source(WireErrorKind::Tls, message, source)
+            .with_establishment(EstablishmentStage::Tls, false)
     }
 
     pub fn protocol<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
@@ -164,6 +187,32 @@ impl WireError {
         E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Protocol, message, source)
+    }
+
+    pub fn protocol_binding<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::with_source(WireErrorKind::Protocol, message, source)
+            .with_establishment(EstablishmentStage::ProtocolBinding, true)
+    }
+
+    pub fn proxy_tunnel<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::with_source(WireErrorKind::Connect, message, source)
+            .with_establishment(EstablishmentStage::ProxyTunnel, true)
+    }
+
+    pub fn proxy_tunnel_non_retryable(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(WireErrorKind::Connect, message)
+            .with_establishment(EstablishmentStage::ProxyTunnel, false)
+    }
+
+    pub fn route_exhausted(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(WireErrorKind::Connect, message)
+            .with_establishment(EstablishmentStage::RouteExhausted, true)
     }
 
     pub fn redirect(message: impl Into<Cow<'static, str>>) -> Self {
@@ -189,6 +238,22 @@ impl WireError {
         E: StdError + Send + Sync + 'static,
     {
         Self::with_source(WireErrorKind::Internal, message, source)
+    }
+
+    fn with_establishment(mut self, stage: EstablishmentStage, retryable: bool) -> Self {
+        self.establishment = Some(EstablishmentContext {
+            stage,
+            retryable,
+            connect_timeout: false,
+        });
+        self
+    }
+
+    fn with_connect_timeout(mut self) -> Self {
+        if let Some(establishment) = &mut self.establishment {
+            establishment.connect_timeout = true;
+        }
+        self
     }
 }
 

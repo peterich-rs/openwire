@@ -16,11 +16,11 @@ bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
-hyper-rustls.workspace = true
 hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
 pin-project-lite.workspace = true
 rustls.workspace = true
+rustls-webpki.workspace = true
 rustls-native-certs.workspace = true
 rustls-pemfile.workspace = true
 rustls-platform-verifier = { workspace = true, optional = true }

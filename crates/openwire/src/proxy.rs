@@ -35,34 +35,36 @@ struct CidrBlock {
 }
 
 impl Proxy {
+    fn from_target(target: Url, intercept: ProxyIntercept) -> Self {
+        Self {
+            target,
+            intercept,
+            no_proxy: None,
+        }
+    }
+
     /// Routes HTTP requests through the given HTTP proxy endpoint.
     pub fn http(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self {
-            target,
-            intercept: ProxyIntercept::Http,
-            no_proxy: None,
-        })
+        Ok(Self::from_target(target, ProxyIntercept::Http))
     }
 
     /// Routes HTTPS requests through the given HTTP proxy endpoint.
     pub fn https(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self {
-            target,
-            intercept: ProxyIntercept::Https,
-            no_proxy: None,
-        })
+        Ok(Self::from_target(target, ProxyIntercept::Https))
     }
 
     /// Routes both HTTP and HTTPS requests through the given HTTP proxy endpoint.
     pub fn all(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self {
-            target,
-            intercept: ProxyIntercept::All,
-            no_proxy: None,
-        })
+        Ok(Self::from_target(target, ProxyIntercept::All))
+    }
+
+    /// Routes both HTTP and HTTPS requests through the given SOCKS5 proxy endpoint.
+    pub fn socks5(target: impl AsRef<str>) -> Result<Self, WireError> {
+        let target = parse_socks5_proxy_target(target.as_ref())?;
+        Ok(Self::from_target(target, ProxyIntercept::All))
     }
 
     /// Excludes requests matched by `no_proxy` from using this proxy rule.
@@ -161,13 +163,30 @@ impl NoProxy {
 }
 
 fn parse_http_proxy_target(target: &str) -> Result<Url, WireError> {
+    parse_proxy_target(target, &["http"], "only http proxy endpoints are supported")
+}
+
+fn parse_socks5_proxy_target(target: &str) -> Result<Url, WireError> {
+    parse_proxy_target(
+        target,
+        &["socks5"],
+        "only socks5 proxy endpoints are supported",
+    )
+}
+
+fn parse_proxy_target(
+    target: &str,
+    allowed_schemes: &[&str],
+    unsupported_message: &'static str,
+) -> Result<Url, WireError> {
     let target = Url::parse(target)
         .map_err(|error| WireError::invalid_request(format!("invalid proxy URL: {error}")))?;
 
-    if target.scheme() != "http" {
-        return Err(WireError::invalid_request(
-            "only http proxy endpoints are supported",
-        ));
+    if !allowed_schemes
+        .iter()
+        .any(|scheme| target.scheme().eq_ignore_ascii_case(scheme))
+    {
+        return Err(WireError::invalid_request(unsupported_message));
     }
 
     if target.host_str().is_none() {
@@ -208,15 +227,24 @@ where
     let mut proxies = Vec::new();
 
     if let Some(proxy) = http_proxy {
-        proxies.push(apply_no_proxy(Proxy::http(proxy)?, no_proxy.clone()));
+        proxies.push(apply_no_proxy(
+            proxy_from_env(&proxy, ProxyIntercept::Http)?,
+            no_proxy.clone(),
+        ));
     }
 
     if let Some(proxy) = https_proxy {
-        proxies.push(apply_no_proxy(Proxy::https(proxy)?, no_proxy.clone()));
+        proxies.push(apply_no_proxy(
+            proxy_from_env(&proxy, ProxyIntercept::Https)?,
+            no_proxy.clone(),
+        ));
     }
 
     if let Some(proxy) = all_proxy {
-        proxies.push(apply_no_proxy(Proxy::all(proxy)?, no_proxy));
+        proxies.push(apply_no_proxy(
+            proxy_from_env(&proxy, ProxyIntercept::All)?,
+            no_proxy,
+        ));
     }
 
     Ok(proxies)
@@ -226,6 +254,23 @@ fn apply_no_proxy(proxy: Proxy, no_proxy: Option<NoProxy>) -> Proxy {
     match no_proxy {
         Some(no_proxy) => proxy.no_proxy(no_proxy),
         None => proxy,
+    }
+}
+
+fn proxy_from_env(target: &str, intercept: ProxyIntercept) -> Result<Proxy, WireError> {
+    let parsed = Url::parse(target)
+        .map_err(|error| WireError::invalid_request(format!("invalid proxy URL: {error}")))?;
+    if parsed.host_str().is_none() {
+        return Err(WireError::invalid_request("proxy URL is missing a host"));
+    }
+    match parsed.scheme() {
+        "http" | "socks5" => Ok(Proxy::from_target(parsed, intercept)),
+        "https" => Err(WireError::invalid_request(
+            "https proxy endpoints are not supported",
+        )),
+        _ => Err(WireError::invalid_request(
+            "only http and socks5 proxy endpoints are supported",
+        )),
     }
 }
 
@@ -343,7 +388,7 @@ fn normalize_domain_suffix(suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_no_proxy, system_proxies_from_iter, ProxyIntercept};
+    use super::{parse_no_proxy, system_proxies_from_iter, Proxy, ProxyIntercept};
 
     #[test]
     fn system_proxy_parser_uses_stable_variable_precedence() {
@@ -390,5 +435,25 @@ mod tests {
         let ipv6 = parse_no_proxy("fd00::/8").expect("ipv6 cidr");
         assert!(ipv6.matches("fd12::1"));
         assert!(!ipv6.matches("fe80::1"));
+    }
+
+    #[test]
+    fn socks5_proxy_constructor_requires_socks_scheme() {
+        let proxy = Proxy::socks5("socks5://proxy.test:1080").expect("socks proxy");
+        assert_eq!(proxy.target.scheme(), "socks5");
+
+        let error = Proxy::socks5("http://proxy.test:1080").expect_err("invalid socks proxy");
+        assert!(error
+            .to_string()
+            .contains("only socks5 proxy endpoints are supported"));
+    }
+
+    #[test]
+    fn system_proxy_parser_accepts_socks5_targets() {
+        let proxies = system_proxies_from_iter([("all_proxy", "socks5://socks.test:1080")])
+            .expect("proxy config");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].target.scheme(), "socks5");
+        assert_eq!(proxies[0].intercept, ProxyIntercept::All);
     }
 }

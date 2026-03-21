@@ -32,6 +32,23 @@ pub struct ConnectionInfo {
     pub tls: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoalescingInfo {
+    pub verified_server_names: Vec<String>,
+}
+
+impl CoalescingInfo {
+    pub fn new(verified_server_names: Vec<String>) -> Self {
+        Self {
+            verified_server_names,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verified_server_names.is_empty()
+    }
+}
+
 pub trait DnsResolver: Send + Sync + 'static {
     fn resolve(
         &self,

@@ -10,14 +10,23 @@ User API
   -> Client::execute
     -> create CallContext
     -> create EventListener
-    -> interceptor chain (tower layers)
-      -> transport service
-        -> connector stack
-          -> dns
-          -> tcp
-          -> tls
-          -> hyper conn/client
+    -> application interceptors
+      -> follow-up coordinator
+        -> request validation
+        -> cookie request application
+        -> bridge normalization
+          -> network interceptors
+            -> transport service
+              -> connector stack
+                -> proxy selection
+                -> dns
+                -> tcp
+                -> tls
+                -> hyper conn/client
+        -> cookie response persistence
+        -> auth / redirect follow-up decision
     -> response body wrapper
+      -> connection release bookkeeping
 ```
 
 

@@ -34,10 +34,43 @@ pub trait EventListener: Send + Sync + 'static {
     fn response_body_end(&self, _ctx: &CallContext, _bytes_read: u64) {}
     fn response_body_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
+    fn pool_lookup(&self, _ctx: &CallContext, _hit: bool, _connection_id: Option<ConnectionId>) {}
+
     fn connection_acquired(&self, _ctx: &CallContext, _connection_id: ConnectionId, _reused: bool) {
     }
 
     fn connection_released(&self, _ctx: &CallContext, _connection_id: ConnectionId) {}
+
+    fn route_plan(&self, _ctx: &CallContext, _route_count: usize, _fast_fallback_enabled: bool) {}
+
+    fn connect_race_start(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+        _route_family: &str,
+    ) {
+    }
+
+    fn connect_race_won(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+    ) {
+    }
+
+    fn connect_race_lost(
+        &self,
+        _ctx: &CallContext,
+        _race_id: u64,
+        _route_index: usize,
+        _route_count: usize,
+        _reason: &str,
+    ) {
+    }
 
     fn retry(&self, _ctx: &CallContext, _attempt: u32, _reason: &str) {}
     fn redirect(&self, _ctx: &CallContext, _attempt: u32, _location: &Uri) {}
