@@ -12,7 +12,7 @@ use std::pin::Pin;
 
 pub use body::{RequestBody, ResponseBody};
 pub use context::{next_connection_id, CallContext, CallId, ConnectionId};
-pub use error::{BoxError, WireError, WireErrorKind};
+pub use error::{BoxError, EstablishmentStage, WireError, WireErrorKind};
 pub use event::{
     EventListener, EventListenerFactory, NoopEventListener, NoopEventListenerFactory,
     SharedEventListener, SharedEventListenerFactory,

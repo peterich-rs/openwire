@@ -186,9 +186,9 @@ fine-grained route and fast-fallback decisions.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P11-001 | `TODO` | Refine internal connection-establishment outcomes into route-aware categories | P6-005 | Internal error mapping distinguishes TCP, TLS, protocol bind, and route exhaustion |
-| P11-002 | `TODO` | Refine retry policy so non-retryable TLS policy failures are not retried like transient connect failures | P11-001 | Retry tests cover TLS-policy vs transient-TLS behavior |
-| P11-003 | `TODO` | Ensure fast-fallback continuation uses refined establishment outcomes instead of broad `WireErrorKind` matching | P11-001 | Winner failure continuation tests pass |
+| P11-001 | `DONE` | Refine internal connection-establishment outcomes into route-aware categories | P6-005 | Internal error mapping distinguishes TCP, TLS, protocol bind, and route exhaustion |
+| P11-002 | `DONE` | Refine retry policy so non-retryable TLS policy failures are not retried like transient connect failures | P11-001 | Retry tests cover TLS-policy vs transient-TLS behavior |
+| P11-003 | `DONE` | Ensure fast-fallback continuation uses refined establishment outcomes instead of broad `WireErrorKind` matching | P11-001 | Winner failure continuation tests pass |
 
 ## Phase 12: Observability, Benchmarks, And Concurrency Hardening
 
@@ -230,15 +230,16 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P11-001` through `P11-003`
-2. `P12-005`
+1. `P12-005`
+2. `P12-001` through `P12-004`
 3. `P13-002` and `P13-003`
 
 Rationale:
 
-- proxy route planning and execution boundaries are now explicit, so the next
-  missing correctness slice is route-aware internal error classification
+- route-aware internal error classification is now landed, so the next
+  correctness gap is deterministic eviction coverage and broader observability
+  hardening
 - idle eviction now exists, but deterministic timing coverage still needs to be
-  added once the pool semantics settle further
+  added explicitly
 - runtime-path ownership is landed, so the next dependency cleanup is removing
   now-unneeded `hyper-util` client-side flags and auditing the remaining shim

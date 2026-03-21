@@ -86,9 +86,8 @@ impl TcpConnector for TokioTcpConnector {
             let connect = tokio::net::TcpStream::connect(addr);
             let stream = match timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, connect).await {
-                    Ok(result) => {
-                        result.map_err(|error| WireError::connect("TCP connect failed", error))?
-                    }
+                    Ok(result) => result
+                        .map_err(|error| WireError::tcp_connect("TCP connect failed", error))?,
                     Err(_error) => {
                         let error = WireError::connect_timeout(format!(
                             "connection timed out after {timeout:?}"
@@ -99,12 +98,12 @@ impl TcpConnector for TokioTcpConnector {
                 },
                 None => connect
                     .await
-                    .map_err(|error| WireError::connect("TCP connect failed", error))?,
+                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error))?,
             };
 
-            stream
-                .set_nodelay(true)
-                .map_err(|error| WireError::connect("failed to configure TCP_NODELAY", error))?;
+            stream.set_nodelay(true).map_err(|error| {
+                WireError::tcp_connect("failed to configure TCP_NODELAY", error)
+            })?;
 
             let info = ConnectionInfo {
                 id: next_connection_id(),
@@ -238,10 +237,7 @@ async fn connect_route_plan(
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let Some(first_route) = route_plan.route(0) else {
-        return Err(WireError::connect(
-            "route plan produced no routes",
-            io::Error::new(io::ErrorKind::NotConnected, "empty route plan"),
-        ));
+        return Err(WireError::route_exhausted("route plan produced no routes"));
     };
 
     match first_route.kind() {
@@ -284,6 +280,7 @@ async fn connect_direct(
     tls_connector: Option<Arc<dyn TlsConnector>>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
+    let connect_span = tracing::Span::current();
     let (stream, outcome) = FastFallbackDialer
         .dial_direct(
             ctx.clone(),
@@ -293,6 +290,8 @@ async fn connect_direct(
             tls_connector,
             connect_timeout,
         )
+        .instrument(connect_span)
+        .with_current_subscriber()
         .await?;
     let span = tracing::Span::current();
     span.record("route_count", outcome.route_count as u64);
@@ -329,10 +328,7 @@ async fn connect_via_http_forward_proxy(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no proxy socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no proxy address connected"),
-        )
+        WireError::route_exhausted("no proxy socket addresses could be connected")
     }))
 }
 
@@ -400,10 +396,7 @@ async fn connect_via_http_proxy(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        WireError::connect(
-            "no proxy socket addresses could be connected",
-            io::Error::new(io::ErrorKind::NotConnected, "no proxy address connected"),
-        )
+        WireError::route_exhausted("no proxy socket addresses could be connected")
     }))
 }
 
@@ -507,11 +500,11 @@ async fn send_connect_request(
     stream
         .write_all(connect_request.as_bytes())
         .await
-        .map_err(|error| WireError::connect("failed to write proxy CONNECT request", error))?;
+        .map_err(|error| WireError::proxy_tunnel("failed to write proxy CONNECT request", error))?;
     stream
         .flush()
         .await
-        .map_err(|error| WireError::connect("failed to flush proxy CONNECT request", error))?;
+        .map_err(|error| WireError::proxy_tunnel("failed to flush proxy CONNECT request", error))?;
 
     let head = read_connect_response(&mut stream, connect_timeout).await?;
     if head.status == StatusCode::OK {
@@ -564,12 +557,11 @@ async fn read_connect_response_inner(
     let mut response = Vec::with_capacity(1024);
     let mut buf = [0u8; 512];
     loop {
-        let read = stream
-            .read(&mut buf)
-            .await
-            .map_err(|error| WireError::connect("failed to read proxy CONNECT response", error))?;
+        let read = stream.read(&mut buf).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read proxy CONNECT response", error)
+        })?;
         if read == 0 {
-            return Err(WireError::connect(
+            return Err(WireError::proxy_tunnel(
                 "proxy closed connection during CONNECT",
                 io::Error::new(io::ErrorKind::UnexpectedEof, "proxy closed connection"),
             ));
@@ -579,7 +571,7 @@ async fn read_connect_response_inner(
             break;
         }
         if response.len() > 8192 {
-            return Err(WireError::connect(
+            return Err(WireError::proxy_tunnel(
                 "proxy CONNECT response headers exceeded 8KiB",
                 io::Error::new(io::ErrorKind::InvalidData, "proxy response too large"),
             ));
@@ -590,8 +582,9 @@ async fn read_connect_response_inner(
 }
 
 fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, WireError> {
-    let head = std::str::from_utf8(response)
-        .map_err(|error| WireError::connect("proxy CONNECT response was not valid UTF-8", error))?;
+    let head = std::str::from_utf8(response).map_err(|error| {
+        WireError::proxy_tunnel("proxy CONNECT response was not valid UTF-8", error)
+    })?;
     let head = head
         .split_once("\r\n\r\n")
         .map(|(head, _)| head)
@@ -600,7 +593,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, W
     let status_line = lines
         .next()
         .ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 "proxy returned an empty CONNECT response",
                 io::Error::new(io::ErrorKind::InvalidData, "empty proxy response"),
             )
@@ -615,19 +608,19 @@ fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, W
         }
 
         let (name, value) = line.split_once(':').ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header line: {line}"),
                 io::Error::new(io::ErrorKind::InvalidData, "malformed proxy header"),
             )
         })?;
         let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header name {name:?}"),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
         let value = HeaderValue::from_str(value.trim()).map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("invalid proxy CONNECT header value for {}", name.as_str()),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
@@ -646,7 +639,7 @@ fn parse_connect_status(status_line: &str) -> Result<StatusCode, WireError> {
     let mut parts = status_line.split_whitespace();
     let protocol = parts.next().unwrap_or_default();
     if protocol != "HTTP/1.1" && protocol != "HTTP/1.0" {
-        return Err(WireError::connect(
+        return Err(WireError::proxy_tunnel(
             format!("proxy CONNECT returned an invalid status line: {status_line}"),
             io::Error::new(io::ErrorKind::InvalidData, "invalid proxy status line"),
         ));
@@ -655,21 +648,21 @@ fn parse_connect_status(status_line: &str) -> Result<StatusCode, WireError> {
     let status = parts
         .next()
         .ok_or_else(|| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("proxy CONNECT returned an invalid status line: {status_line}"),
                 io::Error::new(io::ErrorKind::InvalidData, "missing proxy status code"),
             )
         })?
         .parse::<u16>()
         .map_err(|error| {
-            WireError::connect(
+            WireError::proxy_tunnel(
                 format!("proxy CONNECT returned an invalid status line: {status_line}"),
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
 
     StatusCode::from_u16(status).map_err(|error| {
-        WireError::connect(
+        WireError::proxy_tunnel(
             format!("proxy CONNECT returned an invalid status line: {status_line}"),
             io::Error::new(io::ErrorKind::InvalidData, error),
         )
@@ -699,7 +692,7 @@ fn sanitize_connect_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 fn proxy_connect_status_error(status_line: &str) -> WireError {
-    WireError::connect_non_retryable(format!("proxy CONNECT failed: {status_line}"))
+    WireError::proxy_tunnel_non_retryable(format!("proxy CONNECT failed: {status_line}"))
 }
 
 struct ProxiedConnection {
@@ -1397,7 +1390,7 @@ async fn bind_http1(
     http1::Builder::new()
         .handshake(stream)
         .await
-        .map_err(|error| WireError::protocol("HTTP/1.1 client handshake failed", error))
+        .map_err(|error| WireError::protocol_binding("HTTP/1.1 client handshake failed", error))
 }
 
 async fn bind_http2(
@@ -1419,7 +1412,7 @@ async fn bind_http2(
     builder
         .handshake(stream)
         .await
-        .map_err(|error| WireError::protocol("HTTP/2 client handshake failed", error))
+        .map_err(|error| WireError::protocol_binding("HTTP/2 client handshake failed", error))
 }
 
 fn determine_protocol(address: &Address, connected: &Connected) -> ConnectionProtocol {

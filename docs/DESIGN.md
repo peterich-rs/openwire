@@ -374,19 +374,28 @@ Current `WireErrorKind` surface:
 - `Interceptor`
 - `Internal`
 
-Current retry classification treats these as connection-establishment retry
-reasons when the body is replayable and retry-on-connection-failure is enabled:
+Current internal establishment classification distinguishes:
 
-- `Dns`
-- retryable `Connect`
-- `Tls`
+- DNS resolution failure
+- TCP connect failure and connect timeout
+- TLS establishment failure, including non-retryable TLS policy failures
+- protocol-binding failure
+- proxy-tunnel establishment failure
+- route exhaustion
+
+Current retry classification uses that establishment metadata when the body is
+replayable and retry-on-connection-failure is enabled:
+
+- retryable DNS establishment failures
+- retryable TCP establishment failures
+- retryable TLS establishment failures
+- retryable protocol-binding failures
 - connect timeout
 
-Required refinement for the owned connection core:
+Current fast-fallback continuation also uses the refined establishment metadata:
 
-- distinguish TCP failure, TLS handshake failure, TLS policy failure,
-  protocol-binding failure, and route exhaustion
-- avoid treating permanent TLS policy failures like transient route loss
+- retryable TLS failures may continue remaining route candidates
+- non-retryable TLS policy failures abort the race instead of continuing
 
 ## 15. Observability
 

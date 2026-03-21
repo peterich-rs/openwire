@@ -51,9 +51,8 @@ impl FastFallbackDialer {
         );
 
         if route_plan.is_empty() {
-            return Err(WireError::connect(
+            return Err(WireError::route_exhausted(
                 "route plan produced no direct routes",
-                io::Error::new(io::ErrorKind::NotConnected, "empty route plan"),
             ));
         }
 
@@ -253,6 +252,10 @@ impl FastFallbackDialer {
                                     error_message = %error.message(),
                                     "fast fallback connect attempt lost after tls failure",
                                 );
+                                if !error.is_retryable_establishment() {
+                                    abort_all(&mut handles).await;
+                                    return Err(error);
+                                }
                                 last_error = Some(error);
                             }
                         }
@@ -287,10 +290,7 @@ impl FastFallbackDialer {
 
         abort_all(&mut handles).await;
         Err(last_error.unwrap_or_else(|| {
-            WireError::connect(
-                "no fast-fallback route could be connected",
-                io::Error::new(io::ErrorKind::NotConnected, "all routes failed"),
-            )
+            WireError::route_exhausted("no fast-fallback route could be connected")
         }))
     }
 }
@@ -432,7 +432,7 @@ mod tests {
     use hyper_util::client::legacy::connect::{Connected, Connection};
     use openwire_core::{
         BoxConnection, CallContext, ConnectionInfo, NoopEventListenerFactory,
-        SharedEventListenerFactory, WireError,
+        SharedEventListenerFactory, WireError, WireErrorKind,
     };
 
     use super::FastFallbackDialer;
@@ -518,6 +518,7 @@ mod tests {
     enum TlsScript {
         Pass { delay: Duration },
         Fail { delay: Duration },
+        FailNonRetryable { delay: Duration },
     }
 
     impl ScriptedTlsConnector {
@@ -549,12 +550,19 @@ mod tests {
                         ctx.listener().tls_end(&ctx, &host);
                         Ok(stream)
                     }
-                    TlsScript::Fail { delay } => {
+                    TlsScript::Fail { delay } | TlsScript::FailNonRetryable { delay } => {
                         tokio::time::sleep(delay).await;
-                        let error = WireError::tls(
-                            "scripted tls failure",
-                            io::Error::new(io::ErrorKind::ConnectionAborted, "scripted"),
-                        );
+                        let error = match script {
+                            TlsScript::Fail { .. } => WireError::tls(
+                                "scripted tls failure",
+                                io::Error::new(io::ErrorKind::ConnectionAborted, "scripted"),
+                            ),
+                            TlsScript::FailNonRetryable { .. } => WireError::tls_non_retryable(
+                                "scripted tls policy failure",
+                                io::Error::new(io::ErrorKind::InvalidData, "scripted"),
+                            ),
+                            TlsScript::Pass { .. } => unreachable!("pass handled above"),
+                        };
                         ctx.listener().tls_failed(&ctx, &host, &error);
                         Err(error)
                     }
@@ -731,5 +739,52 @@ mod tests {
             tcp.drops.load(Ordering::Relaxed) >= 2,
             "winner + loser streams should be dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_tls_failure_stops_fast_fallback_continuation() {
+        let addr1 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 21), 443));
+        let addr2 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 22), 443));
+        let tcp = Arc::new(ScriptedTcpConnector::new([
+            (
+                addr1,
+                TcpScript::Success {
+                    delay: Duration::ZERO,
+                },
+            ),
+            (
+                addr2,
+                TcpScript::Success {
+                    delay: Duration::from_millis(2),
+                },
+            ),
+        ]));
+        let tls = Arc::new(ScriptedTlsConnector::new(vec![
+            TlsScript::FailNonRetryable {
+                delay: Duration::from_millis(1),
+            },
+            TlsScript::Pass {
+                delay: Duration::from_millis(1),
+            },
+        ]));
+
+        let error = match FastFallbackDialer
+            .dial_direct(
+                ctx(),
+                "https://example.com/".parse().expect("uri"),
+                route_plan_with_stagger(Duration::from_millis(1), vec![addr1, addr2]),
+                tcp.clone(),
+                Some(tls.clone()),
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("non-retryable tls failure should stop continuation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), WireErrorKind::Tls);
+        assert!(!error.is_retryable_establishment());
+        assert_eq!(tls.calls.load(Ordering::Relaxed), 1);
     }
 }

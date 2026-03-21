@@ -12,9 +12,10 @@ use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODIN
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use openwire::{
-    AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, Exchange, Interceptor,
-    Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody, RustlsTlsConnector, TcpConnector,
-    TlsConnector, TokioTcpConnector, Url, WireError, WireErrorKind,
+    AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, EstablishmentStage,
+    Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody,
+    RustlsTlsConnector, TcpConnector, TlsConnector, TokioTcpConnector, Url, WireError,
+    WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_test::{
@@ -1535,6 +1536,37 @@ async fn custom_root_tls_request_succeeds() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "tls ok");
+}
+
+#[tokio::test]
+async fn tls_policy_failures_are_not_retried() {
+    let server = spawn_https_http1(|_request| async move { ok_text("tls no retry") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .event_listener_factory(events.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://localhost:{}/secure-no-retry",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let error = client.execute(request).await.expect_err("tls should fail");
+    assert_eq!(error.kind(), WireErrorKind::Tls);
+    assert_eq!(error.establishment_stage(), Some(EstablishmentStage::Tls));
+    assert!(!error.is_retryable_establishment());
+
+    let events = events.events();
+    assert!(
+        !events.iter().any(|event| event.starts_with("retry ")),
+        "events = {events:?}",
+    );
 }
 
 #[tokio::test]

@@ -7,7 +7,8 @@ use http::header::{
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
-    BoxFuture, BoxWireService, Exchange, RequestBody, ResponseBody, WireError, WireErrorKind,
+    BoxFuture, BoxWireService, EstablishmentStage, Exchange, RequestBody, ResponseBody, WireError,
+    WireErrorKind,
 };
 use tower::Service;
 use url::Url;
@@ -471,6 +472,28 @@ fn same_authority(left: &Uri, right: &Uri) -> bool {
 }
 
 fn retry_reason(error: &WireError) -> Option<&'static str> {
+    match error.establishment_stage() {
+        Some(EstablishmentStage::Dns) if error.is_retryable_establishment() => return Some("dns"),
+        Some(EstablishmentStage::Tcp) if error.is_connect_timeout() => {
+            return Some("connect_timeout")
+        }
+        Some(EstablishmentStage::Tcp | EstablishmentStage::ProtocolBinding)
+            if error.is_retryable_establishment() =>
+        {
+            return Some("connect");
+        }
+        Some(EstablishmentStage::Tls) if error.is_retryable_establishment() => {
+            return Some("tls");
+        }
+        Some(EstablishmentStage::RouteExhausted | EstablishmentStage::ProxyTunnel)
+            if error.is_retryable_establishment() =>
+        {
+            return Some("connect");
+        }
+        Some(_) => return None,
+        None => {}
+    }
+
     match error.kind() {
         WireErrorKind::Dns => Some("dns"),
         WireErrorKind::Connect if !error.is_non_retryable_connect() => Some("connect"),

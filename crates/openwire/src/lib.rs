@@ -12,10 +12,10 @@ pub use auth::{AuthContext, AuthKind, Authenticator};
 pub use client::{Call, Client, ClientBuilder};
 pub use cookie::{CookieJar, Jar};
 pub use openwire_core::{
-    BoxFuture, CallContext, CallId, ConnectionId, ConnectionInfo, DnsResolver, EventListener,
-    EventListenerFactory, Exchange, Interceptor, Next, NoopEventListener, NoopEventListenerFactory,
-    RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector, TokioRuntime, WireError,
-    WireErrorKind,
+    BoxFuture, CallContext, CallId, ConnectionId, ConnectionInfo, DnsResolver, EstablishmentStage,
+    EventListener, EventListenerFactory, Exchange, Interceptor, Next, NoopEventListener,
+    NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector,
+    TokioRuntime, WireError, WireErrorKind,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

@@ -146,7 +146,7 @@ impl TlsConnector for RustlsTlsConnector {
             let tls_stream = match connector.connect(server_name, TokioIo::new(stream)).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let error = WireError::tls("TLS handshake failed", error);
+                    let error = classify_tls_handshake_error(error);
                     ctx.listener().tls_failed(&ctx, &host, &error);
                     return Err(error);
                 }
@@ -233,6 +233,24 @@ impl hyper::rt::Write for RustlsConnection {
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<Result<usize, std::io::Error>> {
         self.project().inner.poll_write_vectored(cx, bufs)
+    }
+}
+
+fn classify_tls_handshake_error(error: std::io::Error) -> WireError {
+    let non_retryable = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(_) | rustls::Error::PeerIncompatible(_)
+            )
+        });
+
+    if non_retryable {
+        WireError::tls_non_retryable("TLS handshake failed", error)
+    } else {
+        WireError::tls("TLS handshake failed", error)
     }
 }
 
