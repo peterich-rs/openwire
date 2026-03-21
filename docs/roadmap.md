@@ -41,38 +41,73 @@ Priority is defined as:
 
 Features below are accepted into the roadmap.
 
-## P2: RequestBuilder Ergonomics
+## External API Boundary
+
+OpenWire's public API should keep request-message construction separate from
+client execution and transport policy.
+
+### Rules
+
+- `http::Request<RequestBody>` is the public request container
+- request message construction uses the standard `http::Request::builder()` API
+- `Client::execute(request)` and `Client::new_call(request)` are the only send entry points
+- `ClientBuilder` owns execution defaults and transport/policy configuration:
+  - interceptors and event listeners
+  - runtime and connector hooks
+  - DNS / TCP / TLS integration
+  - pooling, retry, redirect, and default timeouts
+- requests own only request-scoped data:
+  - method, URI, version, headers, and body
+  - typed request metadata via `http::Extensions` when callers or interceptors
+    need correlation data
+- do not introduce a parallel OpenWire request builder or client-bound
+  `send()` path unless the standard `http` request model becomes insufficient
+- do not expose request-scoped timeout/auth helper APIs until their semantics are
+  explicitly designed across retries, redirects, and pooled connections
+
+### Canonical User Flow
+
+1. `ClientBuilder -> Client`
+2. `http::Request::builder() -> Request<RequestBody>`
+3. `client.execute(request)` or `client.new_call(request).execute()`
+4. interceptor chain -> transport -> connector stack -> hyper
+
+## P2: Request API Boundary
 
 ### Goal
 
-Add a user-facing builder API so callers do not need to construct `http::Request<RequestBody>` manually for common cases.
+Stabilize the public request API around the standard `http::Request<RequestBody>`
+model before more user-facing features are added.
 
 ### Scope
 
-- `client.get(url)`
-- `client.post(url)`
-- request builder methods for headers, body, timeout, and auth helpers
-- `send().await` returning `Response<ResponseBody>`
+- use `http::Request::builder()` as the primary request-construction path
+- keep `ClientBuilder` as the place for default transport and policy settings
+- document `http::Extensions` as the request-scoped metadata mechanism
+- align README and examples with the standard request/execution flow
 
 ### Out of Scope
 
-- generated API surface for every HTTP verb on day one
+- a custom OpenWire `RequestBuilder`
+- `client.get(...)`, `client.post(...)`, or request-bound `send()`
+- request-scoped timeout/auth helper surface in this phase
 - JSON serialization helpers in the same phase
 
 ### Execution Plan
 
-1. Add a minimal `RequestBuilder` type that compiles down into `http::Request<RequestBody>`.
-2. Land `client.get(url)` and `client.post(url)` as the first public entry points.
-3. Support common body conversions already represented by `RequestBody` (`Bytes`, `Vec<u8>`, `String`, `&'static str`).
-4. Add request-local overrides for timeout and basic auth / bearer auth helpers.
-5. Update `crates/openwire/examples` and the README once the builder is merged.
+1. Remove the custom OpenWire request-builder API from the public surface.
+2. Restore examples and README to the standard `Request::builder()` +
+   `client.execute(request)` flow.
+3. Keep timeout, retry, redirect, connector, and pool configuration documented
+   on `ClientBuilder`.
+4. Preserve request-scoped metadata via standard `http::Extensions`.
 
 ### Acceptance Criteria
 
-- common `GET` / `POST` paths no longer require manual `Request::builder()`
-- builder supports custom headers and request body conversion
-- per-request timeout override works without rebuilding the whole client
-- examples in `crates/openwire/examples` include the new builder style
+- public examples use `Request::builder()` and `client.execute(request)`
+- no public OpenWire request builder remains
+- docs clearly separate client-level configuration from request message data
+- request-scoped metadata guidance uses `http::Extensions`
 
 ## P2: Observability Stabilization
 
@@ -113,7 +148,8 @@ OpenWire already emits `response_body_failed`, exposes connection reuse in `conn
 
 ### Goal
 
-Add higher-level HTTP client behavior only after RequestBuilder and observability stabilization are done.
+Add higher-level HTTP client behavior only after the request API boundary and
+observability stabilization are done.
 
 ### CookieJar
 
@@ -138,7 +174,7 @@ Add higher-level HTTP client behavior only after RequestBuilder and observabilit
 
 Do not begin this phase until:
 
-- RequestBuilder is merged
+- request API boundary is considered stable
 - observability fields are considered stable enough for downstream tooling
 
 ## Deferred For Now
@@ -172,7 +208,7 @@ Definition of done for a roadmap item:
 
 ## Suggested Execution Order
 
-1. RequestBuilder
+1. Request API boundary
 2. Observability stabilization
 3. CookieJar
 4. Authenticator

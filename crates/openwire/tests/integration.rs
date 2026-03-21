@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream;
-use http::header::{AUTHORIZATION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, USER_AGENT};
+use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING, USER_AGENT};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use openwire::{
@@ -43,88 +43,7 @@ async fn basic_get_returns_body() {
 }
 
 #[tokio::test]
-async fn request_builder_get_returns_body() {
-    let server = spawn_http1(|_request| async move { ok_text("builder hello") }).await;
-    let client = Client::builder().build().expect("client");
-
-    let response = client
-        .get(server.http_url("/hello"))
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().text().await.expect("body");
-    assert_eq!(body, "builder hello");
-}
-
-#[tokio::test]
-async fn request_builder_supports_headers_and_common_body_conversions() {
-    let server = spawn_http1(|request: Request<Incoming>| async move {
-        let body_kind = request
-            .headers()
-            .get("x-body-kind")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("missing")
-            .to_owned();
-        let body = collect_request_body(request).await;
-        let body = String::from_utf8(body.to_vec()).expect("request body should be utf-8");
-        ok_text(format!("{body_kind}:{body}"))
-    })
-    .await;
-
-    let client = Client::builder().build().expect("client");
-
-    let response = client
-        .post(server.http_url("/bytes"))
-        .header("x-body-kind", "bytes")
-        .body(Bytes::from_static(b"bytes body"))
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "bytes:bytes body"
-    );
-
-    let response = client
-        .post(server.http_url("/vec"))
-        .header("x-body-kind", "vec")
-        .body(Vec::from("vec body"))
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "vec:vec body"
-    );
-
-    let response = client
-        .post(server.http_url("/string"))
-        .header("x-body-kind", "string")
-        .body(String::from("string body"))
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "string:string body"
-    );
-
-    let response = client
-        .post(server.http_url("/str"))
-        .header("x-body-kind", "str")
-        .body("str body")
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "str:str body"
-    );
-}
-
-#[tokio::test]
-async fn request_builder_timeout_overrides_client_timeout() {
+async fn client_call_timeout_applies_to_requests() {
     let server = spawn_http1(|_request| async move {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         ok_text("slow ok")
@@ -137,57 +56,10 @@ async fn request_builder_timeout_overrides_client_timeout() {
         .expect("client");
 
     let error = client
-        .get(server.http_url("/slow-default"))
-        .send()
+        .execute(empty_request(server.http_url("/slow")))
         .await
         .expect_err("default timeout should fail");
     assert_eq!(error.kind(), WireErrorKind::Timeout);
-
-    let response = client
-        .get(server.http_url("/slow-override"))
-        .timeout(std::time::Duration::from_millis(200))
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(response.into_body().text().await.expect("body"), "slow ok");
-}
-
-#[tokio::test]
-async fn request_builder_auth_helpers_set_authorization_header() {
-    let server = spawn_http1(|request: Request<Incoming>| async move {
-        let auth = request
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("none")
-            .to_owned();
-        ok_text(auth)
-    })
-    .await;
-
-    let client = Client::builder().build().expect("client");
-
-    let response = client
-        .get(server.http_url("/basic"))
-        .basic_auth("aladdin", "open sesame")
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-    );
-
-    let response = client
-        .get(server.http_url("/bearer"))
-        .bearer_auth("secret-token")
-        .send()
-        .await
-        .expect("response");
-    assert_eq!(
-        response.into_body().text().await.expect("body"),
-        "Bearer secret-token"
-    );
 }
 
 #[tokio::test]
@@ -323,15 +195,13 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
     let client = Client::builder().build().expect("client");
 
     let response = client
-        .get(server.http_url("/first"))
-        .send()
+        .execute(empty_request(server.http_url("/first")))
         .await
         .expect("response");
     let _ = response.into_body().text().await.expect("body");
 
     let response = client
-        .get(server.http_url("/second"))
-        .send()
+        .execute(empty_request(server.http_url("/second")))
         .await
         .expect("response");
     let _ = response.into_body().text().await.expect("body");
@@ -429,8 +299,7 @@ async fn success_events_follow_stable_order() {
         .expect("client");
 
     let response = client
-        .get(server.http_url("/ordered"))
-        .send()
+        .execute(empty_request(server.http_url("/ordered")))
         .await
         .expect("response");
     let _ = response.into_body().text().await.expect("body");
@@ -472,11 +341,10 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
         .expect("client");
 
     let response = client
-        .get(format!(
+        .execute(empty_request(format!(
             "http://openwire.test:{}/broken",
             server.addr().port()
-        ))
-        .send()
+        )))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
@@ -750,11 +618,10 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
         .expect("client");
 
     let response = client
-        .get(format!(
+        .execute(empty_request(format!(
             "http://openwire.test:{}/redirect-after-retry",
             server.addr().port()
-        ))
-        .send()
+        )))
         .await
         .expect("response");
     let _ = response.into_body().text().await.expect("body");
@@ -1105,6 +972,13 @@ fn header_value(headers: &http::HeaderMap, name: http::header::HeaderName) -> Op
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {
+    Request::builder()
+        .uri(uri.as_ref())
+        .body(RequestBody::empty())
+        .expect("request")
 }
 
 fn default_user_agent() -> &'static str {

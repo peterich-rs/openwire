@@ -14,7 +14,6 @@ tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 
 [dependencies]
-base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true

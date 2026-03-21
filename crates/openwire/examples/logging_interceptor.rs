@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use openwire::{BoxFuture, Client, Exchange, Interceptor, Next, ResponseBody, WireError};
+use http::Request;
+use openwire::{
+    BoxFuture, Client, Exchange, Interceptor, Next, RequestBody, ResponseBody, WireError,
+};
 
 #[derive(Clone)]
 struct LoggingInterceptor {
@@ -40,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build()?;
 
-    let _ = client.get("http://example.com/").send().await?;
+    let request = Request::builder()
+        .uri("http://example.com/")
+        .body(RequestBody::empty())?;
+    let _ = client.execute(request).await?;
     for line in logs.lock().expect("log lock").iter() {
         println!("{line}");
     }

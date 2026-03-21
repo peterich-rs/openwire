@@ -1,4 +1,5 @@
-use openwire::Client;
+use http::Request;
+use openwire::{Client, RequestBody};
 use openwire_test::RecordingEventListenerFactory;
 use tracing_subscriber::EnvFilter;
 
@@ -13,7 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .event_listener_factory(events.clone())
         .build()?;
 
-    let response = client.get("http://example.com/").send().await?;
+    let request = Request::builder()
+        .uri("http://example.com/")
+        .body(RequestBody::empty())?;
+    let response = client.execute(request).await?;
     println!("status = {}", response.status());
     for event in events.events() {
         println!("{event}");

@@ -1,6 +1,5 @@
 mod bridge;
 mod client;
-mod request_builder;
 mod transport;
 
 pub use client::{Call, Client, ClientBuilder};
@@ -11,5 +10,4 @@ pub use openwire_core::{
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};
-pub use request_builder::RequestBuilder;
 pub use transport::{SystemDnsResolver, TokioRuntime, TokioTcpConnector};
