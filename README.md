@@ -87,3 +87,8 @@ required CI gate.
 The repository also provides a separate GitHub Actions workflow at
 `.github/workflows/live-network.yml` for manual dispatches and weekly scheduled
 runs without affecting the required CI path.
+
+Deferred public-origin follow-ons are intentionally kept out of this baseline
+when they require external credentials, temporary remote resources, untrusted
+public proxies, or timing-sensitive assertions that public networks cannot make
+credible.

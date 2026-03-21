@@ -99,11 +99,16 @@ This tracker implements `DESIGN.md` section `12. Real-Network Validation Archite
 
 ## Explicit Deferrals For This Execution Slice
 
+These items remain deferred after the 2026-03-21 feasibility review because
+they are blocked either by external credentials, stateful third-party setup, or
+public-network safety / stability constraints that are outside the current live
+suite contract.
+
 | ID | Status | Theme | Notes |
 |---|---|---|---|
-| LNV-D01 | `DEFERRED` | GitHub REST API live validation | Requires rate-limit management and optional credentials; outside zero-config phase 1 |
-| LNV-D02 | `DEFERRED` | Webhook.site validation | Requires a temporary URL and is not zero-config |
-| LNV-D03 | `DEFERRED` | ReqRes validation | Requires `x-api-key`; not part of the zero-config first slice |
-| LNV-D04 | `DEFERRED` | Public proxy / tunnel live validation | Proxy and tunnel semantics remain covered by deterministic local fixtures |
-| LNV-D05 | `DEFERRED` | Public fast-fallback timing validation | Public networks are not suitable for strict race-timing assertions |
-| LNV-D06 | `DEFERRED` | TLS-version-policy live validation | `badssl` `tls-v1-*` outcomes vary with platform verifier and OS policy defaults, so the check is deferred beyond the zero-config first slice |
+| LNV-D01 | `DEFERRED` | GitHub REST API live validation | Public read-only repo metadata is available without a token, but broader API coverage still needs explicit rate-limit budgeting and any authenticated or mutating paths need external credentials |
+| LNV-D02 | `DEFERRED` | Webhook.site validation | Zero-config temporary tokens can be created on demand, but the flow adds stateful request-log polling and temporary remote resources beyond the baseline smoke-suite contract |
+| LNV-D03 | `DEFERRED` | ReqRes validation | ReqRes currently requires `x-api-key` from `app.reqres.in`; anonymous requests may fail with `missing_api_key` or Cloudflare challenge responses |
+| LNV-D04 | `DEFERRED` | Public proxy / tunnel live validation | Proxy and tunnel semantics remain covered by deterministic local fixtures until a trusted external proxy contract exists; arbitrary public proxies are not an acceptable default |
+| LNV-D05 | `DEFERRED` | Public fast-fallback timing validation | Public networks are not suitable for strict or even loosely budgeted race-timing assertions that would claim fast-fallback correctness |
+| LNV-D06 | `DEFERRED` | TLS-version-policy live validation | `badssl` `tls-v1-*` endpoints exist, but expected outcomes vary with the active TLS backend, verifier, and platform policy defaults rather than only OpenWire behavior |

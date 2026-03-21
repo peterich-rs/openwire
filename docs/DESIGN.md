@@ -596,6 +596,31 @@ Live-suite maintenance rules:
 - keep the live suite opt-in and serial unless there is strong evidence that a
   parallel contract remains stable across providers
 
+Deferred follow-on themes after the first live-validation slice:
+
+- GitHub REST API: unauthenticated public metadata reads such as
+  `GET https://api.github.com/repos/peterich-rs/openwire` work within the
+  public rate limit, but broader validation should stay explicitly
+  rate-limit-aware and any authenticated or mutating paths require external
+  credentials
+- Webhook.site: zero-config temporary URLs can be created with
+  `POST https://webhook.site/token`, then inspected through
+  `/token/{uuid}/requests`, but this adds stateful multi-call orchestration and
+  public request-log polling beyond the current baseline smoke suite
+- ReqRes: the live API currently requires `x-api-key` from `app.reqres.in`, and
+  anonymous requests may return either `missing_api_key` responses or Cloudflare
+  challenge pages depending on edge behavior
+- Public proxy / tunnel validation: using arbitrary public proxies is not an
+  acceptable default because trust, retention, and availability are outside the
+  repository's control; proxy semantics remain covered by deterministic local
+  fixtures unless a trusted external proxy contract is introduced explicitly
+- Public fast-fallback timing: the repository should not claim correctness from
+  timing-sensitive assertions on public networks because resolver order, route
+  health, and cross-region latency are too unstable
+- TLS-version-policy checks: `badssl` still exposes `tls-v1-0`, `tls-v1-1`, and
+  `tls-v1-2` endpoints, but pass / fail expectations depend on the active TLS
+  backend, verifier, and platform policy rather than only on OpenWire logic
+
 ## 13. Current Non-Goals
 
 These are intentionally outside the current baseline:
