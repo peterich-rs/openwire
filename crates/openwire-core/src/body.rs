@@ -7,6 +7,10 @@ use futures_util::TryStreamExt;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use pin_project_lite::pin_project;
+#[cfg(feature = "json")]
+use serde::de::DeserializeOwned;
+#[cfg(feature = "json")]
+use serde::Serialize;
 
 use crate::WireError;
 
@@ -39,6 +43,17 @@ impl RequestBody {
 
     pub fn from_static(bytes: &'static [u8]) -> Self {
         Self::from_bytes(Bytes::from_static(bytes))
+    }
+
+    #[cfg(feature = "json")]
+    pub fn from_json<T>(value: &T) -> Result<Self, WireError>
+    where
+        T: Serialize,
+    {
+        serde_json::to_vec(value)
+            .map(Bytes::from)
+            .map(Self::from_bytes)
+            .map_err(|error| WireError::body("failed to serialize request body as JSON", error))
     }
 
     pub fn from_stream<S, E>(stream: S) -> Self
@@ -202,6 +217,16 @@ impl ResponseBody {
         String::from_utf8(bytes.to_vec())
             .map_err(|error| WireError::body("response body is not valid UTF-8", error))
     }
+
+    #[cfg(feature = "json")]
+    pub async fn json<T>(self) -> Result<T, WireError>
+    where
+        T: DeserializeOwned,
+    {
+        let bytes = self.bytes().await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| WireError::body("response body is not valid JSON", error))
+    }
 }
 
 impl Default for ResponseBody {
@@ -233,5 +258,43 @@ impl Body for ResponseBody {
 impl From<Bytes> for ResponseBody {
     fn from(value: Bytes) -> Self {
         Self::from_bytes(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "json")]
+    use bytes::Bytes;
+    #[cfg(feature = "json")]
+    use http_body_util::BodyExt;
+
+    #[cfg(feature = "json")]
+    use super::{RequestBody, ResponseBody};
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn request_body_serializes_json_replayably() {
+        let body =
+            RequestBody::from_json(&serde_json::json!({ "hello": "openwire" })).expect("json body");
+        let cloned = body.try_clone().expect("replayable clone");
+        assert_eq!(
+            body.collect().await.expect("body").to_bytes(),
+            Bytes::from_static(br#"{"hello":"openwire"}"#)
+        );
+        assert_eq!(
+            cloned.collect().await.expect("clone body").to_bytes(),
+            Bytes::from_static(br#"{"hello":"openwire"}"#)
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn response_body_deserializes_json() {
+        let value: serde_json::Value =
+            ResponseBody::from_bytes(Bytes::from_static(br#"{"ok":true}"#))
+                .json()
+                .await
+                .expect("json");
+        assert_eq!(value["ok"], true);
     }
 }

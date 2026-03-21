@@ -56,7 +56,7 @@ This phase defines exactly what OpenWire will reclaim from
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
 | P1-001 | `DONE` | Freeze the target execution chain and ownership split in `DESIGN.md` | P0-006 | `DESIGN.md` includes current chain, target chain, object model, threading/performance/error sections |
-| P1-002 | `DONE` | Freeze the initial connection-core scope: exact-address reuse only, no broad coalescing, no HTTP/3 | P1-001 | Scope decision recorded in `DESIGN.md` and reflected in this file |
+| P1-002 | `DONE` | Freeze the initial connection-core scope: exact-address reuse only, no broad coalescing | P1-001 | Scope decision recorded in `DESIGN.md` and reflected in this file |
 | P1-003 | `DONE` | Freeze the initial fast-fallback semantics: route-based, dual-stack + single-stack multi-IP, 250ms stagger | P1-001 | Trigger conditions, ordering rules, and winner/loser behavior explicitly documented |
 | P1-004 | `DONE` | Freeze the protocol-binding ownership boundary: `hyper` for HTTP codecs, OpenWire for acquisition/pool/orchestration | P1-001 | No remaining ambiguity in `DESIGN.md` on `hyper` vs OpenWire responsibilities |
 | P1-005 | `DONE` | Freeze the migration boundary for `hyper-util`: legacy client removed from runtime path, minimal adapter surface retained or replaced | P1-004 | Decision recorded before implementation of Stage 3 begins |
@@ -222,21 +222,14 @@ These items remain intentionally outside the near-term execution path.
 |---|---|---|---|---|
 | P14-001 | `DONE` | Broad connection coalescing beyond exact-address reuse | P9-002 | Conservative direct-route HTTPS HTTP/2 coalescing now reuses connections across verified authorities when certificate SANs authorize the target host and the resolved route plan overlaps the connected remote address; `cargo test -p openwire coalesc`; `cargo test -p openwire --tests`; `cargo test --workspace --tests --no-run`; `cargo bench -p openwire --bench perf_baseline --no-run` |
 | P14-002 | `DONE` | HTTP cache crate (`openwire-cache`) on top of the owned connection core | P13-001 | `openwire-cache` now provides an application-layer cache interceptor plus in-memory store for fresh `GET 200` responses with explicit `Cache-Control: max-age`; `cargo test -p openwire-cache -- --nocapture` |
-| P14-003 | `DEFERRED` | SOCKS support beyond route planning groundwork | P10-005 | Resume after proxy route ownership is stable |
-| P14-004 | `DEFERRED` | HTTP/3 | None | No work before connection core stabilization |
-| P14-005 | `DEFERRED` | Serde / JSON convenience helpers | None | No work before connection core stabilization |
+| P14-003 | `DONE` | SOCKS support beyond route planning groundwork | P10-005 | SOCKS5 no-auth proxy routes now execute for HTTP and HTTPS through the owned route planner and transport path; `cargo test -p openwire socks -- --nocapture`; `cargo test -p openwire --tests -- --nocapture` |
+| P14-005 | `DONE` | Serde / JSON convenience helpers | None | Optional `json` feature now enables `RequestBody::from_json(...)` and `ResponseBody::json(...)`; `cargo test -p openwire-core --features json -- --nocapture`; `cargo test -p openwire --features json --tests --no-run` |
 
 ## Immediate Next Slice
 
-If execution starts now, the next contiguous slice should be:
-
-1. `P14-003`
-2. `P14-004`
-3. `P14-005`
+If execution starts now, there is no remaining tracked contiguous slice in this file.
 
 Rationale:
 
-- the first two deferred follow-ups are now landed: conservative HTTPS HTTP/2
-  coalescing and a dedicated cache crate
-- SOCKS, HTTP/3, and convenience helpers are now the only unfinished roadmap
-  items
+- every currently tracked item in this file is now landed on the current branch
+- no additional roadmap items remain tracked in this execution file

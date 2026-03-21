@@ -237,7 +237,6 @@ First-milestone rules:
   candidates overlap the connected remote address
 - conservative HTTP/2 multiplex accounting
 - no speculative preconnect
-- no HTTP/3 and no HTTP/3-shaped connection-core abstractions
 
 ## 9. Fast Fallback Semantics
 
@@ -307,7 +306,8 @@ Important baseline details to preserve during migration:
 - `RoutePlanner` now owns direct-vs-proxy route selection and proxy endpoint
   DNS target choice; `ConnectorStack` executes the resulting route plan
 - direct-route cold connects now run through `FastFallbackDialer`; proxy routes
-  still dial sequentially
+  still dial sequentially, including HTTP forward proxy, CONNECT tunnel, and
+  SOCKS5 tunnel routes
 - protocol binding now happens in `TransportService` via
   `hyper::client::conn::http1` / `http2`
 - HTTP/1.1 idle timeout and max-idle-per-address limits now enforce
@@ -455,9 +455,7 @@ Coverage themes to preserve or add:
 
 Not in scope until the owned connection core is stable:
 
-- HTTP/3
 - WebSocket support
-- Serde / JSON convenience helpers
 - multipart helpers
 - response decompression policy
 - speculative connection warming
@@ -467,8 +465,6 @@ Not in scope until the owned connection core is stable:
 
 ## 18. Open Questions
 
-- SOCKS support timing and placement
 - proxy route fast-fallback policy
-- cache integration timing after connection-core ownership lands
 - alternate DNS/TLS adapter timing
 - mobile-specific connection-core test requirements

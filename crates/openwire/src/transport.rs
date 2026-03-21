@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -265,9 +265,7 @@ async fn connect_route_plan(
             return connect_via_http_proxy(ctx, uri, route_plan, deps).await;
         }
         RouteKind::SocksProxy { .. } => {
-            return Err(WireError::invalid_request(
-                "SOCKS proxy routes are planned but not yet executable",
-            ));
+            return connect_via_socks_proxy(ctx, uri, route_plan, deps).await;
         }
     }
 }
@@ -400,6 +398,71 @@ async fn connect_via_http_proxy(
     }))
 }
 
+async fn connect_via_socks_proxy(
+    ctx: CallContext,
+    target_uri: Uri,
+    route_plan: RoutePlan,
+    deps: ProxyConnectDeps,
+) -> Result<BoxConnection, WireError> {
+    let mut last_error = None;
+
+    for route in route_plan.iter().cloned() {
+        let &RouteKind::SocksProxy { proxy: addr } = route.kind() else {
+            continue;
+        };
+        match deps
+            .tcp_connector
+            .connect(ctx.clone(), addr, deps.connect_timeout)
+            .await
+        {
+            Ok(stream) => {
+                let tunneled = match establish_socks5_tunnel(
+                    ctx.clone(),
+                    &target_uri,
+                    addr,
+                    stream,
+                    deps.connect_timeout,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        ctx.listener().connect_failed(&ctx, addr, &error);
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+
+                let proxied = Box::new(ProxiedConnection { inner: tunneled }) as BoxConnection;
+                if target_uri
+                    .scheme_str()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                {
+                    let tls_connector = deps.tls_connector.clone().ok_or_else(|| {
+                        WireError::tls(
+                            "HTTPS requested but no TLS connector is configured",
+                            io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
+                        )
+                    })?;
+                    return tls_connector
+                        .connect(ctx.clone(), target_uri, proxied)
+                        .await;
+                }
+
+                return Ok(proxied);
+            }
+            Err(error) => {
+                ctx.listener().connect_failed(&ctx, addr, &error);
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        WireError::route_exhausted("no proxy socket addresses could be connected")
+    }))
+}
+
 async fn establish_connect_tunnel(
     params: ConnectTunnelParams<'_>,
 ) -> Result<BoxConnection, WireError> {
@@ -474,6 +537,39 @@ async fn establish_connect_tunnel(
             }
         }
     }
+}
+
+async fn establish_socks5_tunnel(
+    ctx: CallContext,
+    target_uri: &Uri,
+    proxy_addr: SocketAddr,
+    stream: BoxConnection,
+    timeout: Option<Duration>,
+) -> Result<BoxConnection, WireError> {
+    let host = target_uri
+        .host()
+        .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?;
+    let port = target_uri.port_u16().unwrap_or_else(|| {
+        if target_uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    let mut stream = TokioIo::new(stream);
+
+    socks5_write_client_greeting(&mut stream, timeout).await?;
+    socks5_read_server_choice(&mut stream, timeout).await?;
+    socks5_write_connect_request(&mut stream, host, port, timeout).await?;
+    socks5_read_connect_response(&mut stream, timeout).await?;
+    tracing::debug!(
+        call_id = ctx.call_id().as_u64(),
+        proxy_addr = %proxy_addr,
+        target_host = host,
+        target_port = port,
+        "established SOCKS5 tunnel"
+    );
+    Ok(stream.into_inner())
 }
 
 enum ConnectTunnelOutcome {
@@ -579,6 +675,187 @@ async fn read_connect_response_inner(
     }
 
     parse_connect_response_head(&response)
+}
+
+async fn socks5_write_client_greeting(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    socks5_timeout(timeout, async {
+        stream
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .map_err(|error| WireError::proxy_tunnel("failed to write SOCKS5 greeting", error))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| WireError::proxy_tunnel("failed to flush SOCKS5 greeting", error))
+    })
+    .await
+}
+
+async fn socks5_read_server_choice(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut response = [0u8; 2];
+    socks5_timeout(timeout, async {
+        stream.read_exact(&mut response).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read SOCKS5 greeting response", error)
+        })
+    })
+    .await?;
+
+    if response[0] != 0x05 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 proxy returned unsupported version {}",
+            response[0]
+        )));
+    }
+    if response[1] != 0x00 {
+        return Err(WireError::proxy_tunnel_non_retryable(
+            "SOCKS5 proxy does not support no-auth authentication",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn socks5_write_connect_request(
+    stream: &mut TokioIo<BoxConnection>,
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut request = vec![0x05, 0x01, 0x00];
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
+        }
+        Ok(IpAddr::V6(ip)) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            if host.len() > u8::MAX as usize {
+                return Err(WireError::invalid_request(
+                    "SOCKS5 target host exceeds 255 bytes",
+                ));
+            }
+            request.push(0x03);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+
+    socks5_timeout(timeout, async {
+        stream.write_all(&request).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to write SOCKS5 connect request", error)
+        })?;
+        stream.flush().await.map_err(|error| {
+            WireError::proxy_tunnel("failed to flush SOCKS5 connect request", error)
+        })
+    })
+    .await
+}
+
+async fn socks5_read_connect_response(
+    stream: &mut TokioIo<BoxConnection>,
+    timeout: Option<Duration>,
+) -> Result<(), WireError> {
+    let mut head = [0u8; 4];
+    socks5_timeout(timeout, async {
+        stream.read_exact(&mut head).await.map_err(|error| {
+            WireError::proxy_tunnel("failed to read SOCKS5 connect response", error)
+        })
+    })
+    .await?;
+
+    if head[0] != 0x05 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 proxy returned unsupported version {}",
+            head[0]
+        )));
+    }
+    if head[1] != 0x00 {
+        return Err(WireError::proxy_tunnel_non_retryable(format!(
+            "SOCKS5 connect failed: {}",
+            socks5_reply_reason(head[1])
+        )));
+    }
+
+    match head[3] {
+        0x01 => {
+            let mut remainder = [0u8; 6];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 IPv4 bind address", error)
+                })
+            })
+            .await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut len).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 bind host length", error)
+                })
+            })
+            .await?;
+            let mut remainder = vec![0u8; len[0] as usize + 2];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 bind host", error)
+                })
+            })
+            .await?;
+        }
+        0x04 => {
+            let mut remainder = [0u8; 18];
+            socks5_timeout(timeout, async {
+                stream.read_exact(&mut remainder).await.map_err(|error| {
+                    WireError::proxy_tunnel("failed to read SOCKS5 IPv6 bind address", error)
+                })
+            })
+            .await?;
+        }
+        atyp => {
+            return Err(WireError::proxy_tunnel_non_retryable(format!(
+                "SOCKS5 proxy returned unknown address type {atyp}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn socks5_timeout<T>(
+    timeout: Option<Duration>,
+    future: impl std::future::Future<Output = Result<T, WireError>>,
+) -> Result<T, WireError> {
+    if let Some(timeout) = timeout {
+        return tokio::time::timeout(timeout, future).await.map_err(|_| {
+            WireError::connect_timeout(format!("SOCKS5 handshake timed out after {timeout:?}"))
+        })?;
+    }
+
+    future.await
+}
+
+fn socks5_reply_reason(code: u8) -> &'static str {
+    match code {
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "unknown failure",
+    }
 }
 
 fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, WireError> {

@@ -410,6 +410,85 @@ async fn http_requests_can_route_through_http_proxy_without_origin_dns() {
 }
 
 #[tokio::test]
+async fn http_requests_can_route_through_socks5_proxy_without_origin_dns() {
+    let server = spawn_http1(|_request| async move { ok_text("proxied socks http") }).await;
+    let proxy = spawn_socks5_proxy().await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://localhost:{}/socks-http",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied socks http");
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .any(|request| request == &format!("localhost:{}", server.addr().port())),
+        "requests = {:?}",
+        proxy.requests(),
+    );
+}
+
+#[tokio::test]
+async fn https_requests_can_tunnel_through_socks5_proxy_without_origin_dns() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxied socks https") }).await;
+    let proxy = spawn_socks5_proxy().await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://localhost:{}/socks-https",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied socks https");
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .any(|request| request == &format!("localhost:{}", server.addr().port())),
+        "requests = {:?}",
+        proxy.requests(),
+    );
+}
+
+#[tokio::test]
 async fn no_proxy_exact_host_bypasses_proxy() {
     let server = spawn_http1(|_request| async move { ok_text("direct exact") }).await;
     let proxy = spawn_plain_http_proxy_response("proxied http ok").await;
@@ -2950,6 +3029,30 @@ impl Drop for PlainHttpProxyServer {
     }
 }
 
+struct Socks5ProxyServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl Socks5ProxyServer {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("proxy requests").clone()
+    }
+}
+
+impl Drop for Socks5ProxyServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -3168,6 +3271,131 @@ async fn spawn_plain_http_proxy_response(body: &'static str) -> PlainHttpProxySe
     });
 
     PlainHttpProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_socks5_proxy() -> Socks5ProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind socks proxy listener");
+    let addr = listener.local_addr().expect("socks proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut greeting = [0u8; 2];
+                        if client.read_exact(&mut greeting).await.is_err() {
+                            return;
+                        }
+                        if greeting[0] != 0x05 {
+                            return;
+                        }
+                        let mut methods = vec![0u8; greeting[1] as usize];
+                        if client.read_exact(&mut methods).await.is_err() {
+                            return;
+                        }
+                        if !methods.contains(&0x00) {
+                            let _ = client.write_all(&[0x05, 0xff]).await;
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+                        if client.write_all(&[0x05, 0x00]).await.is_err() {
+                            return;
+                        }
+
+                        let mut head = [0u8; 4];
+                        if client.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        if head[0] != 0x05 || head[1] != 0x01 {
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+
+                        let host = match head[3] {
+                            0x01 => {
+                                let mut addr = [0u8; 4];
+                                if client.read_exact(&mut addr).await.is_err() {
+                                    return;
+                                }
+                                std::net::Ipv4Addr::from(addr).to_string()
+                            }
+                            0x03 => {
+                                let mut len = [0u8; 1];
+                                if client.read_exact(&mut len).await.is_err() {
+                                    return;
+                                }
+                                let mut host = vec![0u8; len[0] as usize];
+                                if client.read_exact(&mut host).await.is_err() {
+                                    return;
+                                }
+                                match String::from_utf8(host) {
+                                    Ok(host) => host,
+                                    Err(_) => return,
+                                }
+                            }
+                            0x04 => {
+                                let mut addr = [0u8; 16];
+                                if client.read_exact(&mut addr).await.is_err() {
+                                    return;
+                                }
+                                std::net::Ipv6Addr::from(addr).to_string()
+                            }
+                            _ => {
+                                let _ = client.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                let _ = client.shutdown().await;
+                                return;
+                            }
+                        };
+
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        let port = u16::from_be_bytes(port);
+                        requests
+                            .lock()
+                            .expect("proxy requests")
+                            .push(format!("{host}:{port}"));
+
+                        let mut upstream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                            Ok(upstream) => upstream,
+                            Err(_) => {
+                                let _ = client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                let _ = client.shutdown().await;
+                                return;
+                            }
+                        };
+
+                        if client
+                            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    });
+                }
+            }
+        }
+    });
+
+    Socks5ProxyServer {
         addr,
         requests,
         shutdown: Some(shutdown_tx),

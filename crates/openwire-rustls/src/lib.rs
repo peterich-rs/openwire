@@ -189,9 +189,20 @@ pin_project! {
 
 impl Connection for RustlsConnection {
     fn connected(&self) -> Connected {
-        let connected = Connected::new()
+        let mut connected = Connected::new()
             .extra(self.info.clone())
             .extra(self.coalescing.clone());
+        if self
+            .inner
+            .inner()
+            .get_ref()
+            .0
+            .inner()
+            .connected()
+            .is_proxied()
+        {
+            connected = connected.proxy(true);
+        }
         if self.negotiated_h2 {
             connected.negotiated_h2()
         } else {

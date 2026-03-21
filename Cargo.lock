@@ -1057,6 +1057,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tower",

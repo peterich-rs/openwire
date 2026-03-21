@@ -217,8 +217,17 @@ impl Address {
 
 impl ProxyConfig {
     fn from_runtime_proxy(scheme: UriScheme, proxy: &Proxy) -> Result<Self, WireError> {
+        let endpoint_scheme = match proxy.target().scheme() {
+            "http" => ProxyScheme::Http,
+            "socks5" => ProxyScheme::Socks5,
+            unsupported => {
+                return Err(WireError::invalid_request(format!(
+                    "unsupported proxy URL scheme: {unsupported}"
+                )));
+            }
+        };
         let endpoint = ProxyEndpoint::new(
-            ProxyScheme::Http,
+            endpoint_scheme,
             proxy
                 .target()
                 .host_str()
@@ -228,9 +237,15 @@ impl ProxyConfig {
             })?,
         );
 
-        let mode = match scheme {
-            UriScheme::Http if proxy.intercepts_http() => ProxyMode::Forward,
-            UriScheme::Https if proxy.intercepts_https() => ProxyMode::Connect,
+        let mode = match (endpoint_scheme, scheme) {
+            (ProxyScheme::Http, UriScheme::Http) if proxy.intercepts_http() => ProxyMode::Forward,
+            (ProxyScheme::Http, UriScheme::Https) if proxy.intercepts_https() => ProxyMode::Connect,
+            (ProxyScheme::Socks5, UriScheme::Http) if proxy.intercepts_http() => {
+                ProxyMode::SocksTunnel
+            }
+            (ProxyScheme::Socks5, UriScheme::Https) if proxy.intercepts_https() => {
+                ProxyMode::SocksTunnel
+            }
             _ => {
                 return Err(WireError::invalid_request(
                     "proxy does not apply to the request scheme",

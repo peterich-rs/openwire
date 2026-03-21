@@ -12,6 +12,7 @@ default = ["runtime-tokio", "tls-rustls", "platform-verifier"]
 runtime-tokio = []
 tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
+json = ["openwire-core/json"]
 
 [dependencies]
 bytes.workspace = true

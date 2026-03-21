@@ -49,12 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - minimal safe retries for replayable requests on connection-establishment failures
 - configurable `CookieJar` support with a default in-memory `Jar`
 - configurable `Authenticator` support for origin `401` follow-ups on replayable requests
-- HTTP proxy forwarding and HTTPS-over-HTTP proxy tunneling via `Proxy::http(...)`, `Proxy::https(...)`, and `Proxy::all(...)`
+- HTTP proxy forwarding, HTTPS-over-HTTP proxy tunneling, and SOCKS5 tunneling via `Proxy::http(...)`, `Proxy::https(...)`, `Proxy::all(...)`, and `Proxy::socks5(...)`
 - `proxy_authenticator(...)` support for both response-path `407` handling and HTTPS `CONNECT` tunnel authentication
 - `NoProxy` exclusions for exact hosts, domain suffixes, and loopback/localhost addresses
 - opt-in system proxy loading via `use_system_proxy(true)` from common `*_proxy` / `NO_PROXY` environment variables
 - environment `NO_PROXY` parsing for wildcard `*`, host/domain exclusions, and IP CIDR ranges
 - custom DNS resolver / TCP connector / TLS connector hooks
+- optional `json` feature with `RequestBody::from_json(...)` and `ResponseBody::json(...)`
 - redirect handling with basic authority-sensitive header stripping
 - call timeout and connect timeout, including proxy CONNECT handshake reads
 - typed request metadata via standard `http::Extensions`
