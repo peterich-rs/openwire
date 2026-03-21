@@ -569,10 +569,24 @@ Current live-network coverage on this branch includes:
 - `httpbingo` redirect-following and no-redirect client behavior
 - `httpbingo` cookie-jar roundtrip, delay-timeout, streaming, ETag, and basic-auth smoke checks
 - `badssl` expired, wrong-hostname, and self-signed certificate failures classified as TLS errors
+- `postman-echo` GET / POST interoperability smoke checks
+- `jsonplaceholder` GET / POST JSON REST smoke checks
 
 TLS-version-policy live checks against `tls-v1-*` `badssl` endpoints remain
 deferred to a later slice because zero-config outcomes vary with the active
 platform verifier and OS certificate / policy defaults.
+
+Live-suite maintenance rules:
+
+- keep assertions coarse enough to tolerate benign public-endpoint drift such as
+  header casing, CDN-added headers, and incidental payload formatting changes
+- prefer checking stable semantic fields like status, echoed query / JSON
+  values, redirect location, and `WireErrorKind` classification
+- if a public origin becomes flaky or changes shape materially, first loosen the
+  assertion if behavior is still semantically equivalent; replace the endpoint
+  only when the drift makes the smoke contract no longer credible
+- keep the live suite opt-in and serial unless there is strong evidence that a
+  parallel contract remains stable across providers
 
 ## 13. Current Non-Goals
 

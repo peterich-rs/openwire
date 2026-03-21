@@ -4,8 +4,9 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION};
 use http::{Method, StatusCode};
 use openwire::EstablishmentStage;
 use support::{
-    assert_timeout, assert_tls, badssl, cookie_client, httpbingo, no_redirect_client, request,
-    request_with_body, response_json, response_text, short_timeout_client, standard_client,
+    assert_timeout, assert_tls, badssl, cookie_client, httpbingo, jsonplaceholder,
+    no_redirect_client, postman_echo, request, request_with_body, response_json, response_text,
+    short_timeout_client, standard_client,
 };
 
 const BASIC_AUTH_OPENWIRE: &str = "Basic b3BlbndpcmU6c3dvcmRmaXNo";
@@ -201,6 +202,97 @@ async fn httpbingo_basic_auth_smoke() {
     assert_eq!(body["authenticated"].as_bool(), Some(true));
     assert_eq!(body["authorized"].as_bool(), Some(true));
     assert_eq!(body["user"].as_str(), Some("openwire"));
+}
+
+#[tokio::test]
+#[ignore = "live network suite is opt-in; run with --ignored --test-threads=1"]
+async fn postman_echo_get_smoke() {
+    let client = standard_client();
+    let response = client
+        .execute(request(
+            Method::GET,
+            postman_echo("/get?hello=openwire&phase=400"),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["args"]["hello"].as_str(), Some("openwire"));
+    assert_eq!(body["args"]["phase"].as_str(), Some("400"));
+    assert_eq!(body["headers"]["host"].as_str(), Some("postman-echo.com"));
+    assert!(body["headers"]["user-agent"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+}
+
+#[tokio::test]
+#[ignore = "live network suite is opt-in; run with --ignored --test-threads=1"]
+async fn postman_echo_post_smoke() {
+    let client = standard_client();
+    let mut request = request_with_body(
+        Method::POST,
+        postman_echo("/post"),
+        r#"{"hello":"openwire"}"#,
+    );
+    request.headers_mut().insert(
+        CONTENT_TYPE,
+        "application/json".parse().expect("content-type"),
+    );
+    request
+        .headers_mut()
+        .insert("x-openwire", "phase-401".parse().expect("x-openwire"));
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response_json(response).await;
+    assert_eq!(body["json"]["hello"].as_str(), Some("openwire"));
+    assert_eq!(body["data"]["hello"].as_str(), Some("openwire"));
+    assert_eq!(body["headers"]["x-openwire"].as_str(), Some("phase-401"));
+}
+
+#[tokio::test]
+#[ignore = "live network suite is opt-in; run with --ignored --test-threads=1"]
+async fn jsonplaceholder_get_smoke() {
+    let client = standard_client();
+    let response = client
+        .execute(request(Method::GET, jsonplaceholder("/posts/1")))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["id"].as_i64(), Some(1));
+    assert_eq!(body["userId"].as_i64(), Some(1));
+    assert!(body["title"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(body["body"].as_str().is_some_and(|value| !value.is_empty()));
+}
+
+#[tokio::test]
+#[ignore = "live network suite is opt-in; run with --ignored --test-threads=1"]
+async fn jsonplaceholder_post_smoke() {
+    let client = standard_client();
+    let mut request = request_with_body(
+        Method::POST,
+        jsonplaceholder("/posts"),
+        r#"{"title":"openwire","body":"phase-403","userId":7}"#,
+    );
+    request.headers_mut().insert(
+        CONTENT_TYPE,
+        "application/json".parse().expect("content-type"),
+    );
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response_json(response).await;
+    assert_eq!(body["title"].as_str(), Some("openwire"));
+    assert_eq!(body["body"].as_str(), Some("phase-403"));
+    assert_eq!(body["userId"].as_i64(), Some(7));
+    assert!(body["id"].as_i64().is_some());
 }
 
 #[tokio::test]

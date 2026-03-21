@@ -84,17 +84,17 @@ This tracker implements `DESIGN.md` section `12. Real-Network Validation Archite
 
 | ID | Status | Task | File Targets | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|---|
-| LNV-400 | `TODO` | Add `postman-echo` GET smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-103 | A second public echo service verifies broad GET interoperability |
-| LNV-401 | `TODO` | Add `postman-echo` POST smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-400 | A second public echo service verifies broad POST interoperability |
-| LNV-402 | `TODO` | Add `jsonplaceholder` GET smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-103 | A live test verifies JSON response parsing against a stable public REST response |
-| LNV-403 | `TODO` | Add `jsonplaceholder` POST smoke coverage with coarse assertions only | `crates/openwire/tests/live_network.rs` | LNV-402 | A live test verifies request/response interoperability without asserting persistence semantics |
+| LNV-400 | `DONE` | Add `postman-echo` GET smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-103 | A second public echo service verifies broad GET interoperability |
+| LNV-401 | `DONE` | Add `postman-echo` POST smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-400 | A second public echo service verifies broad POST interoperability |
+| LNV-402 | `DONE` | Add `jsonplaceholder` GET smoke coverage | `crates/openwire/tests/live_network.rs` | LNV-103 | A live test verifies JSON response parsing against a stable public REST response |
+| LNV-403 | `DONE` | Add `jsonplaceholder` POST smoke coverage with coarse assertions only | `crates/openwire/tests/live_network.rs` | LNV-402 | A live test verifies request/response interoperability without asserting persistence semantics |
 
 ## Phase 5: Invocation, Documentation, And Maintenance
 
 | ID | Status | Task | File Targets | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|---|
-| LNV-500 | `TODO` | Document the live-suite command and non-CI status in user-facing docs | `README.md`, `docs/DESIGN.md` | LNV-104 | Docs explain how to run live tests locally and clarify that they are not part of the required CI gate |
-| LNV-501 | `TODO` | Add a short maintenance section for endpoint drift and flaky-public-origin handling | `docs/DESIGN.md`, `docs/tasks.md` | LNV-500 | Docs explain that public endpoints require coarse assertions and may need periodic review |
+| LNV-500 | `DONE` | Document the live-suite command and non-CI status in user-facing docs | `README.md`, `docs/DESIGN.md` | LNV-104 | Docs explain how to run live tests locally and clarify that they are not part of the required CI gate |
+| LNV-501 | `DONE` | Add a short maintenance section for endpoint drift and flaky-public-origin handling | `docs/DESIGN.md`, `docs/tasks.md` | LNV-500 | Docs explain that public endpoints require coarse assertions and may need periodic review |
 | LNV-502 | `DEFERRED` | Add a separate manual or scheduled live-network workflow without touching `CI Gate` | `.github/workflows/live-network.yml` | LNV-400 | Workflow is independent from required checks and runs only by dispatch or schedule |
 
 ## Explicit Deferrals For This Execution Slice

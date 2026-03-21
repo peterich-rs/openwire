@@ -80,3 +80,6 @@ Optional live-network smoke suite:
 ```bash
 cargo test -p openwire --test live_network -- --ignored --test-threads=1
 ```
+
+This suite is opt-in, hits public internet endpoints, and is not part of the
+required CI gate.

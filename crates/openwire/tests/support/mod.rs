@@ -41,6 +41,14 @@ pub fn badssl(host: &str) -> String {
     format!("https://{host}/")
 }
 
+pub fn postman_echo(path: &str) -> String {
+    format!("https://postman-echo.com{path}")
+}
+
+pub fn jsonplaceholder(path: &str) -> String {
+    format!("https://jsonplaceholder.typicode.com{path}")
+}
+
 pub fn request(method: Method, uri: impl AsRef<str>) -> Request<RequestBody> {
     Request::builder()
         .method(method)
