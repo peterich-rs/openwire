@@ -7,9 +7,9 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use openwire_core::{
     BoxFuture, CallContext, ConnectionId, DnsResolver, EventListener, EventListenerFactory,
     RequestBody, ResponseBody, SharedEventListener, WireError,
@@ -58,7 +58,7 @@ where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = TestResponse> + Send + 'static,
 {
-    spawn_server(handler, None).await
+    spawn_server(handler, None, TestProtocol::Http1).await
 }
 
 pub async fn spawn_https_http1<F, Fut>(handler: F) -> TestServer
@@ -66,24 +66,17 @@ where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = TestResponse> + Send + 'static,
 {
-    let cert = generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("failed to create self-signed certificate");
-    let cert_der: CertificateDer<'static> = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .expect("failed to create TLS server config");
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls = tls_acceptor_with_alpn(vec![b"http/1.1".to_vec()]);
+    spawn_server(handler, Some(tls), TestProtocol::Http1).await
+}
 
-    spawn_server(
-        handler,
-        Some((
-            tokio_rustls::TlsAcceptor::from(Arc::new(config)),
-            cert.cert.pem(),
-        )),
-    )
-    .await
+pub async fn spawn_https_http2<F, Fut>(handler: F) -> TestServer
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = TestResponse> + Send + 'static,
+{
+    let tls = tls_acceptor_with_alpn(vec![b"h2".to_vec()]);
+    spawn_server(handler, Some(tls), TestProtocol::Http2).await
 }
 
 pub fn text_response(status: StatusCode, body: impl Into<Bytes>) -> TestResponse {
@@ -233,6 +226,7 @@ impl DnsResolver for StaticDnsResolver {
 async fn spawn_server<F, Fut>(
     handler: F,
     tls: Option<(tokio_rustls::TlsAcceptor, String)>,
+    protocol: TestProtocol,
 ) -> TestServer
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
@@ -266,14 +260,32 @@ where
                                 let Ok(stream) = acceptor.accept(stream).await else {
                                     return;
                                 };
-                                let _ = http1::Builder::new()
-                                    .serve_connection(TokioIo::new(stream), service)
-                                    .await;
+                                match protocol {
+                                    TestProtocol::Http1 => {
+                                        let _ = http1::Builder::new()
+                                            .serve_connection(TokioIo::new(stream), service)
+                                            .await;
+                                    }
+                                    TestProtocol::Http2 => {
+                                        let _ = http2::Builder::new(TokioExecutor::new())
+                                            .serve_connection(TokioIo::new(stream), service)
+                                            .await;
+                                    }
+                                }
                             }
                             None => {
-                                let _ = http1::Builder::new()
-                                    .serve_connection(TokioIo::new(stream), service)
-                                    .await;
+                                match protocol {
+                                    TestProtocol::Http1 => {
+                                        let _ = http1::Builder::new()
+                                            .serve_connection(TokioIo::new(stream), service)
+                                            .await;
+                                    }
+                                    TestProtocol::Http2 => {
+                                        let _ = http2::Builder::new(TokioExecutor::new())
+                                            .serve_connection(TokioIo::new(stream), service)
+                                            .await;
+                                    }
+                                }
                             }
                         }
                     });
@@ -287,4 +299,26 @@ where
         shutdown: Some(shutdown_tx),
         tls_root_pem,
     }
+}
+
+#[derive(Clone, Copy)]
+enum TestProtocol {
+    Http1,
+    Http2,
+}
+
+fn tls_acceptor_with_alpn(alpn_protocols: Vec<Vec<u8>>) -> (tokio_rustls::TlsAcceptor, String) {
+    let cert = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("failed to create self-signed certificate");
+    let cert_der: CertificateDer<'static> = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("failed to create TLS server config");
+    config.alpn_protocols = alpn_protocols;
+    (
+        tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+        cert.cert.pem(),
+    )
 }

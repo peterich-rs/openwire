@@ -15,11 +15,11 @@ This workspace uses:
 - `crates/openwire-rustls`: default rustls TLS connector
 - `crates/openwire-test`: local test server and observability test helpers
 
-## Roadmap
+## Docs
 
-- Long-term planning and accepted next-stage work live in [docs/roadmap.md](docs/roadmap.md)
-- The active near-term roadmap now starts with `Core Semantics Hardening` for the request execution chain, before `CookieJar`, `Authenticator`, and `openwire-cache`
-- Detailed implementation planning lives in [docs/implementation-plan.md](docs/implementation-plan.md)
+- [docs/DESIGN.md](docs/DESIGN.md): canonical technical design
+- [docs/tasks.md](docs/tasks.md): step-by-step execution tracker
+- The next architecture stage is the self-owned connection core: OpenWire will keep `hyper` as the protocol engine while reclaiming connection acquisition, route planning, pooling, and fast fallback from `hyper-util`'s legacy client path
 
 ## Current API
 
@@ -59,12 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - call timeout and connect timeout, including proxy CONNECT handshake reads
 - typed request metadata via standard `http::Extensions`
 - connection pooling via `hyper-util`
+- HTTP/2 over TLS via rustls ALPN negotiation
 - default Tokio runtime integration
 - default rustls TLS connector with platform verifier or native roots fallback
 - response body wrappers with body-end and connection-release events
+- local Criterion benchmarks for warm pooled HTTP/1.1 and HTTPS HTTP/2 request paths
 - examples and integration tests for HTTP, cookies, auth, proxy, redirect, custom DNS, interceptors, events, and TLS
 
 ## Verification
 
 - `cargo check --workspace --all-targets`
 - `cargo test -p openwire --tests`
+- `cargo test -p openwire --test performance_baseline`
+- `cargo bench -p openwire --bench perf_baseline -- --noplot`

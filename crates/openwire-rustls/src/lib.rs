@@ -26,7 +26,8 @@ impl RustlsTlsConnector {
         RustlsTlsConnectorBuilder::new()
     }
 
-    pub fn from_config(config: ClientConfig) -> Self {
+    pub fn from_config(mut config: ClientConfig) -> Self {
+        ensure_default_http_alpn(&mut config);
         Self {
             config: Arc::new(config),
         }
@@ -79,10 +80,11 @@ impl RustlsTlsConnectorBuilder {
 
         #[cfg(feature = "platform-verifier")]
         if self.custom_roots.is_empty() && self.use_platform_verifier {
-            let config = ClientConfig::builder()
+            let mut config = ClientConfig::builder()
                 .with_platform_verifier()
                 .map_err(|error| WireError::tls("failed to initialize platform verifier", error))?
                 .with_no_client_auth();
+            ensure_default_http_alpn(&mut config);
             return Ok(RustlsTlsConnector::from_config(config));
         }
 
@@ -107,10 +109,17 @@ impl RustlsTlsConnectorBuilder {
             ));
         }
 
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        ensure_default_http_alpn(&mut config);
         Ok(RustlsTlsConnector::from_config(config))
+    }
+}
+
+fn ensure_default_http_alpn(config: &mut ClientConfig) {
+    if config.alpn_protocols.is_empty() {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }
 }
 
@@ -239,4 +248,77 @@ fn connection_info_from_stream(stream: &dyn openwire_core::ConnectionIo) -> Conn
             local_addr: None,
             tls: false,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_config_injects_default_http_alpn_when_missing() {
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoopVerifier))
+            .with_no_client_auth();
+
+        let connector = RustlsTlsConnector::from_config(config);
+        assert_eq!(
+            connector.config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn from_config_preserves_explicit_alpn_configuration() {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoopVerifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let connector = RustlsTlsConnector::from_config(config);
+        assert_eq!(connector.config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[derive(Debug)]
+    struct NoopVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for NoopVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+            ]
+        }
+    }
 }
