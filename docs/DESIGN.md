@@ -256,6 +256,11 @@ First-milestone semantics:
 - winner means TCP + required TLS + protocol binding all succeed
 - losers must be canceled and cleaned up
 - if a TCP winner later fails in TLS or protocol binding, remaining routes may continue
+- direct routes race resolved target addresses
+- proxy routes resolve proxy endpoint addresses into `RoutePlan`, but currently
+  execute those proxy routes sequentially
+- target addresses behind HTTP forward proxies and CONNECT tunnels remain
+  deferred and are not part of fast-fallback racing today
 
 ## 10. Protocol Binding
 
@@ -293,8 +298,8 @@ Important baseline details to preserve during migration:
 - exact-address derivation and pool lookup now happen in `TransportService` via `ExchangeFinder`
 - pool hits now execute through OpenWire-owned bound connection handles instead
   of a separate runtime pool
-- the miss path now builds proxy-aware routes through `RoutePlanner`, but the
-  full proxy policy boundary still partly lives in `ConnectorStack`
+- `RoutePlanner` now owns direct-vs-proxy route selection and proxy endpoint
+  DNS target choice; `ConnectorStack` executes the resulting route plan
 - direct-route cold connects now run through `FastFallbackDialer`; proxy routes
   still dial sequentially
 - protocol binding now happens in `TransportService` via

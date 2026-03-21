@@ -553,6 +553,30 @@ impl RoutePlanner {
         self.fast_fallback_stagger
     }
 
+    pub(crate) fn dns_target<'a>(&self, address: &'a Address) -> (&'a str, u16) {
+        if let Some(proxy) = address.proxy() {
+            (
+                proxy.endpoint().authority().host(),
+                proxy.endpoint().authority().port(),
+            )
+        } else {
+            (address.authority().host(), address.authority().port())
+        }
+    }
+
+    pub(crate) fn plan(
+        &self,
+        address: Address,
+        resolved_addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> RoutePlan {
+        match address.proxy().map(ProxyConfig::mode) {
+            Some(ProxyMode::Forward) => self.plan_http_forward(address, resolved_addrs),
+            Some(ProxyMode::Connect) => self.plan_connect_proxy(address, resolved_addrs),
+            Some(ProxyMode::SocksTunnel) => self.plan_socks_proxy(address, resolved_addrs),
+            None => self.plan_direct(address, resolved_addrs),
+        }
+    }
+
     pub(crate) fn plan_direct(
         &self,
         address: Address,
@@ -861,6 +885,40 @@ mod tests {
                 DnsResolution::Deferred { host, port } if host == "example.com" && *port == 443
             ));
         }
+    }
+
+    #[test]
+    fn planner_selects_dns_target_from_address() {
+        let planner = RoutePlanner::default();
+
+        assert_eq!(planner.dns_target(&http_address()), ("example.com", 80));
+        assert_eq!(
+            planner.dns_target(&https_proxy_address(ProxyMode::Connect)),
+            ("proxy.internal", 8080)
+        );
+    }
+
+    #[test]
+    fn planner_selects_route_kind_from_address_proxy_mode() {
+        let planner = RoutePlanner::default();
+
+        let direct = planner.plan(http_address(), [socket_v4(51)]);
+        assert!(matches!(
+            direct.route(0).expect("direct route").kind(),
+            RouteKind::Direct { .. }
+        ));
+
+        let forward = planner.plan(https_proxy_address(ProxyMode::Forward), [socket_v4(52)]);
+        assert!(matches!(
+            forward.route(0).expect("forward route").kind(),
+            RouteKind::HttpForwardProxy { .. }
+        ));
+
+        let connect = planner.plan(https_proxy_address(ProxyMode::Connect), [socket_v4(53)]);
+        assert!(matches!(
+            connect.route(0).expect("connect route").kind(),
+            RouteKind::ConnectProxy { .. }
+        ));
     }
 
     #[test]

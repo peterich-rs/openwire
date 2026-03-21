@@ -251,7 +251,6 @@ impl ClientBuilder {
             tcp_connector: self.tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
-            proxies,
             route_planner: RoutePlanner::default(),
             proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,

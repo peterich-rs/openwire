@@ -22,6 +22,7 @@ use openwire_core::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
@@ -29,10 +30,9 @@ use crate::auth::{
     SharedAuthenticator,
 };
 use crate::connection::{
-    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, Route, RouteKind,
+    Address, ConnectionProtocol, ExchangeFinder, FastFallbackDialer, Route, RouteKind, RoutePlan,
     RoutePlanner, UriScheme,
 };
-use crate::proxy::Proxy;
 use crate::trace::PolicyTraceContext;
 
 #[derive(Clone, Debug, Default)]
@@ -181,7 +181,6 @@ pub(crate) struct ConnectorStack {
     pub(crate) tcp_connector: Arc<dyn TcpConnector>,
     pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
     pub(crate) connect_timeout: Option<Duration>,
-    pub(crate) proxies: Vec<Proxy>,
     pub(crate) route_planner: RoutePlanner,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_proxy_auth_attempts: usize,
@@ -189,7 +188,6 @@ pub(crate) struct ConnectorStack {
 
 #[derive(Clone)]
 struct ProxyConnectDeps {
-    dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     proxy_authenticator: Option<SharedAuthenticator>,
@@ -215,9 +213,13 @@ impl ConnectorStack {
         uri: Uri,
         address: Address,
     ) -> Result<BoxConnection, WireError> {
-        let proxy = self.proxies.iter().find(|proxy| proxy.matches(&uri));
+        let (dns_host, dns_port) = self.route_planner.dns_target(&address);
+        let resolved_addrs = self
+            .dns_resolver
+            .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
+            .await?;
+        let route_plan = self.route_planner.plan(address, resolved_addrs);
         let proxy_connect_deps = ProxyConnectDeps {
-            dns_resolver: self.dns_resolver.clone(),
             tcp_connector: self.tcp_connector.clone(),
             tls_connector: self.tls_connector.clone(),
             proxy_authenticator: self.proxy_authenticator.clone(),
@@ -225,67 +227,63 @@ impl ConnectorStack {
             connect_timeout: self.connect_timeout,
         };
 
-        if let Some(proxy) = proxy {
-            if proxy.intercepts_http()
-                && uri
-                    .scheme_str()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
-            {
-                return connect_via_http_forward_proxy(
-                    ctx,
-                    address,
-                    self.route_planner.clone(),
-                    proxy_connect_deps.dns_resolver.clone(),
-                    proxy_connect_deps.tcp_connector.clone(),
-                    proxy_connect_deps.connect_timeout,
-                )
-                .await;
-            }
+        connect_route_plan(ctx, uri, route_plan, proxy_connect_deps).await
+    }
+}
 
-            if proxy.intercepts_https()
-                && uri
-                    .scheme_str()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-            {
-                return connect_via_http_proxy(
-                    ctx,
-                    uri,
-                    address,
-                    self.route_planner.clone(),
-                    proxy_connect_deps,
-                )
-                .await;
-            }
+async fn connect_route_plan(
+    ctx: CallContext,
+    uri: Uri,
+    route_plan: RoutePlan,
+    deps: ProxyConnectDeps,
+) -> Result<BoxConnection, WireError> {
+    let Some(first_route) = route_plan.route(0) else {
+        return Err(WireError::connect(
+            "route plan produced no routes",
+            io::Error::new(io::ErrorKind::NotConnected, "empty route plan"),
+        ));
+    };
+
+    match first_route.kind() {
+        RouteKind::Direct { .. } => {
+            return connect_direct(
+                ctx,
+                uri,
+                route_plan,
+                deps.tcp_connector,
+                deps.tls_connector,
+                deps.connect_timeout,
+            )
+            .await;
         }
-
-        connect_direct(
-            ctx,
-            uri,
-            address,
-            self.route_planner.clone(),
-            self.dns_resolver.clone(),
-            self.tcp_connector.clone(),
-            self.tls_connector.clone(),
-            self.connect_timeout,
-        )
-        .await
+        RouteKind::HttpForwardProxy { .. } => {
+            return connect_via_http_forward_proxy(
+                ctx,
+                route_plan,
+                deps.tcp_connector,
+                deps.connect_timeout,
+            )
+            .await;
+        }
+        RouteKind::ConnectProxy { .. } => {
+            return connect_via_http_proxy(ctx, uri, route_plan, deps).await;
+        }
+        RouteKind::SocksProxy { .. } => {
+            return Err(WireError::invalid_request(
+                "SOCKS proxy routes are planned but not yet executable",
+            ));
+        }
     }
 }
 
 async fn connect_direct(
     ctx: CallContext,
     uri: Uri,
-    address: Address,
-    route_planner: RoutePlanner,
-    dns_resolver: Arc<dyn DnsResolver>,
+    route_plan: RoutePlan,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let host = address.authority().host().to_owned();
-    let port = address.authority().port();
-    let addrs = dns_resolver.resolve(ctx.clone(), host, port).await?;
-    let route_plan = route_planner.plan_direct(address, addrs);
     let (stream, outcome) = FastFallbackDialer
         .dial_direct(
             ctx.clone(),
@@ -306,24 +304,10 @@ async fn connect_direct(
 
 async fn connect_via_http_forward_proxy(
     ctx: CallContext,
-    address: Address,
-    route_planner: RoutePlanner,
-    dns_resolver: Arc<dyn DnsResolver>,
+    route_plan: RoutePlan,
     tcp_connector: Arc<dyn TcpConnector>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
-    let proxy = address.proxy().ok_or_else(|| {
-        WireError::internal(
-            "missing proxy config for forward proxy route",
-            io::Error::other("missing proxy config"),
-        )
-    })?;
-    let proxy_host = proxy.endpoint().authority().host().to_owned();
-    let proxy_port = proxy.endpoint().authority().port();
-    let addrs = dns_resolver
-        .resolve(ctx.clone(), proxy_host, proxy_port)
-        .await?;
-    let route_plan = route_planner.plan_http_forward(address, addrs);
     let mut last_error = None;
 
     for route in route_plan.iter().cloned() {
@@ -355,8 +339,7 @@ async fn connect_via_http_forward_proxy(
 async fn connect_via_http_proxy(
     ctx: CallContext,
     target_uri: Uri,
-    address: Address,
-    route_planner: RoutePlanner,
+    route_plan: RoutePlan,
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let target_scheme = target_uri
@@ -367,20 +350,6 @@ async fn connect_via_http_proxy(
             "configured proxy currently supports HTTPS requests only",
         ));
     }
-
-    let proxy = address.proxy().ok_or_else(|| {
-        WireError::internal(
-            "missing proxy config for CONNECT route",
-            io::Error::other("missing proxy config"),
-        )
-    })?;
-    let proxy_host = proxy.endpoint().authority().host().to_owned();
-    let proxy_port = proxy.endpoint().authority().port();
-    let addrs = deps
-        .dns_resolver
-        .resolve(ctx.clone(), proxy_host, proxy_port)
-        .await?;
-    let route_plan = route_planner.plan_connect_proxy(address, addrs);
     let mut last_error = None;
 
     for route in route_plan.iter().cloned() {
@@ -1045,9 +1014,12 @@ impl TransportService {
         ctx: CallContext,
         span: tracing::Span,
     ) -> Result<SelectedConnection, WireError> {
+        let connect_span = tracing::Span::current();
         let stream = self
             .connector
             .connect(ctx, request.uri().clone(), prepared.address().clone())
+            .instrument(connect_span)
+            .with_current_subscriber()
             .await?;
         let connected = stream.connected();
         let info = connection_info_from_connected(&connected);
@@ -1149,7 +1121,11 @@ impl Service<Exchange> for TransportService {
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
-        Box::pin(self.clone().execute_exchange(exchange))
+        Box::pin(
+            self.clone()
+                .execute_exchange(exchange)
+                .with_current_subscriber(),
+        )
     }
 }
 

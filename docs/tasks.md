@@ -173,11 +173,11 @@ planning.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P10-001 | `TODO` | Move direct/proxy route selection logic into `RoutePlanner` | P2-007, P5-004 | Planner owns direct, forward-proxy, and CONNECT route generation |
-| P10-002 | `TODO` | Represent HTTP forward proxy routes as first-class `Route` variants | P10-001 | Absolute-form request routing works through route planner |
-| P10-003 | `TODO` | Represent HTTPS CONNECT routes as first-class `Route` variants | P10-001 | CONNECT tunnel path works through route planner |
-| P10-004 | `TODO` | Preserve proxy authentication loops in the owned acquisition path | P10-003 | Existing proxy auth integration tests continue to pass |
-| P10-005 | `TODO` | Decide whether fast fallback races proxy endpoint addresses, target addresses, or both for each route type | P10-001 | Decision recorded in `DESIGN.md` before broader proxy work proceeds |
+| P10-001 | `DONE` | Move direct/proxy route selection logic into `RoutePlanner` | P2-007, P5-004 | Planner owns direct, forward-proxy, and CONNECT route generation |
+| P10-002 | `DONE` | Represent HTTP forward proxy routes as first-class `Route` variants | P10-001 | Absolute-form request routing works through route planner |
+| P10-003 | `DONE` | Represent HTTPS CONNECT routes as first-class `Route` variants | P10-001 | CONNECT tunnel path works through route planner |
+| P10-004 | `DONE` | Preserve proxy authentication loops in the owned acquisition path | P10-003 | Existing proxy auth integration tests continue to pass |
+| P10-005 | `DONE` | Decide whether fast fallback races proxy endpoint addresses, target addresses, or both for each route type | P10-001 | Decision recorded in `DESIGN.md` before broader proxy work proceeds |
 
 ## Phase 11: Error Model Refinement
 
@@ -230,15 +230,14 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P10-001` through `P10-005`
+1. `P11-001` through `P11-003`
 2. `P12-005`
 3. `P13-002` and `P13-003`
 
 Rationale:
 
-- the remaining major ownership gap is proxy route generation and acquisition
-  semantics, which are still split between `RoutePlanner` and connector
-  branching
+- proxy route planning and execution boundaries are now explicit, so the next
+  missing correctness slice is route-aware internal error classification
 - idle eviction now exists, but deterministic timing coverage still needs to be
   added once the pool semantics settle further
 - runtime-path ownership is landed, so the next dependency cleanup is removing
