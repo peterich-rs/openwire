@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream;
@@ -17,6 +18,13 @@ use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, RecordingEventListenerFactory,
     StaticDnsResolver,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Id, Subscriber};
+use tracing_subscriber::layer::{Context as LayerContext, Layer};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 #[tokio::test]
 async fn basic_get_returns_body() {
@@ -32,6 +40,26 @@ async fn basic_get_returns_body() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "hello openwire");
+}
+
+#[tokio::test]
+async fn client_call_timeout_applies_to_requests() {
+    let server = spawn_http1(|_request| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ok_text("slow ok")
+    })
+    .await;
+
+    let client = Client::builder()
+        .call_timeout(std::time::Duration::from_millis(10))
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(server.http_url("/slow")))
+        .await
+        .expect_err("default timeout should fail");
+    assert_eq!(error.kind(), WireErrorKind::Timeout);
 }
 
 #[tokio::test]
@@ -159,6 +187,59 @@ async fn shared_client_reuses_connection_pool_across_calls() {
 }
 
 #[tokio::test]
+async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
+    let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
+    let trace = TraceCapture::default();
+    let subscriber = tracing_subscriber::registry().with(trace.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let client = Client::builder().build().expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/first")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let response = client
+        .execute(empty_request(server.http_url("/second")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let spans = trace.spans_named("openwire.attempt");
+    assert_eq!(spans.len(), 2, "spans = {spans:?}");
+    assert_eq!(
+        spans[0].fields.get("attempt").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        spans[0].fields.get("retry_count").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        spans[0].fields.get("redirect_count").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        spans[0].fields.get("connection_reused").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        spans[1].fields.get("attempt").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        spans[1].fields.get("connection_reused").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        spans[0].fields.get("connection_id"),
+        spans[1].fields.get("connection_id"),
+        "spans = {spans:?}",
+    );
+}
+
+#[tokio::test]
 async fn interceptors_wrap_transport_in_expected_order() {
     let server = spawn_http1(|_request| async move { ok_text("ok") }).await;
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -206,6 +287,147 @@ async fn event_listener_observes_full_call_lifecycle() {
     assert!(events.contains("response_headers_end 200 OK"));
     assert!(events.contains("response_body_end 12"));
     assert!(events.contains("connection_released"));
+}
+
+#[tokio::test]
+async fn success_events_follow_stable_order() {
+    let server = spawn_http1(|_request| async move { ok_text("ordered") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/ordered")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "call_start GET",
+            "dns_start",
+            "dns_end",
+            "connect_end",
+            "request_body_end 0",
+            "connection_acquired ",
+            "response_headers_start",
+            "response_headers_end 200 OK",
+            "call_end 200 OK",
+            "response_body_end 7",
+            "connection_released ",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn dropping_response_body_without_consuming_it_does_not_emit_response_body_end() {
+    let server = spawn_http1(|_request| async move { ok_text("abandoned") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/abandoned")))
+        .await
+        .expect("response");
+    drop(response);
+
+    let events = events.events();
+    assert_event_subsequence(&events, &["call_end 200 OK", "connection_released "]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_end ")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_failed ")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
+    let server = spawn_raw_http1_response(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc".to_vec(),
+    )
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let trace = TraceCapture::default();
+    let subscriber = tracing_subscriber::registry().with(trace.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/broken",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let error = response
+        .into_body()
+        .text()
+        .await
+        .expect_err("body should fail");
+    assert_eq!(error.kind(), WireErrorKind::Protocol);
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "call_start GET",
+            "response_headers_end 200 OK",
+            "call_end 200 OK",
+            "response_body_failed protocol",
+            "connection_released ",
+        ],
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_end ")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("call_failed ")),
+        "events = {events:?}",
+    );
+
+    let body_failure = trace
+        .event_by_message("response body failed")
+        .expect("body failure trace event");
+    assert_eq!(
+        body_failure.fields.get("error_kind").map(String::as_str),
+        Some("protocol")
+    );
+    assert_eq!(
+        body_failure.fields.get("bytes_read").map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        body_failure.fields.get("attempt").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        body_failure.fields.contains_key("call_id"),
+        "body failure event = {body_failure:?}",
+    );
 }
 
 #[tokio::test]
@@ -395,6 +617,109 @@ async fn redirect_count_remains_independent_from_retry_count() {
             .iter()
             .any(|event| event.starts_with("redirect 1 http://openwire.test:")),
         "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect-after-retry" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/redirect-target")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect after retry"),
+        }
+    })
+    .await;
+
+    let connector = FailingTcpConnector::new(1);
+    let events = RecordingEventListenerFactory::default();
+    let trace = TraceCapture::default();
+    let subscriber = tracing_subscriber::registry().with(trace.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector)
+        .event_listener_factory(events.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/redirect-after-retry",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "call_start GET",
+            "connect_failed ",
+            "retry 1 connect",
+            "connect_end ",
+            "connection_acquired ",
+            "response_headers_end 302 Found",
+            "redirect 1 http://openwire.test:",
+            "connection_released ",
+            "connection_acquired ",
+            "response_headers_end 200 OK",
+            "call_end 200 OK",
+            "response_body_end 20",
+        ],
+    );
+
+    let retry_event = trace
+        .event_by_message("retrying request after connection-establishment failure")
+        .expect("retry trace event");
+    assert_eq!(
+        retry_event.fields.get("attempt").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        retry_event.fields.get("retry_count").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        retry_event.fields.get("redirect_count").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        retry_event.fields.get("retry_reason").map(String::as_str),
+        Some("connect")
+    );
+
+    let redirect_event = trace
+        .event_by_message("following redirect")
+        .expect("redirect trace event");
+    assert_eq!(
+        redirect_event.fields.get("attempt").map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        redirect_event.fields.get("retry_count").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        redirect_event
+            .fields
+            .get("redirect_count")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        redirect_event
+            .fields
+            .get("redirect_location")
+            .is_some_and(|location| location.contains("/redirect-target")),
+        "redirect event = {redirect_event:?}",
     );
 }
 
@@ -679,6 +1004,13 @@ fn header_value(headers: &http::HeaderMap, name: http::header::HeaderName) -> Op
         .map(str::to_owned)
 }
 
+fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {
+    Request::builder()
+        .uri(uri.as_ref())
+        .body(RequestBody::empty())
+        .expect("request")
+}
+
 fn default_user_agent() -> &'static str {
     concat!("openwire/", env!("CARGO_PKG_VERSION"))
 }
@@ -772,5 +1104,200 @@ impl DnsResolver for HostMapResolver {
             ctx.listener().dns_end(&ctx, &host, &[addr]);
             Ok(vec![addr])
         })
+    }
+}
+
+fn assert_event_subsequence(events: &[String], expected_prefixes: &[&str]) {
+    let mut cursor = 0usize;
+    for expected in expected_prefixes {
+        while cursor < events.len() && !events[cursor].starts_with(expected) {
+            cursor += 1;
+        }
+        assert!(
+            cursor < events.len(),
+            "missing event starting with {expected:?} in {events:?}",
+        );
+        cursor += 1;
+    }
+}
+
+struct RawHttpServer {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl RawHttpServer {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for RawHttpServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut shutdown_rx => {}
+            accepted = listener.accept() => {
+                if let Ok((mut stream, _)) = accepted {
+                    let mut buffer = [0u8; 1024];
+                    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer)).await;
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CapturedSpan {
+    name: String,
+    fields: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedEvent {
+    fields: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct TraceCaptureInner {
+    span_order: Vec<u64>,
+    spans: HashMap<u64, CapturedSpan>,
+    events: Vec<CapturedEvent>,
+}
+
+#[derive(Clone, Default)]
+struct TraceCapture {
+    inner: Arc<Mutex<TraceCaptureInner>>,
+}
+
+impl TraceCapture {
+    fn spans_named(&self, name: &str) -> Vec<CapturedSpan> {
+        let inner = self.inner.lock().expect("trace capture lock");
+        inner
+            .span_order
+            .iter()
+            .filter_map(|id| inner.spans.get(id))
+            .filter(|span| span.name == name)
+            .cloned()
+            .collect()
+    }
+
+    fn event_by_message(&self, message: &str) -> Option<CapturedEvent> {
+        self.inner
+            .lock()
+            .expect("trace capture lock")
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .fields
+                    .get("message")
+                    .is_some_and(|value| value == message)
+            })
+            .cloned()
+    }
+}
+
+impl<S> Layer<S> for TraceCapture
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &Id,
+        _ctx: LayerContext<'_, S>,
+    ) {
+        let mut visitor = FieldCapture::default();
+        attrs.record(&mut visitor);
+        let mut inner = self.inner.lock().expect("trace capture lock");
+        let id = id.into_u64();
+        inner.span_order.push(id);
+        inner.spans.insert(
+            id,
+            CapturedSpan {
+                name: attrs.metadata().name().to_owned(),
+                fields: visitor.fields,
+            },
+        );
+    }
+
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _ctx: LayerContext<'_, S>) {
+        let mut visitor = FieldCapture::default();
+        values.record(&mut visitor);
+        if let Some(span) = self
+            .inner
+            .lock()
+            .expect("trace capture lock")
+            .spans
+            .get_mut(&id.into_u64())
+        {
+            span.fields.extend(visitor.fields);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
+        let mut visitor = FieldCapture::default();
+        event.record(&mut visitor);
+        let _ = ctx.event_scope(event);
+        self.inner
+            .lock()
+            .expect("trace capture lock")
+            .events
+            .push(CapturedEvent {
+                fields: visitor.fields,
+            });
+    }
+}
+
+#[derive(Default)]
+struct FieldCapture {
+    fields: HashMap<String, String>,
+}
+
+impl Visit for FieldCapture {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.fields
+            .insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .insert(field.name().to_owned(), format!("{value:?}"));
     }
 }

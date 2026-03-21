@@ -28,7 +28,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = Request::builder()
         .uri("http://openwire.local:8080/")
         .body(RequestBody::empty())?;
-
     let response = client.execute(request).await?;
     println!("status = {}", response.status());
     Ok(())

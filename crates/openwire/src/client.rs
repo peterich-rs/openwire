@@ -19,6 +19,7 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::bridge::BridgeInterceptor;
+use crate::trace::PolicyTraceContext;
 use crate::transport::{
     build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
     TransportService,
@@ -368,10 +369,16 @@ impl Service<Exchange> for RetryPolicyService {
         let config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, mut attempt) = exchange.into_parts();
+            let mut policy_trace = request
+                .extensions()
+                .get::<PolicyTraceContext>()
+                .copied()
+                .unwrap_or_default();
             let retry_snapshot = RetrySnapshot::capture(&request);
             let mut retries = 0u32;
 
             loop {
+                request.extensions_mut().insert(policy_trace);
                 let mut svc = network.clone();
                 let result = tower::ServiceExt::ready(&mut svc)
                     .await
@@ -404,15 +411,17 @@ impl Service<Exchange> for RetryPolicyService {
 
                         retries += 1;
                         attempt += 1;
+                        policy_trace.retry_count = retries;
                         ctx.listener().retry(&ctx, retries, reason);
                         tracing::debug!(
                             call_id = ctx.call_id().as_u64(),
-                            retry_attempt = retries,
                             attempt,
-                            reason,
+                            retry_count = policy_trace.retry_count,
+                            redirect_count = policy_trace.redirect_count,
+                            retry_reason = reason,
                             "retrying request after connection-establishment failure",
                         );
-                        request = snapshot.to_request()?;
+                        request = snapshot.to_request(policy_trace)?;
                     }
                 }
             }
@@ -440,16 +449,22 @@ impl Service<Exchange> for RedirectPolicyService {
         let config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, initial_attempt) = exchange.into_parts();
+            let mut policy_trace = request
+                .extensions()
+                .get::<PolicyTraceContext>()
+                .copied()
+                .unwrap_or_default();
             let mut attempt = initial_attempt;
             let mut redirects = 0u32;
             let mut total_retries = 0u32;
 
             loop {
                 validate_request(&request)?;
+                request.extensions_mut().insert(policy_trace);
                 let redirect_snapshot = RedirectSnapshot::capture(&request);
 
                 let mut svc = network.clone();
-                let mut response = tower::ServiceExt::ready(&mut svc)
+                let response = tower::ServiceExt::ready(&mut svc)
                     .await
                     .map_err(|error| WireError::internal("network chain not ready", error))?
                     .call(Exchange::new(request, ctx.clone(), attempt))
@@ -466,11 +481,11 @@ impl Service<Exchange> for RedirectPolicyService {
                 total_retries += attempt_metadata.retry_count;
 
                 if !config.follow_redirects {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 }
 
                 let Some(location) = response
@@ -478,19 +493,19 @@ impl Service<Exchange> for RedirectPolicyService {
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
                 else {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 };
 
                 if !is_redirect_status(response.status()) {
-                    response.extensions_mut().insert(AttemptMetadata {
-                        total_attempt: attempt_metadata.total_attempt,
-                        retry_count: total_retries,
-                    });
-                    return Ok(response);
+                    return Ok(response_with_attempt_metadata(
+                        response,
+                        attempt_metadata.total_attempt,
+                        total_retries,
+                    ));
                 }
 
                 if redirects as usize >= config.max_redirects {
@@ -502,10 +517,25 @@ impl Service<Exchange> for RedirectPolicyService {
 
                 let next_uri = resolve_redirect_uri(&redirect_snapshot.uri, location)?;
                 ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
+                let next_attempt = attempt_metadata.total_attempt + 1;
+                policy_trace.retry_count = total_retries;
+                policy_trace.redirect_count = redirects + 1;
+                tracing::debug!(
+                    call_id = ctx.call_id().as_u64(),
+                    attempt = next_attempt,
+                    retry_count = policy_trace.retry_count,
+                    redirect_count = policy_trace.redirect_count,
+                    redirect_location = %next_uri,
+                    "following redirect",
+                );
 
-                request = redirect_snapshot.into_redirect_request(response.status(), next_uri)?;
+                request = redirect_snapshot.into_redirect_request(
+                    response.status(),
+                    next_uri,
+                    policy_trace,
+                )?;
                 redirects += 1;
-                attempt = attempt_metadata.total_attempt + 1;
+                attempt = next_attempt;
             }
         })
     }
@@ -620,7 +650,10 @@ impl RetrySnapshot {
         })
     }
 
-    fn to_request(&self) -> Result<Request<RequestBody>, WireError> {
+    fn to_request(
+        &self,
+        policy_trace: PolicyTraceContext,
+    ) -> Result<Request<RequestBody>, WireError> {
         let body = self
             .body
             .as_ref()
@@ -632,6 +665,7 @@ impl RetrySnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = self.headers.clone();
+        request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
 }
@@ -651,6 +685,7 @@ impl RedirectSnapshot {
         self,
         status: StatusCode,
         next_uri: Uri,
+        policy_trace: PolicyTraceContext,
     ) -> Result<Request<RequestBody>, WireError> {
         let same_authority = same_authority(&self.uri, &next_uri);
         let should_switch_to_get = matches!(
@@ -699,6 +734,7 @@ impl RedirectSnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = headers;
+        request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
 }
@@ -707,14 +743,24 @@ fn same_authority(left: &Uri, right: &Uri) -> bool {
     left.scheme_str() == right.scheme_str() && left.authority() == right.authority()
 }
 
+fn response_with_attempt_metadata(
+    mut response: Response<ResponseBody>,
+    total_attempt: u32,
+    retry_count: u32,
+) -> Response<ResponseBody> {
+    response.extensions_mut().insert(AttemptMetadata {
+        total_attempt,
+        retry_count,
+    });
+    response
+}
+
 fn retry_reason(error: &WireError) -> Option<&'static str> {
     match error.kind() {
         WireErrorKind::Dns => Some("dns"),
         WireErrorKind::Connect => Some("connect"),
         WireErrorKind::Tls => Some("tls"),
-        WireErrorKind::Timeout if error.message().starts_with("connection timed out after") => {
-            Some("connect_timeout")
-        }
+        WireErrorKind::Timeout if error.is_connect_timeout() => Some("connect_timeout"),
         _ => None,
     }
 }

@@ -46,7 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = Request::builder()
         .uri("http://example.com/")
         .body(RequestBody::empty())?;
-
     let _ = client.execute(request).await?;
     for line in logs.lock().expect("log lock").iter() {
         println!("{line}");

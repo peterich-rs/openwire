@@ -1,5 +1,6 @@
 mod bridge;
 mod client;
+mod trace;
 mod transport;
 
 pub use client::{Call, Client, ClientBuilder};

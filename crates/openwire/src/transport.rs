@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::Response;
+use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -23,6 +23,8 @@ use openwire_core::{
 };
 use tower::Service;
 use tracing::Instrument;
+
+use crate::trace::PolicyTraceContext;
 
 tokio::task_local! {
     static CURRENT_CALL_CONTEXT: CallContext;
@@ -97,8 +99,9 @@ impl TcpConnector for TokioTcpConnector {
                         result.map_err(|error| WireError::connect("TCP connect failed", error))?
                     }
                     Err(_error) => {
-                        let error =
-                            WireError::timeout(format!("connection timed out after {timeout:?}"));
+                        let error = WireError::connect_timeout(format!(
+                            "connection timed out after {timeout:?}"
+                        ));
                         ctx.listener().connect_failed(&ctx, addr, &error);
                         return Err(error);
                     }
@@ -294,14 +297,13 @@ impl Service<Exchange> for TransportService {
         Box::pin(async move {
             let (request, ctx, attempt) = exchange.into_parts();
             let request_body_len = request.body().replayable_len();
+            let policy_trace = request
+                .extensions()
+                .get::<PolicyTraceContext>()
+                .copied()
+                .unwrap_or_default();
 
-            let call_span = tracing::debug_span!(
-                "openwire.attempt",
-                call_id = ctx.call_id().as_u64(),
-                attempt,
-                method = %request.method(),
-                uri = %request.uri(),
-            );
+            let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
 
             async move {
                 let response = with_call_context(ctx.clone(), async move {
@@ -322,11 +324,20 @@ impl Service<Exchange> for TransportService {
                         !seen.insert(info.id)
                     };
                     ctx.listener().connection_acquired(&ctx, info.id, reused);
+                    let span = tracing::Span::current();
+                    span.record("connection_id", info.id.as_u64());
+                    span.record("connection_reused", reused);
                 }
 
                 ctx.listener().response_headers_start(&ctx);
                 let (parts, body) = response.into_parts();
-                let body = ObservedIncomingBody::wrap(body, ctx.clone(), connection_info);
+                let body = ObservedIncomingBody::wrap(
+                    body,
+                    ctx.clone(),
+                    attempt,
+                    connection_info,
+                    tracing::Span::current(),
+                );
                 let response = Response::from_parts(parts, body);
                 ctx.listener().response_headers_end(&ctx, &response);
 
@@ -336,6 +347,27 @@ impl Service<Exchange> for TransportService {
             .await
         })
     }
+}
+
+fn attempt_span(
+    ctx: &CallContext,
+    request: &Request<RequestBody>,
+    attempt: u32,
+    policy_trace: PolicyTraceContext,
+) -> tracing::Span {
+    // Canonical attempt-level tracing fields. Downstream tooling should rely on
+    // these names instead of ad hoc transport-specific labels.
+    tracing::debug_span!(
+        "openwire.attempt",
+        call_id = ctx.call_id().as_u64(),
+        attempt,
+        retry_count = policy_trace.retry_count,
+        redirect_count = policy_trace.redirect_count,
+        method = %request.method(),
+        uri = %request.uri(),
+        connection_id = tracing::field::Empty,
+        connection_reused = tracing::field::Empty,
+    )
 }
 
 pub(crate) fn build_hyper_client(
@@ -358,26 +390,36 @@ pub(crate) fn build_hyper_client(
 struct ObservedIncomingBody {
     inner: Incoming,
     ctx: CallContext,
+    attempt: u32,
     bytes_read: u64,
     connection_id: Option<openwire_core::ConnectionId>,
+    span: tracing::Span,
     finished: bool,
 }
 
 impl ObservedIncomingBody {
-    fn wrap(body: Incoming, ctx: CallContext, info: Option<ConnectionInfo>) -> ResponseBody {
+    fn wrap(
+        body: Incoming,
+        ctx: CallContext,
+        attempt: u32,
+        info: Option<ConnectionInfo>,
+        span: tracing::Span,
+    ) -> ResponseBody {
         ResponseBody::new(
             Self {
                 inner: body,
                 ctx,
+                attempt,
                 bytes_read: 0,
                 connection_id: info.map(|info| info.id),
+                span,
                 finished: false,
             }
             .boxed(),
         )
     }
 
-    fn finish(&mut self) {
+    fn finish_successfully(&mut self) {
         if self.finished {
             return;
         }
@@ -385,6 +427,37 @@ impl ObservedIncomingBody {
         self.ctx
             .listener()
             .response_body_end(&self.ctx, self.bytes_read);
+        self.release_connection();
+    }
+
+    fn finish_with_error(&mut self, error: &WireError) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.in_scope(|| {
+            tracing::debug!(
+                call_id = self.ctx.call_id().as_u64(),
+                attempt = self.attempt,
+                error_kind = %error.kind(),
+                error_message = %error.message(),
+                bytes_read = self.bytes_read,
+                "response body failed",
+            );
+        });
+        self.ctx.listener().response_body_failed(&self.ctx, error);
+        self.release_connection();
+    }
+
+    fn finish_abandoned(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.release_connection();
+    }
+
+    fn release_connection(&mut self) {
         if let Some(connection_id) = self.connection_id {
             self.ctx
                 .listener()
@@ -395,7 +468,7 @@ impl ObservedIncomingBody {
 
 impl Drop for ObservedIncomingBody {
     fn drop(&mut self) {
-        self.finish();
+        self.finish_abandoned();
     }
 }
 
@@ -417,12 +490,11 @@ impl Body for ObservedIncomingBody {
             }
             Poll::Ready(Some(Err(error))) => {
                 let error = WireError::from(error);
-                this.ctx.listener().response_body_failed(&this.ctx, &error);
-                this.finish();
+                this.finish_with_error(&error);
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.finish();
+                this.finish_successfully();
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -463,7 +535,7 @@ fn current_call_context() -> Result<CallContext, WireError> {
         .map_err(|error| {
             WireError::internal(
                 "call context unavailable inside connector stack",
-                io::Error::new(io::ErrorKind::Other, error.to_string()),
+                io::Error::other(error.to_string()),
             )
         })
 }

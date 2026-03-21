@@ -7,6 +7,17 @@ use thiserror::Error;
 
 pub type BoxError = Arc<dyn StdError + Send + Sync>;
 
+#[derive(Debug)]
+struct ConnectTimeoutMarker;
+
+impl fmt::Display for ConnectTimeoutMarker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("connect timeout")
+    }
+}
+
+impl StdError for ConnectTimeoutMarker {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WireErrorKind {
     InvalidRequest,
@@ -83,12 +94,23 @@ impl WireError {
         self.message.as_ref()
     }
 
+    pub fn is_connect_timeout(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<ConnectTimeoutMarker>())
+            .is_some()
+    }
+
     pub fn invalid_request(message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(WireErrorKind::InvalidRequest, message)
     }
 
     pub fn timeout(message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(WireErrorKind::Timeout, message)
+    }
+
+    pub fn connect_timeout(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::with_source(WireErrorKind::Timeout, message, ConnectTimeoutMarker)
     }
 
     pub fn canceled(message: impl Into<Cow<'static, str>>) -> Self {

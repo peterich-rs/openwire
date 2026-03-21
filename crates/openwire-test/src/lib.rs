@@ -154,6 +154,10 @@ impl EventListener for RecordingEventListener {
         self.push(format!("dns_end {host} {}", addrs.len()));
     }
 
+    fn connect_failed(&self, _ctx: &CallContext, addr: SocketAddr, error: &WireError) {
+        self.push(format!("connect_failed {addr} {}", error.kind()));
+    }
+
     fn connect_end(&self, _ctx: &CallContext, connection_id: ConnectionId, addr: SocketAddr) {
         self.push(format!("connect_end {} {}", connection_id.as_u64(), addr));
     }
@@ -162,12 +166,27 @@ impl EventListener for RecordingEventListener {
         self.push(format!("request_body_end {bytes_sent}"));
     }
 
+    fn response_headers_start(&self, _ctx: &CallContext) {
+        self.push("response_headers_start");
+    }
+
     fn response_headers_end(&self, _ctx: &CallContext, response: &Response<ResponseBody>) {
         self.push(format!("response_headers_end {}", response.status()));
     }
 
+    fn response_body_failed(&self, _ctx: &CallContext, error: &WireError) {
+        self.push(format!("response_body_failed {}", error.kind()));
+    }
+
     fn response_body_end(&self, _ctx: &CallContext, bytes_read: u64) {
         self.push(format!("response_body_end {bytes_read}"));
+    }
+
+    fn connection_acquired(&self, _ctx: &CallContext, connection_id: ConnectionId, reused: bool) {
+        self.push(format!(
+            "connection_acquired {} reused={reused}",
+            connection_id.as_u64()
+        ));
     }
 
     fn connection_released(&self, _ctx: &CallContext, connection_id: ConnectionId) {

@@ -15,7 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .method("POST")
         .uri("http://example.com/upload")
         .body(body)?;
-
     let response = client.execute(request).await?;
     println!("status = {}", response.status());
     Ok(())
