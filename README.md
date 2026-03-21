@@ -31,7 +31,7 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
-- [docs/tasks.md](docs/tasks.md): active / deferred execution tracker
+- [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start
 
@@ -74,3 +74,21 @@ cargo check --workspace --all-targets
 cargo test --workspace --all-targets
 cargo bench -p openwire --bench perf_baseline -- --noplot
 ```
+
+Optional live-network smoke suite:
+
+```bash
+cargo test -p openwire --test live_network -- --ignored --test-threads=1
+```
+
+This suite is opt-in, hits public internet endpoints, and is not part of the
+required CI gate.
+
+The repository also provides a separate GitHub Actions workflow at
+`.github/workflows/live-network.yml` for manual dispatches and weekly scheduled
+runs without affecting the required CI path.
+
+Deferred public-origin follow-ons are intentionally kept out of this baseline
+when they require external credentials, temporary remote resources, untrusted
+public proxies, or timing-sensitive assertions that public networks cannot make
+credible.
