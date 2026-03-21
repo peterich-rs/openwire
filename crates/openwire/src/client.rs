@@ -1,25 +1,24 @@
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, PROXY_AUTHORIZATION,
-};
-use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
+use http::{Request, Response};
 use openwire_core::{
-    BoxFuture, BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange,
-    InterceptorLayer, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime,
-    SharedEventListenerFactory, SharedInterceptor, TcpConnector, TlsConnector, WireError,
-    WireErrorKind,
+    BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
+    NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
+    SharedInterceptor, TcpConnector, TlsConnector, WireError,
 };
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
 use tower::Service;
 use tracing::Instrument;
-use url::Url;
 
+use crate::auth::{Authenticator, SharedAuthenticator};
 use crate::bridge::BridgeInterceptor;
-use crate::trace::PolicyTraceContext;
+use crate::cookie::{CookieJar, SharedCookieJar};
+use crate::policy::{
+    AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
+};
+use crate::proxy::{system_proxies_from_env, Proxy};
 use crate::transport::{
     build_hyper_client, ConnectorStack, SystemDnsResolver, TokioRuntime, TokioTcpConnector,
     TransportService,
@@ -52,25 +51,6 @@ pub(crate) struct TransportConfig {
     pub(crate) retry_canceled_requests: bool,
 }
 
-#[derive(Clone)]
-struct PolicyConfig {
-    call_timeout: Option<Duration>,
-    retry: RetryPolicyConfig,
-    redirect: RedirectPolicyConfig,
-}
-
-#[derive(Clone)]
-struct RetryPolicyConfig {
-    retry_on_connection_failure: bool,
-    max_retries: usize,
-}
-
-#[derive(Clone)]
-struct RedirectPolicyConfig {
-    follow_redirects: bool,
-    max_redirects: usize,
-}
-
 pub struct ClientBuilder {
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
@@ -81,6 +61,8 @@ pub struct ClientBuilder {
     dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
+    proxies: Vec<Proxy>,
+    use_system_proxy: bool,
 }
 
 impl ClientBuilder {
@@ -141,6 +123,49 @@ impl ClientBuilder {
         T: TlsConnector,
     {
         self.tls_connector = Some(Arc::new(connector));
+        self
+    }
+
+    /// Configures a cookie jar for automatic cookie loading and persistence.
+    pub fn cookie_jar<J>(mut self, jar: J) -> Self
+    where
+        J: CookieJar,
+    {
+        self.policy.cookie_jar = Some(Arc::new(jar) as SharedCookieJar);
+        self
+    }
+
+    /// Adds a proxy rule to the client.
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxies.push(proxy);
+        self
+    }
+
+    /// Opts into reading proxy rules from standard environment variables.
+    pub fn use_system_proxy(mut self, enabled: bool) -> Self {
+        self.use_system_proxy = enabled;
+        self
+    }
+
+    pub fn authenticator<A>(mut self, authenticator: A) -> Self
+    where
+        A: Authenticator,
+    {
+        self.policy.auth.authenticator = Some(Arc::new(authenticator) as SharedAuthenticator);
+        self
+    }
+
+    pub fn proxy_authenticator<A>(mut self, authenticator: A) -> Self
+    where
+        A: Authenticator,
+    {
+        self.policy.auth.proxy_authenticator = Some(Arc::new(authenticator) as SharedAuthenticator);
+        self
+    }
+
+    /// Sets the maximum number of automatic auth follow-ups per logical call.
+    pub fn max_auth_attempts(mut self, max_auth_attempts: usize) -> Self {
+        self.policy.auth.max_auth_attempts = max_auth_attempts;
         self
     }
 
@@ -212,11 +237,19 @@ impl ClientBuilder {
         #[cfg(not(feature = "tls-rustls"))]
         let tls_connector = self.tls_connector;
 
+        let mut proxies = self.proxies;
+        if self.use_system_proxy {
+            proxies.extend(system_proxies_from_env()?);
+        }
+
         let connector = ConnectorStack {
             dns_resolver: self.dns_resolver,
             tcp_connector: self.tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
+            proxies,
+            proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
+            max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
         };
 
         let transport = TransportService::new(build_hyper_client(connector, &self.transport));
@@ -255,6 +288,12 @@ impl Default for ClientBuilder {
             },
             policy: PolicyConfig {
                 call_timeout: None,
+                cookie_jar: None,
+                auth: AuthPolicyConfig {
+                    authenticator: None,
+                    proxy_authenticator: None,
+                    max_auth_attempts: 3,
+                },
                 retry: RetryPolicyConfig {
                     retry_on_connection_failure: true,
                     max_retries: 1,
@@ -267,6 +306,8 @@ impl Default for ClientBuilder {
             dns_resolver: Arc::new(SystemDnsResolver),
             tcp_connector: Arc::new(TokioTcpConnector),
             tls_connector: None,
+            proxies: Vec::new(),
+            use_system_proxy: false,
         }
     }
 }
@@ -349,198 +390,6 @@ impl Call {
     }
 }
 
-#[derive(Clone)]
-struct RetryPolicyService {
-    network: BoxWireService,
-    config: RetryPolicyConfig,
-}
-
-impl Service<Exchange> for RetryPolicyService {
-    type Response = Response<ResponseBody>;
-    type Error = WireError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let network = self.network.clone();
-        let config = self.config.clone();
-        Box::pin(async move {
-            let (mut request, ctx, mut attempt) = exchange.into_parts();
-            let mut policy_trace = request
-                .extensions()
-                .get::<PolicyTraceContext>()
-                .copied()
-                .unwrap_or_default();
-            let retry_snapshot = RetrySnapshot::capture(&request);
-            let mut retries = 0u32;
-
-            loop {
-                request.extensions_mut().insert(policy_trace);
-                let mut svc = network.clone();
-                let result = tower::ServiceExt::ready(&mut svc)
-                    .await
-                    .map_err(|error| WireError::internal("network chain not ready", error))?
-                    .call(Exchange::new(request, ctx.clone(), attempt))
-                    .await;
-
-                match result {
-                    Ok(mut response) => {
-                        response.extensions_mut().insert(AttemptMetadata {
-                            total_attempt: attempt,
-                            retry_count: retries,
-                        });
-                        return Ok(response);
-                    }
-                    Err(error) => {
-                        let Some(reason) = retry_reason(&error) else {
-                            return Err(error);
-                        };
-
-                        if !config.retry_on_connection_failure
-                            || retries as usize >= config.max_retries
-                        {
-                            return Err(error);
-                        }
-
-                        let Some(snapshot) = &retry_snapshot else {
-                            return Err(error);
-                        };
-
-                        retries += 1;
-                        attempt += 1;
-                        policy_trace.retry_count = retries;
-                        ctx.listener().retry(&ctx, retries, reason);
-                        tracing::debug!(
-                            call_id = ctx.call_id().as_u64(),
-                            attempt,
-                            retry_count = policy_trace.retry_count,
-                            redirect_count = policy_trace.redirect_count,
-                            retry_reason = reason,
-                            "retrying request after connection-establishment failure",
-                        );
-                        request = snapshot.to_request(policy_trace)?;
-                    }
-                }
-            }
-        })
-    }
-}
-
-#[derive(Clone)]
-struct RedirectPolicyService {
-    network: BoxWireService,
-    config: RedirectPolicyConfig,
-}
-
-impl Service<Exchange> for RedirectPolicyService {
-    type Response = Response<ResponseBody>;
-    type Error = WireError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let network = self.network.clone();
-        let config = self.config.clone();
-        Box::pin(async move {
-            let (mut request, ctx, initial_attempt) = exchange.into_parts();
-            let mut policy_trace = request
-                .extensions()
-                .get::<PolicyTraceContext>()
-                .copied()
-                .unwrap_or_default();
-            let mut attempt = initial_attempt;
-            let mut redirects = 0u32;
-            let mut total_retries = 0u32;
-
-            loop {
-                validate_request(&request)?;
-                request.extensions_mut().insert(policy_trace);
-                let redirect_snapshot = RedirectSnapshot::capture(&request);
-
-                let mut svc = network.clone();
-                let response = tower::ServiceExt::ready(&mut svc)
-                    .await
-                    .map_err(|error| WireError::internal("network chain not ready", error))?
-                    .call(Exchange::new(request, ctx.clone(), attempt))
-                    .await?;
-
-                let attempt_metadata = response
-                    .extensions()
-                    .get::<AttemptMetadata>()
-                    .copied()
-                    .unwrap_or(AttemptMetadata {
-                        total_attempt: attempt,
-                        retry_count: 0,
-                    });
-                total_retries += attempt_metadata.retry_count;
-
-                if !config.follow_redirects {
-                    return Ok(response_with_attempt_metadata(
-                        response,
-                        attempt_metadata.total_attempt,
-                        total_retries,
-                    ));
-                }
-
-                let Some(location) = response
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                else {
-                    return Ok(response_with_attempt_metadata(
-                        response,
-                        attempt_metadata.total_attempt,
-                        total_retries,
-                    ));
-                };
-
-                if !is_redirect_status(response.status()) {
-                    return Ok(response_with_attempt_metadata(
-                        response,
-                        attempt_metadata.total_attempt,
-                        total_retries,
-                    ));
-                }
-
-                if redirects as usize >= config.max_redirects {
-                    return Err(WireError::redirect(format!(
-                        "too many redirects (max {})",
-                        config.max_redirects
-                    )));
-                }
-
-                let next_uri = resolve_redirect_uri(&redirect_snapshot.uri, location)?;
-                ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
-                let next_attempt = attempt_metadata.total_attempt + 1;
-                policy_trace.retry_count = total_retries;
-                policy_trace.redirect_count = redirects + 1;
-                tracing::debug!(
-                    call_id = ctx.call_id().as_u64(),
-                    attempt = next_attempt,
-                    retry_count = policy_trace.retry_count,
-                    redirect_count = policy_trace.redirect_count,
-                    redirect_location = %next_uri,
-                    "following redirect",
-                );
-
-                request = redirect_snapshot.into_redirect_request(
-                    response.status(),
-                    next_uri,
-                    policy_trace,
-                )?;
-                redirects += 1;
-                attempt = next_attempt;
-            }
-        })
-    }
-}
-
 fn build_service_chain(
     transport: TransportService,
     application_interceptors: Vec<SharedInterceptor>,
@@ -556,211 +405,12 @@ fn build_service_chain(
         InterceptorLayer::new(Arc::new(BridgeInterceptor) as SharedInterceptor).layer(network),
     );
 
-    let retry_policy = RetryPolicyService {
-        network,
-        config: policy.retry,
-    };
-    let redirect_policy = RedirectPolicyService {
-        network: BoxCloneSyncService::new(retry_policy),
-        config: policy.redirect,
-    };
-
-    let mut service: BoxWireService = BoxCloneSyncService::new(redirect_policy);
+    let mut service: BoxWireService =
+        BoxCloneSyncService::new(FollowUpPolicyService::new(network, policy));
     for interceptor in application_interceptors.iter().rev() {
         service =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
     }
 
     service
-}
-
-fn validate_request(request: &Request<RequestBody>) -> Result<(), WireError> {
-    let scheme = request
-        .uri()
-        .scheme_str()
-        .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
-
-    if !matches!(scheme, "http" | "https") {
-        return Err(WireError::invalid_request(
-            "request URI scheme must be http or https",
-        ));
-    }
-
-    if request.uri().host().is_none() {
-        return Err(WireError::invalid_request("request URI is missing a host"));
-    }
-
-    Ok(())
-}
-
-fn is_redirect_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    )
-}
-
-fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri, WireError> {
-    let base = Url::parse(&base.to_string())
-        .map_err(|error| WireError::redirect(format!("invalid base URL for redirect: {error}")))?;
-    let joined = base
-        .join(location)
-        .map_err(|error| WireError::redirect(format!("invalid redirect URL: {error}")))?;
-    joined
-        .as_str()
-        .parse::<Uri>()
-        .map_err(|error| WireError::redirect(format!("failed to parse redirect URI: {error}")))
-}
-
-struct RedirectSnapshot {
-    method: Method,
-    uri: Uri,
-    version: Version,
-    headers: HeaderMap,
-    body: Option<RequestBody>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AttemptMetadata {
-    total_attempt: u32,
-    retry_count: u32,
-}
-
-struct RetrySnapshot {
-    method: Method,
-    uri: Uri,
-    version: Version,
-    headers: HeaderMap,
-    body: Option<RequestBody>,
-}
-
-impl RetrySnapshot {
-    fn capture(request: &Request<RequestBody>) -> Option<Self> {
-        let body = request.body().try_clone()?;
-        Some(Self {
-            method: request.method().clone(),
-            uri: request.uri().clone(),
-            version: request.version(),
-            headers: request.headers().clone(),
-            body: Some(body),
-        })
-    }
-
-    fn to_request(
-        &self,
-        policy_trace: PolicyTraceContext,
-    ) -> Result<Request<RequestBody>, WireError> {
-        let body = self
-            .body
-            .as_ref()
-            .and_then(RequestBody::try_clone)
-            .expect("captured replayable body must remain replayable");
-        let mut request = Request::builder()
-            .method(self.method.clone())
-            .uri(self.uri.clone())
-            .version(self.version)
-            .body(body)?;
-        *request.headers_mut() = self.headers.clone();
-        request.extensions_mut().insert(policy_trace);
-        Ok(request)
-    }
-}
-
-impl RedirectSnapshot {
-    fn capture(request: &Request<RequestBody>) -> Self {
-        Self {
-            method: request.method().clone(),
-            uri: request.uri().clone(),
-            version: request.version(),
-            headers: request.headers().clone(),
-            body: request.body().try_clone(),
-        }
-    }
-
-    fn into_redirect_request(
-        self,
-        status: StatusCode,
-        next_uri: Uri,
-        policy_trace: PolicyTraceContext,
-    ) -> Result<Request<RequestBody>, WireError> {
-        let same_authority = same_authority(&self.uri, &next_uri);
-        let should_switch_to_get = matches!(
-            status,
-            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
-        ) && self.method != Method::GET
-            && self.method != Method::HEAD;
-
-        let preserve_body = matches!(
-            status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-        );
-
-        let body = if preserve_body {
-            self.body.ok_or_else(|| {
-                WireError::redirect("cannot follow redirect for a non-replayable request body")
-            })?
-        } else if should_switch_to_get {
-            RequestBody::empty()
-        } else {
-            self.body.unwrap_or_else(RequestBody::empty)
-        };
-
-        let method = if preserve_body {
-            self.method
-        } else if should_switch_to_get {
-            Method::GET
-        } else {
-            self.method
-        };
-
-        let mut headers = self.headers;
-        headers.remove(HOST);
-        if !same_authority {
-            headers.remove(AUTHORIZATION);
-            headers.remove(PROXY_AUTHORIZATION);
-        }
-        if should_switch_to_get {
-            headers.remove(CONTENT_LENGTH);
-            headers.remove(CONTENT_TYPE);
-        }
-
-        let mut request = Request::builder()
-            .method(method)
-            .uri(next_uri)
-            .version(self.version)
-            .body(body)?;
-        *request.headers_mut() = headers;
-        request.extensions_mut().insert(policy_trace);
-        Ok(request)
-    }
-}
-
-fn same_authority(left: &Uri, right: &Uri) -> bool {
-    left.scheme_str() == right.scheme_str() && left.authority() == right.authority()
-}
-
-fn response_with_attempt_metadata(
-    mut response: Response<ResponseBody>,
-    total_attempt: u32,
-    retry_count: u32,
-) -> Response<ResponseBody> {
-    response.extensions_mut().insert(AttemptMetadata {
-        total_attempt,
-        retry_count,
-    });
-    response
-}
-
-fn retry_reason(error: &WireError) -> Option<&'static str> {
-    match error.kind() {
-        WireErrorKind::Dns => Some("dns"),
-        WireErrorKind::Connect => Some("connect"),
-        WireErrorKind::Tls => Some("tls"),
-        WireErrorKind::Timeout if error.is_connect_timeout() => Some("connect_timeout"),
-        _ => None,
-    }
 }
