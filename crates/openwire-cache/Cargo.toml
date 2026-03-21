@@ -1,0 +1,20 @@
+[package]
+name = "openwire-cache"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+openwire = { path = "../openwire" }
+tokio.workspace = true
+
+[dev-dependencies]
+hyper.workspace = true
+openwire-rustls = { path = "../openwire-rustls" }
+openwire-test = { path = "../openwire-test" }

@@ -36,6 +36,7 @@ Build vs adopt:
 ```text
 openwire/
 ├── crates/openwire          public API, policy layer, transport integration
+├── crates/openwire-cache    application-layer HTTP cache interceptor + store traits
 ├── crates/openwire-core     shared primitives: body, error, event, interceptor,
 │                            runtime, transport traits
 ├── crates/openwire-rustls   optional Rustls TLS connector
@@ -50,7 +51,7 @@ Layering rules:
 - `openwire-core` contains no retry, redirect, auth, cookie, proxy, or cache policy
 - `openwire` owns public API and built-in policy behavior
 - `openwire-rustls` stays swappable behind `TlsConnector`
-- future cache remains a dedicated crate, not transport logic
+- cache remains a dedicated crate, not transport logic
 
 ## 3. Ownership Strategy
 
@@ -230,8 +231,10 @@ Ownership split:
 First-milestone rules:
 
 - these rules are frozen for the initial self-owned connection-core slice
-- exact `Address` equality for reuse
-- no broad connection coalescing
+- exact `Address` equality remains the first pool-lookup path
+- direct HTTPS HTTP/2 may coalesce beyond exact `Address` only when the peer
+  certificate SANs authorize the requested authority and the resolved route
+  candidates overlap the connected remote address
 - conservative HTTP/2 multiplex accounting
 - no speculative preconnect
 - no HTTP/3 and no HTTP/3-shaped connection-core abstractions
@@ -295,7 +298,10 @@ HTTP/2:
 Important baseline details to preserve during migration:
 
 - cookie and auth behavior currently lives in the follow-up coordinator, not in transport
-- exact-address derivation and pool lookup now happen in `TransportService` via `ExchangeFinder`
+- exact-address derivation and first-stage pool lookup now happen in
+  `TransportService` via `ExchangeFinder`
+- direct HTTPS HTTP/2 misses may perform a second-stage post-DNS coalesced
+  lookup against verified certificate SANs plus route overlap before dialing
 - pool hits now execute through OpenWire-owned bound connection handles instead
   of a separate runtime pool
 - `RoutePlanner` now owns direct-vs-proxy route selection and proxy endpoint
@@ -455,7 +461,7 @@ Not in scope until the owned connection core is stable:
 - multipart helpers
 - response decompression policy
 - speculative connection warming
-- broad connection coalescing
+- full general connection coalescing beyond the current direct HTTPS HTTP/2 slice
 - general middleware crate split
 - full OpenTelemetry integration
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::stream;
 use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT};
-use http::{Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use openwire::{
     AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, EstablishmentStage,
@@ -19,8 +19,8 @@ use openwire::{
 };
 use openwire_core::BoxConnection;
 use openwire_test::{
-    collect_request_body, ok_text, spawn_http1, spawn_https_http1, RecordingEventListenerFactory,
-    StaticDnsResolver,
+    collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
+    RecordingEventListenerFactory, StaticDnsResolver,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -1051,6 +1051,195 @@ async fn shared_client_reuses_connection_pool_across_calls() {
 }
 
 #[tokio::test]
+async fn shared_client_coalesces_https_http2_connections_across_verified_authorities() {
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], |_request| async move {
+        ok_text("coalesced h2")
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response_one.version(), Version::HTTP_2);
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let response_two = client
+        .execute(empty_request(format!(
+            "https://b.test:{}/second",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response_two.version(), Version::HTTP_2);
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_two.into_body().text().await.expect("body");
+
+    assert_eq!(connection_one, connection_two);
+    assert_eq!(
+        events
+            .events()
+            .into_iter()
+            .filter(|event| event.starts_with("connect_end "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn https_http2_coalescing_requires_route_overlap() {
+    let server_one = spawn_https_http2_with_hosts(&["a.test", "b.test"], |_request| async move {
+        ok_text("first h2")
+    })
+    .await;
+    let server_two =
+        spawn_https_http2_with_hosts(&["b.test"], |_request| async move { ok_text("second h2") })
+            .await;
+    let roots = format!(
+        "{}\n{}",
+        server_one.tls_root_pem().expect("root pem"),
+        server_two.tls_root_pem().expect("root pem"),
+    );
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server_one.addr()),
+            ("b.test".to_owned(), server_two.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(roots)
+                .expect("root certs")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server_one.addr().port()
+        )))
+        .await
+        .expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let response_two = client
+        .execute(empty_request(format!(
+            "https://b.test:{}/second",
+            server_two.addr().port()
+        )))
+        .await
+        .expect("response");
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_two.into_body().text().await.expect("body");
+
+    assert_ne!(connection_one, connection_two);
+    assert_eq!(body, "second h2");
+    assert_eq!(
+        events
+            .events()
+            .into_iter()
+            .filter(|event| event.starts_with("connect_end "))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn pool_lookup_events_report_miss_then_hit_for_reused_connections() {
+    let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/first")))
+        .await
+        .expect("response");
+    let connection_id = response
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response.into_body().text().await.expect("body");
+
+    let response = client
+        .execute(empty_request(server.http_url("/second")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "call_start GET",
+            "pool_miss",
+            "dns_start",
+            "connect_end",
+            "connection_acquired ",
+            "connection_released ",
+            "call_start GET",
+            "pool_hit ",
+            "connection_acquired ",
+            "connection_released ",
+        ],
+    );
+    assert!(
+        events.iter().any(|event| event == "pool_miss"),
+        "events = {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("pool_hit {}", connection_id.as_u64())),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
 async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
     let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
     let trace = TraceCapture::default();
@@ -1090,6 +1279,11 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
         Some("0")
     );
     assert_eq!(
+        spans[0].fields.get("pool_hit").map(String::as_str),
+        Some("false")
+    );
+    assert!(!spans[0].fields.contains_key("pool_connection_id"));
+    assert_eq!(
         spans[0].fields.get("connection_reused").map(String::as_str),
         Some("false")
     );
@@ -1102,6 +1296,15 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
         Some("0")
     );
     assert_eq!(
+        spans[1].fields.get("pool_hit").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        spans[1].fields.get("pool_connection_id"),
+        spans[1].fields.get("connection_id"),
+        "spans = {spans:?}",
+    );
+    assert_eq!(
         spans[1].fields.get("connection_reused").map(String::as_str),
         Some("true")
     );
@@ -1112,7 +1315,7 @@ async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn fast_fallback_dual_stack_routes_emit_observability_and_reduce_latency() {
     let server = spawn_http1(|_request| async move { ok_text("dual-stack race") }).await;
     let fake_ipv6 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0], 9001));
@@ -1177,9 +1380,9 @@ async fn fast_fallback_dual_stack_routes_emit_observability_and_reduce_latency()
         ],
     );
 
-    let planned = trace
-        .event_by_message("planned direct connect routes")
-        .expect("planned route trace event");
+    let spans = trace.spans_named("openwire.attempt");
+    assert_eq!(spans.len(), 1, "spans = {spans:?}");
+    let planned = &spans[0];
     assert_eq!(
         planned.fields.get("route_count").map(String::as_str),
         Some("2")
@@ -1196,15 +1399,11 @@ async fn fast_fallback_dual_stack_routes_emit_observability_and_reduce_latency()
         .get("connect_race_id")
         .cloned()
         .expect("planned route trace race id");
-
-    let winner = trace
-        .event_by_message("fast fallback connect attempt won")
-        .expect("winner trace event");
+    assert!(!planned_race_id.is_empty(), "spans = {spans:?}");
     assert_eq!(
-        winner.fields.get("route_index").map(String::as_str),
+        planned.fields.get("connect_winner").map(String::as_str),
         Some("1")
     );
-    assert_eq!(winner.fields.get("connect_race_id"), Some(&planned_race_id),);
 }
 
 #[tokio::test]
@@ -3166,10 +3365,16 @@ async fn with_trace_capture<F, T>(trace: &TraceCapture, future: F) -> T
 where
     F: Future<Output = T>,
 {
+    let _guard = trace_capture_lock().lock().await;
     let subscriber = tracing_subscriber::registry().with(trace.clone());
     future
         .with_subscriber(tracing::Dispatch::new(subscriber))
         .await
+}
+
+fn trace_capture_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
 impl<S> Layer<S> for TraceCapture

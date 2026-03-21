@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use openwire_core::{next_connection_id, ConnectionId};
+use openwire_core::{next_connection_id, CoalescingInfo, ConnectionId};
 
 use super::{Address, Route};
 
@@ -48,6 +48,7 @@ struct RealConnectionInner {
     address: Address,
     route: Route,
     protocol: ConnectionProtocol,
+    coalescing: CoalescingInfo,
     state: Mutex<RealConnectionState>,
 }
 
@@ -65,12 +66,22 @@ impl RealConnection {
     }
 
     pub(crate) fn with_id(id: ConnectionId, route: Route, protocol: ConnectionProtocol) -> Self {
+        Self::with_id_and_coalescing(id, route, protocol, CoalescingInfo::default())
+    }
+
+    pub(crate) fn with_id_and_coalescing(
+        id: ConnectionId,
+        route: Route,
+        protocol: ConnectionProtocol,
+        coalescing: CoalescingInfo,
+    ) -> Self {
         Self {
             inner: Arc::new(RealConnectionInner {
                 id,
                 address: route.address().clone(),
                 route,
                 protocol,
+                coalescing,
                 state: Mutex::new(RealConnectionState {
                     health: ConnectionHealth::Healthy,
                     allocations: 0,
@@ -95,6 +106,10 @@ impl RealConnection {
 
     pub(crate) fn protocol(&self) -> ConnectionProtocol {
         self.inner.protocol
+    }
+
+    pub(crate) fn coalescing(&self) -> &CoalescingInfo {
+        &self.inner.coalescing
     }
 
     pub(crate) fn snapshot(&self) -> RealConnectionSnapshot {
@@ -160,6 +175,12 @@ impl RealConnection {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.snapshot().health == ConnectionHealth::Closed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_since_for_test(&self, idle_since: Option<Instant>) {
+        let mut state = self.inner.state.lock().expect("real connection lock");
+        state.idle_since = idle_since;
     }
 }
 

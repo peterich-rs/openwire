@@ -196,11 +196,11 @@ The goal is to preserve and extend the current strong debugging story.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P12-001 | `TODO` | Add pool hit / miss events and trace fields | P5-001 | Event and tracing tests cover pool lookup results |
-| P12-002 | `TODO` | Add route planning and connect-race observability | P6-001 | Fast-fallback tests assert route fields and winner events |
-| P12-003 | `TODO` | Add warm-path and cold-connect benchmarks for the owned connection core | P7-001 | Benchmarks cover warm H1/H2 plus cold route racing |
-| P12-004 | `TODO` | Add concurrent client usage tests with owned pool and HTTP/2 multiplex reuse | P9-002 | Tests pass under concurrent load without race regressions |
-| P12-005 | `TODO` | Add idle eviction timing tests for the owned pool | P8-004 | Deterministic tests cover eviction behavior |
+| P12-001 | `DONE` | Add pool hit / miss events and trace fields | P5-001 | Event and tracing tests now cover pool lookup miss/hit results and reserved connection IDs; `cargo test -p openwire pool_lookup`; `cargo test -p openwire tracing_attempt_spans_record_stable_connection_reuse_fields` |
+| P12-002 | `DONE` | Add route planning and connect-race observability | P6-001 | Fast-fallback integration tests assert route-plan events plus connect-race trace fields and winner/loser events; `cargo test -p openwire fast_fallback_` |
+| P12-003 | `DONE` | Add warm-path and cold-connect benchmarks for the owned connection core | P7-001 | Criterion bench now covers warm HTTP/1.1, warm HTTPS HTTP/2, concurrent HTTPS HTTP/2, and cold HTTP/1.1 fast-fallback route racing; `cargo bench -p openwire --bench perf_baseline -- --noplot` |
+| P12-004 | `DONE` | Add concurrent client usage tests with owned pool and HTTP/2 multiplex reuse | P9-002 | Shared-client HTTP/2 multiplex reuse remains covered under concurrent load; `cargo test -p openwire --test performance_baseline` |
+| P12-005 | `DONE` | Add idle eviction timing tests for the owned pool | P8-004 | Deterministic pool tests now cover pre-timeout retention, post-timeout eviction, and max-idle ordering without sleeps; `cargo test -p openwire pool_` |
 
 ## Phase 13: `hyper-util` Runtime-Path Removal
 
@@ -210,8 +210,8 @@ path.
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
 | P13-001 | `DONE` | Remove `hyper_util::client::legacy::Client` from `TransportService` | P7-001, P8-002, P9-002 | Runtime request path no longer builds through legacy client |
-| P13-002 | `TODO` | Remove now-unused `hyper-util` client-side feature flags from crate manifests | P13-001 | Dependency graph reduced and verified |
-| P13-003 | `TODO` | Audit remaining `hyper-util` usage and keep only intentionally retained adapters or remove the crate entirely | P13-001 | Manifest and code references match the design decision |
+| P13-002 | `DONE` | Remove now-unused `hyper-util` client-side feature flags from crate manifests | P13-001 | Workspace manifest now disables default features and keeps only `client-legacy`; dependency graph verified with `cargo tree -e features --workspace | rg "hyper-util"` |
+| P13-003 | `DONE` | Audit remaining `hyper-util` usage and keep only intentionally retained adapters or remove the crate entirely | P13-001 | Remaining direct usage is limited to `client::legacy::connect::{Connection, Connected}` in OpenWire-owned connector/TLS shims and test doubles; unused `hyper-rustls` manifest dependency removed; `cargo test --workspace --tests --no-run`; `cargo test -p openwire --tests`; `cargo bench -p openwire --bench perf_baseline --no-run` |
 | P13-004 | `DONE` | Refresh README and docs to reflect the new owned connection core baseline | P13-001 | Documentation no longer describes legacy client as the runtime core |
 
 ## Phase 14: Deferred Work
@@ -220,8 +220,8 @@ These items remain intentionally outside the near-term execution path.
 
 | ID | Status | Task | Depends On | Exit Criteria / Verification |
 |---|---|---|---|---|
-| P14-001 | `DEFERRED` | Broad connection coalescing beyond exact-address reuse | P9-002 | Resume only after the owned pool is stable |
-| P14-002 | `DEFERRED` | HTTP cache crate (`openwire-cache`) on top of the owned connection core | P13-001 | Resume after pool/acquisition ownership lands |
+| P14-001 | `DONE` | Broad connection coalescing beyond exact-address reuse | P9-002 | Conservative direct-route HTTPS HTTP/2 coalescing now reuses connections across verified authorities when certificate SANs authorize the target host and the resolved route plan overlaps the connected remote address; `cargo test -p openwire coalesc`; `cargo test -p openwire --tests`; `cargo test --workspace --tests --no-run`; `cargo bench -p openwire --bench perf_baseline --no-run` |
+| P14-002 | `DONE` | HTTP cache crate (`openwire-cache`) on top of the owned connection core | P13-001 | `openwire-cache` now provides an application-layer cache interceptor plus in-memory store for fresh `GET 200` responses with explicit `Cache-Control: max-age`; `cargo test -p openwire-cache -- --nocapture` |
 | P14-003 | `DEFERRED` | SOCKS support beyond route planning groundwork | P10-005 | Resume after proxy route ownership is stable |
 | P14-004 | `DEFERRED` | HTTP/3 | None | No work before connection core stabilization |
 | P14-005 | `DEFERRED` | Serde / JSON convenience helpers | None | No work before connection core stabilization |
@@ -230,16 +230,13 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P12-005`
-2. `P12-001` through `P12-004`
-3. `P13-002` and `P13-003`
+1. `P14-003`
+2. `P14-004`
+3. `P14-005`
 
 Rationale:
 
-- route-aware internal error classification is now landed, so the next
-  correctness gap is deterministic eviction coverage and broader observability
-  hardening
-- idle eviction now exists, but deterministic timing coverage still needs to be
-  added explicitly
-- runtime-path ownership is landed, so the next dependency cleanup is removing
-  now-unneeded `hyper-util` client-side flags and auditing the remaining shim
+- the first two deferred follow-ups are now landed: conservative HTTPS HTTP/2
+  coalescing and a dedicated cache crate
+- SOCKS, HTTP/3, and convenience helpers are now the only unfinished roadmap
+  items

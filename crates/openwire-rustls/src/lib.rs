@@ -6,7 +6,8 @@ use std::task::{Context, Poll};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    BoxConnection, BoxFuture, CallContext, ConnectionInfo, TlsConnector, TokioIo, WireError,
+    BoxConnection, BoxFuture, CallContext, CoalescingInfo, ConnectionInfo, TlsConnector, TokioIo,
+    WireError,
 };
 use pin_project_lite::pin_project;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -14,6 +15,7 @@ use rustls::{ClientConfig, RootCertStore};
 #[cfg(feature = "platform-verifier")]
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio_rustls::client::TlsStream;
+use webpki::EndEntityCert;
 
 #[derive(Clone)]
 pub struct RustlsTlsConnector {
@@ -158,6 +160,7 @@ impl TlsConnector for RustlsTlsConnector {
                 .alpn_protocol()
                 .map(|protocol| protocol == b"h2")
                 .unwrap_or(false);
+            let coalescing = coalescing_info_from_session(tls_stream.get_ref().1);
 
             ctx.listener().tls_end(&ctx, &host);
 
@@ -167,6 +170,7 @@ impl TlsConnector for RustlsTlsConnector {
                     tls: true,
                     ..connection_info
                 },
+                coalescing,
                 negotiated_h2,
             }) as BoxConnection)
         })
@@ -178,13 +182,16 @@ pin_project! {
         #[pin]
         inner: TokioIo<TlsStream<TokioIo<BoxConnection>>>,
         info: ConnectionInfo,
+        coalescing: CoalescingInfo,
         negotiated_h2: bool,
     }
 }
 
 impl Connection for RustlsConnection {
     fn connected(&self) -> Connected {
-        let connected = Connected::new().extra(self.info.clone());
+        let connected = Connected::new()
+            .extra(self.info.clone())
+            .extra(self.coalescing.clone());
         if self.negotiated_h2 {
             connected.negotiated_h2()
         } else {
@@ -265,6 +272,30 @@ fn connection_info_from_stream(stream: &dyn openwire_core::ConnectionIo) -> Conn
             local_addr: None,
             tls: false,
         })
+}
+
+fn coalescing_info_from_session(session: &rustls::ClientConnection) -> CoalescingInfo {
+    let Some(end_entity) = session.peer_certificates().and_then(|certs| certs.first()) else {
+        return CoalescingInfo::default();
+    };
+
+    let parsed = match EndEntityCert::try_from(end_entity) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::debug!(
+                ?error,
+                "failed to parse peer certificate for coalescing metadata"
+            );
+            return CoalescingInfo::default();
+        }
+    };
+
+    CoalescingInfo::new(
+        parsed
+            .valid_dns_names()
+            .map(|name| name.to_ascii_lowercase())
+            .collect(),
+    )
 }
 
 #[cfg(test)]

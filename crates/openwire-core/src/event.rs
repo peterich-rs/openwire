@@ -34,6 +34,8 @@ pub trait EventListener: Send + Sync + 'static {
     fn response_body_end(&self, _ctx: &CallContext, _bytes_read: u64) {}
     fn response_body_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
+    fn pool_lookup(&self, _ctx: &CallContext, _hit: bool, _connection_id: Option<ConnectionId>) {}
+
     fn connection_acquired(&self, _ctx: &CallContext, _connection_id: ConnectionId, _reused: bool) {
     }
 

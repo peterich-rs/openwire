@@ -65,7 +65,7 @@ where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = TestResponse> + Send + 'static,
 {
-    let tls = tls_acceptor_with_alpn(vec![b"http/1.1".to_vec()]);
+    let tls = tls_acceptor_with_alpn_and_hosts(vec![b"http/1.1".to_vec()], &["localhost"]);
     spawn_server(handler, Some(tls), TestProtocol::Http1).await
 }
 
@@ -74,7 +74,16 @@ where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = TestResponse> + Send + 'static,
 {
-    let tls = tls_acceptor_with_alpn(vec![b"h2".to_vec()]);
+    let tls = tls_acceptor_with_alpn_and_hosts(vec![b"h2".to_vec()], &["localhost"]);
+    spawn_server(handler, Some(tls), TestProtocol::Http2).await
+}
+
+pub async fn spawn_https_http2_with_hosts<F, Fut>(hosts: &[&str], handler: F) -> TestServer
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = TestResponse> + Send + 'static,
+{
+    let tls = tls_acceptor_with_alpn_and_hosts(vec![b"h2".to_vec()], hosts);
     spawn_server(handler, Some(tls), TestProtocol::Http2).await
 }
 
@@ -172,6 +181,16 @@ impl EventListener for RecordingEventListener {
 
     fn response_body_end(&self, _ctx: &CallContext, bytes_read: u64) {
         self.push(format!("response_body_end {bytes_read}"));
+    }
+
+    fn pool_lookup(&self, _ctx: &CallContext, hit: bool, connection_id: Option<ConnectionId>) {
+        match (hit, connection_id) {
+            (true, Some(connection_id)) => {
+                self.push(format!("pool_hit {}", connection_id.as_u64()));
+            }
+            (true, None) => self.push("pool_hit"),
+            (false, _) => self.push("pool_miss"),
+        }
     }
 
     fn connection_acquired(&self, _ctx: &CallContext, connection_id: ConnectionId, reused: bool) {
@@ -350,9 +369,17 @@ enum TestProtocol {
     Http2,
 }
 
-fn tls_acceptor_with_alpn(alpn_protocols: Vec<Vec<u8>>) -> (tokio_rustls::TlsAcceptor, String) {
-    let cert = generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("failed to create self-signed certificate");
+fn tls_acceptor_with_alpn_and_hosts(
+    alpn_protocols: Vec<Vec<u8>>,
+    hosts: &[&str],
+) -> (tokio_rustls::TlsAcceptor, String) {
+    let cert = generate_simple_self_signed(
+        hosts
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .expect("failed to create self-signed certificate");
     let cert_der: CertificateDer<'static> = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let mut config = rustls::ServerConfig::builder()

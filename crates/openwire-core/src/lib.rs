@@ -23,7 +23,8 @@ pub use interceptor::{
 pub use runtime::Runtime;
 pub use tokio_rt::{TokioExecutor, TokioIo, TokioRuntime, TokioTimer};
 pub use transport::{
-    BoxConnection, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector, TlsConnector,
+    BoxConnection, CoalescingInfo, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector,
+    TlsConnector,
 };
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

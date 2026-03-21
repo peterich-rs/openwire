@@ -654,24 +654,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyper-rustls"
-version = "0.27.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
-dependencies = [
- "http",
- "hyper",
- "hyper-util",
- "log",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tower-service",
-]
-
-[[package]]
 name = "hyper-util"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1048,6 +1030,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openwire-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "hyper",
+ "openwire",
+ "openwire-rustls",
+ "openwire-test",
+ "tokio",
+]
+
+[[package]]
 name = "openwire-core"
 version = "0.1.0"
 dependencies = [
@@ -1075,7 +1071,6 @@ dependencies = [
  "futures-util",
  "http",
  "hyper",
- "hyper-rustls",
  "hyper-util",
  "openwire-core",
  "pin-project-lite",
@@ -1083,6 +1078,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-platform-verifier",
+ "rustls-webpki",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1408,9 +1404,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",

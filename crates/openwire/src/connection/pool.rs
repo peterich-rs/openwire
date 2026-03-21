@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use openwire_core::ConnectionId;
 
-use super::{Address, ConnectionAllocationState, ConnectionProtocol, RealConnection};
+use super::{
+    Address, ConnectionAllocationState, ConnectionProtocol, ProtocolPolicy, RealConnection, Route,
+    RouteKind, RoutePlan, UriScheme,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PoolSettings {
@@ -62,6 +65,47 @@ impl ConnectionPool {
 
         let connections = pool.get_mut(address)?;
         connections.iter().find(|conn| conn.try_acquire()).cloned()
+    }
+
+    pub(crate) fn acquire_coalesced(
+        &self,
+        address: &Address,
+        route_plan: &RoutePlan,
+    ) -> Option<RealConnection> {
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        let keys = pool.keys().cloned().collect::<Vec<_>>();
+        let mut empty_keys = Vec::new();
+
+        for key in keys {
+            let Some(connections) = pool.get_mut(&key) else {
+                continue;
+            };
+
+            prune_connections(&self.settings, connections);
+            if connections.is_empty() {
+                empty_keys.push(key);
+                continue;
+            }
+
+            if let Some(connection) = connections
+                .iter()
+                .find(|connection| {
+                    can_coalesce(connection, address, route_plan) && connection.try_acquire()
+                })
+                .cloned()
+            {
+                for key in empty_keys {
+                    pool.remove(&key);
+                }
+                return Some(connection);
+            }
+        }
+
+        for key in empty_keys {
+            pool.remove(&key);
+        }
+
+        None
     }
 
     pub(crate) fn release(&self, connection: &RealConnection) -> bool {
@@ -198,6 +242,74 @@ fn idle_http1_expired(connection: &RealConnection, timeout: Duration) -> bool {
             .is_some_and(|idle_since| idle_since.elapsed() >= timeout)
 }
 
+fn can_coalesce(connection: &RealConnection, request: &Address, route_plan: &RoutePlan) -> bool {
+    if connection.protocol() != ConnectionProtocol::Http2
+        || !request_allows_h2_coalescing(request)
+        || !connection_allows_h2_coalescing(connection)
+    {
+        return false;
+    }
+
+    let existing = connection.address();
+    if existing.authority().port() != request.authority().port() {
+        return false;
+    }
+
+    let host_matches = existing.authority().host() == request.authority().host()
+        || connection
+            .coalescing()
+            .verified_server_names
+            .iter()
+            .any(|name| verified_server_name_matches(name, request.authority().host()));
+    if !host_matches {
+        return false;
+    }
+
+    route_overlap(connection.route(), route_plan)
+}
+
+fn request_allows_h2_coalescing(address: &Address) -> bool {
+    address.scheme() == UriScheme::Https
+        && address.proxy().is_none()
+        && !matches!(address.protocol_policy(), ProtocolPolicy::Http1Only)
+}
+
+fn connection_allows_h2_coalescing(connection: &RealConnection) -> bool {
+    let address = connection.address();
+    address.scheme() == UriScheme::Https && address.proxy().is_none()
+}
+
+fn route_overlap(connection_route: &Route, route_plan: &RoutePlan) -> bool {
+    let RouteKind::Direct {
+        target: existing_target,
+    } = connection_route.kind()
+    else {
+        return false;
+    };
+
+    route_plan.iter().any(|route| {
+        matches!(
+            route.kind(),
+            RouteKind::Direct { target } if target == existing_target
+        )
+    })
+}
+
+fn verified_server_name_matches(pattern: &str, host: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
+
+    !prefix.is_empty() && prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+}
+
 fn enforce_max_idle_http1(max_idle_per_address: usize, connections: &mut Vec<RealConnection>) {
     if max_idle_per_address == usize::MAX {
         return;
@@ -244,25 +356,34 @@ fn enforce_max_idle_http1(max_idle_per_address: usize, connections: &mut Vec<Rea
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use openwire_core::CoalescingInfo;
 
     use super::{ConnectionPool, PoolSettings, PoolStats};
     use crate::connection::{
         Address, AuthorityKey, ConnectionAllocationState, ConnectionProtocol, DnsPolicy,
         ProtocolPolicy, ProxyConfig, ProxyEndpoint, ProxyMode, ProxyScheme, RealConnection, Route,
-        UriScheme,
+        RoutePlan, UriScheme,
     };
 
-    fn address_with_proxy(proxy: Option<ProxyConfig>) -> Address {
+    fn address_for_host(
+        host: &str,
+        proxy: Option<ProxyConfig>,
+        protocol_policy: ProtocolPolicy,
+    ) -> Address {
         Address::new(
             UriScheme::Https,
-            AuthorityKey::new("example.com", 443),
+            AuthorityKey::new(host, 443),
             proxy,
-            Some(crate::connection::TlsIdentity::new("example.com")),
-            ProtocolPolicy::Http1OrHttp2,
+            Some(crate::connection::TlsIdentity::new(host)),
+            protocol_policy,
             DnsPolicy::System,
         )
+    }
+
+    fn address_with_proxy(proxy: Option<ProxyConfig>) -> Address {
+        address_for_host("example.com", proxy, ProtocolPolicy::Http1OrHttp2)
     }
 
     fn make_connection(address: Address, last_octet: u8) -> RealConnection {
@@ -274,11 +395,30 @@ mod tests {
         last_octet: u8,
         protocol: ConnectionProtocol,
     ) -> RealConnection {
+        make_connection_with_protocol_and_coalescing(address, last_octet, protocol, &[])
+    }
+
+    fn make_connection_with_protocol_and_coalescing(
+        address: Address,
+        last_octet: u8,
+        protocol: ConnectionProtocol,
+        verified_server_names: &[&str],
+    ) -> RealConnection {
         let route = Route::direct(
             address,
             SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 443)),
         );
-        RealConnection::new(route, protocol)
+        RealConnection::with_id_and_coalescing(
+            openwire_core::next_connection_id(),
+            route,
+            protocol,
+            CoalescingInfo::new(
+                verified_server_names
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+            ),
+        )
     }
 
     #[test]
@@ -371,19 +511,146 @@ mod tests {
     }
 
     #[test]
+    fn pool_coalesces_direct_https_http2_connections_for_verified_authorities() {
+        let first = address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2);
+        let second = address_for_host("b.test", None, ProtocolPolicy::Http1OrHttp2);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection = make_connection_with_protocol_and_coalescing(
+            first,
+            41,
+            ConnectionProtocol::Http2,
+            &["a.test", "b.test"],
+        );
+        let connection_id = connection.id();
+        pool.insert(connection);
+
+        let route_plan = RoutePlan::new(
+            vec![Route::direct(
+                second.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 41), 443)),
+            )],
+            Duration::from_millis(250),
+        );
+
+        assert_eq!(
+            pool.acquire_coalesced(&second, &route_plan)
+                .map(|connection| connection.id()),
+            Some(connection_id)
+        );
+    }
+
+    #[test]
+    fn pool_rejects_coalescing_without_verified_origin_route_overlap_or_direct_h2() {
+        let second = address_for_host("b.test", None, ProtocolPolicy::Http1OrHttp2);
+        let matching_route_plan = RoutePlan::new(
+            vec![Route::direct(
+                second.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 443)),
+            )],
+            Duration::from_millis(250),
+        );
+        let mismatched_route_plan = RoutePlan::new(
+            vec![Route::direct(
+                second.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 99), 443)),
+            )],
+            Duration::from_millis(250),
+        );
+
+        let unverified_pool = ConnectionPool::new(PoolSettings::default());
+        unverified_pool.insert(make_connection_with_protocol_and_coalescing(
+            address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2),
+            42,
+            ConnectionProtocol::Http2,
+            &["a.test"],
+        ));
+        assert!(unverified_pool
+            .acquire_coalesced(&second, &matching_route_plan)
+            .is_none());
+
+        let route_miss_pool = ConnectionPool::new(PoolSettings::default());
+        route_miss_pool.insert(make_connection_with_protocol_and_coalescing(
+            address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2),
+            42,
+            ConnectionProtocol::Http2,
+            &["a.test", "b.test"],
+        ));
+        assert!(route_miss_pool
+            .acquire_coalesced(&second, &mismatched_route_plan)
+            .is_none());
+
+        let proxy_pool = ConnectionPool::new(PoolSettings::default());
+        proxy_pool.insert(make_connection_with_protocol_and_coalescing(
+            address_for_host(
+                "a.test",
+                Some(ProxyConfig::new(
+                    ProxyMode::Connect,
+                    ProxyEndpoint::new(ProxyScheme::Http, "proxy.internal", 8080),
+                )),
+                ProtocolPolicy::Http1OrHttp2,
+            ),
+            42,
+            ConnectionProtocol::Http2,
+            &["a.test", "b.test"],
+        ));
+        assert!(proxy_pool
+            .acquire_coalesced(&second, &matching_route_plan)
+            .is_none());
+
+        let http1_only = address_for_host("b.test", None, ProtocolPolicy::Http1Only);
+        let policy_pool = ConnectionPool::new(PoolSettings::default());
+        policy_pool.insert(make_connection_with_protocol_and_coalescing(
+            address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2),
+            42,
+            ConnectionProtocol::Http2,
+            &["a.test", "b.test"],
+        ));
+        assert!(policy_pool
+            .acquire_coalesced(&http1_only, &matching_route_plan)
+            .is_none());
+    }
+
+    #[test]
     fn pool_evicts_idle_http1_connections_after_timeout() {
         let address = address_with_proxy(None);
         let pool = ConnectionPool::new(PoolSettings {
-            idle_timeout: Some(Duration::ZERO),
+            idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
         });
         let connection = make_connection(address.clone(), 12);
         let connection_id = connection.id();
-        pool.insert(connection);
+        pool.insert(connection.clone());
+        connection.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(6)));
 
         assert!(pool.acquire(&address).is_none());
         assert_eq!(pool.stats(&address), PoolStats::default());
         assert!(pool.remove(connection_id).is_none());
+    }
+
+    #[test]
+    fn pool_keeps_idle_http1_connections_before_timeout() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_idle_per_address: usize::MAX,
+        });
+        let connection = make_connection(address.clone(), 13);
+        let connection_id = connection.id();
+        pool.insert(connection.clone());
+        connection.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(2)));
+
+        assert_eq!(
+            pool.stats(&address),
+            PoolStats {
+                total: 1,
+                idle: 1,
+                in_use: 0,
+            }
+        );
+        assert_eq!(
+            pool.acquire(&address).map(|connection| connection.id()),
+            Some(connection_id)
+        );
     }
 
     #[test]
@@ -393,12 +660,14 @@ mod tests {
             idle_timeout: None,
             max_idle_per_address: 2,
         });
+        let now = Instant::now();
 
         let oldest = make_connection(address.clone(), 21);
-        thread::sleep(Duration::from_millis(1));
         let middle = make_connection(address.clone(), 22);
-        thread::sleep(Duration::from_millis(1));
         let newest = make_connection(address.clone(), 23);
+        oldest.set_idle_since_for_test(Some(now - Duration::from_secs(3)));
+        middle.set_idle_since_for_test(Some(now - Duration::from_secs(2)));
+        newest.set_idle_since_for_test(Some(now - Duration::from_secs(1)));
 
         pool.insert(oldest.clone());
         pool.insert(middle.clone());

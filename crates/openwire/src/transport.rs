@@ -16,9 +16,9 @@ use hyper::client::conn::{http1, http2};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, CallContext, ConnectionId, ConnectionInfo,
-    DnsResolver, Exchange, RequestBody, ResponseBody, Runtime, TcpConnector, TlsConnector,
-    TokioExecutor, TokioIo, TokioTimer, WireError,
+    next_connection_id, BoxConnection, BoxFuture, CallContext, CoalescingInfo, ConnectionId,
+    ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime, TcpConnector,
+    TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
@@ -206,27 +206,27 @@ struct ConnectTunnelParams<'a> {
 }
 
 impl ConnectorStack {
-    async fn connect(
+    async fn route_plan(
         &self,
         ctx: CallContext,
-        uri: Uri,
-        address: Address,
-    ) -> Result<BoxConnection, WireError> {
+        address: &Address,
+    ) -> Result<RoutePlan, WireError> {
         let (dns_host, dns_port) = self.route_planner.dns_target(&address);
         let resolved_addrs = self
             .dns_resolver
             .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
             .await?;
-        let route_plan = self.route_planner.plan(address, resolved_addrs);
-        let proxy_connect_deps = ProxyConnectDeps {
+        Ok(self.route_planner.plan(address.clone(), resolved_addrs))
+    }
+
+    fn proxy_connect_deps(&self) -> ProxyConnectDeps {
+        ProxyConnectDeps {
             tcp_connector: self.tcp_connector.clone(),
             tls_connector: self.tls_connector.clone(),
             proxy_authenticator: self.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
             connect_timeout: self.connect_timeout,
-        };
-
-        connect_route_plan(ctx, uri, route_plan, proxy_connect_deps).await
+        }
     }
 }
 
@@ -931,7 +931,10 @@ impl TransportService {
             .unwrap_or_default();
 
         let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
+        record_pool_lookup_trace(&call_span, &prepared);
         async move {
+            ctx.listener()
+                .pool_lookup(&ctx, prepared.pool_hit(), prepared.pool_connection_id());
             let selected = self
                 .acquire_connection(&prepared, &request, ctx.clone(), tracing::Span::current())
                 .await?;
@@ -1007,18 +1010,32 @@ impl TransportService {
         ctx: CallContext,
         span: tracing::Span,
     ) -> Result<SelectedConnection, WireError> {
-        let connect_span = tracing::Span::current();
-        let stream = self
+        let route_plan = self
             .connector
-            .connect(ctx, request.uri().clone(), prepared.address().clone())
-            .instrument(connect_span)
-            .with_current_subscriber()
+            .route_plan(ctx.clone(), prepared.address())
             .await?;
+        if let Some(selected) = self.try_acquire_coalesced(prepared.address(), &route_plan) {
+            return Ok(selected);
+        }
+
+        let connect_span = tracing::Span::current();
+        let stream = connect_route_plan(
+            ctx,
+            request.uri().clone(),
+            route_plan,
+            self.connector.proxy_connect_deps(),
+        )
+        .instrument(connect_span)
+        .with_current_subscriber()
+        .await?;
         let connected = stream.connected();
         let info = connection_info_from_connected(&connected);
+        let coalescing = coalescing_info_from_connected(&connected);
         let protocol = determine_protocol(prepared.address(), &connected);
         let route = Route::from_observed(prepared.address().clone(), info.remote_addr);
-        let connection = crate::connection::RealConnection::with_id(info.id, route, protocol);
+        let connection = crate::connection::RealConnection::with_id_and_coalescing(
+            info.id, route, protocol, coalescing,
+        );
         let _ = connection.try_acquire();
         self.exchange_finder.pool().insert(connection.clone());
 
@@ -1049,6 +1066,28 @@ impl TransportService {
             binding,
             reused: false,
         })
+    }
+
+    fn try_acquire_coalesced(
+        &self,
+        address: &Address,
+        route_plan: &RoutePlan,
+    ) -> Option<SelectedConnection> {
+        let connection = self
+            .exchange_finder
+            .pool()
+            .acquire_coalesced(address, route_plan)?;
+        let binding = self.bindings.acquire(connection.id());
+        if let Some(binding) = binding {
+            return Some(SelectedConnection {
+                connection,
+                binding,
+                reused: true,
+            });
+        }
+
+        let _ = self.exchange_finder.pool().remove(connection.id());
+        None
     }
 
     fn spawn_http1_task(
@@ -1139,6 +1178,8 @@ fn attempt_span(
         auth_count = policy_trace.auth_count,
         method = %request.method(),
         uri = %request.uri(),
+        pool_hit = tracing::field::Empty,
+        pool_connection_id = tracing::field::Empty,
         route_count = tracing::field::Empty,
         fast_fallback_enabled = tracing::field::Empty,
         connect_race_id = tracing::field::Empty,
@@ -1146,6 +1187,13 @@ fn attempt_span(
         connection_id = tracing::field::Empty,
         connection_reused = tracing::field::Empty,
     )
+}
+
+fn record_pool_lookup_trace(span: &tracing::Span, prepared: &crate::connection::PreparedExchange) {
+    span.record("pool_hit", prepared.pool_hit());
+    if let Some(connection_id) = prepared.pool_connection_id() {
+        span.record("pool_connection_id", connection_id.as_u64());
+    }
 }
 
 struct ObservedIncomingBody {
@@ -1517,4 +1565,10 @@ fn connection_info_from_connected(connected: &Connected) -> ConnectionInfo {
             local_addr: None,
             tls: false,
         })
+}
+
+fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
+    let mut extensions = http::Extensions::new();
+    connected.get_extras(&mut extensions);
+    extensions.remove::<CoalescingInfo>().unwrap_or_default()
 }

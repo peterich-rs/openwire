@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use http::Request;
-use openwire_core::{ConnectionInfo, RequestBody, WireError};
+use openwire_core::{ConnectionId, ConnectionInfo, RequestBody, WireError};
 
 use crate::proxy::Proxy;
 
@@ -18,6 +18,14 @@ pub(crate) struct PreparedExchange {
 impl PreparedExchange {
     pub(crate) fn address(&self) -> &Address {
         &self.address
+    }
+
+    pub(crate) fn pool_hit(&self) -> bool {
+        matches!(self.outcome, PreparedExchangeOutcome::PoolHit { .. })
+    }
+
+    pub(crate) fn pool_connection_id(&self) -> Option<ConnectionId> {
+        self.reserved_connection().map(|connection| connection.id())
     }
 
     pub(crate) fn outcome(&self) -> &PreparedExchangeOutcome {
