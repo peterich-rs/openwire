@@ -5,6 +5,8 @@ use openwire_core::{next_connection_id, ConnectionId};
 
 use super::{Address, Route};
 
+const DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectionProtocol {
     Http1,
@@ -113,8 +115,14 @@ impl RealConnection {
             return false;
         }
 
-        if self.inner.protocol == ConnectionProtocol::Http1 && state.allocations > 0 {
-            return false;
+        match self.inner.protocol {
+            ConnectionProtocol::Http1 if state.allocations > 0 => return false,
+            ConnectionProtocol::Http2
+                if state.allocations >= DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS =>
+            {
+                return false;
+            }
+            ConnectionProtocol::Http1 | ConnectionProtocol::Http2 => {}
         }
 
         state.allocations += 1;
@@ -171,7 +179,10 @@ fn allocation_state(state: &RealConnectionState) -> ConnectionAllocationState {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use super::{ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection};
+    use super::{
+        ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection,
+        DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS,
+    };
     use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, Route, UriScheme};
 
     fn test_connection(protocol: ConnectionProtocol) -> RealConnection {
@@ -249,5 +260,18 @@ mod tests {
         assert_eq!(snapshot.allocation, ConnectionAllocationState::Idle);
         assert_eq!(snapshot.completed_exchanges, 2);
         assert!(snapshot.idle_since.is_some());
+    }
+
+    #[test]
+    fn http2_connection_enforces_conservative_stream_limit() {
+        let connection = test_connection(ConnectionProtocol::Http2);
+
+        for _ in 0..DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS {
+            assert!(connection.try_acquire());
+        }
+        assert!(!connection.try_acquire());
+
+        assert!(connection.release());
+        assert!(connection.try_acquire());
     }
 }

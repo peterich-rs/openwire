@@ -163,7 +163,7 @@ The goal is to let OpenWire own HTTP/2 multiplexing decisions and state.
 |---|---|---|---|---|
 | P9-001 | `DONE` | Add HTTP/2-capable `RealConnection` state with multiplex metadata | P7-002 | Pool can distinguish H1 and H2 connection behavior |
 | P9-002 | `DONE` | Route multiple exchanges over one HTTP/2 connection when eligible | P9-001 | Existing HTTP/2 multiplex test continues to pass on owned path |
-| P9-003 | `TODO` | Track conservative stream usage limits in pool state | P9-001 | Tests prove no invalid reuse under active load |
+| P9-003 | `DONE` | Track conservative stream usage limits in pool state | P9-001 | Tests prove no invalid reuse under active load |
 | P9-004 | `DONE` | Integrate HTTP/2 keep-alive settings with the owned connection model | P9-001 | Existing keep-alive config still plumbed correctly |
 
 ## Phase 10: Proxy Route Ownership
@@ -230,17 +230,16 @@ These items remain intentionally outside the near-term execution path.
 
 If execution starts now, the next contiguous slice should be:
 
-1. `P9-003`
-2. `P10-001` through `P10-005`
-3. `P12-005`
+1. `P10-001` through `P10-005`
+2. `P12-005`
+3. `P13-002` and `P13-003`
 
 Rationale:
 
-- HTTP/1.1 idle eviction policy is now enforced, so the next missing
-  correctness guard is conservative HTTP/2 stream-limit accounting
-- HTTP/2 multiplex reuse works, but the pool still needs conservative stream
-  limit accounting before the concurrency model is considered hardened
-- proxy route generation and ownership are now the next major boundary still
-  split between planner and connector branching
+- the remaining major ownership gap is proxy route generation and acquisition
+  semantics, which are still split between `RoutePlanner` and connector
+  branching
 - idle eviction now exists, but deterministic timing coverage still needs to be
   added once the pool semantics settle further
+- runtime-path ownership is landed, so the next dependency cleanup is removing
+  now-unneeded `hyper-util` client-side flags and auditing the remaining shim

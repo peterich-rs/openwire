@@ -442,4 +442,21 @@ mod tests {
             Some(connection_id)
         );
     }
+
+    #[test]
+    fn pool_refuses_http2_reuse_after_conservative_stream_limit_is_reached() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection =
+            make_connection_with_protocol(address.clone(), 32, ConnectionProtocol::Http2);
+        pool.insert(connection.clone());
+
+        for _ in 0..100 {
+            assert!(connection.try_acquire());
+        }
+
+        assert!(pool.acquire(&address).is_none());
+        assert!(connection.release());
+        assert!(pool.acquire(&address).is_some());
+    }
 }

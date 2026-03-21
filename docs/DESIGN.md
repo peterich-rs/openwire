@@ -282,6 +282,8 @@ HTTP/2:
 - protocol eligibility decided by ALPN or explicit policy
 - one connection may carry multiple exchanges
 - pool must track multiplex-capable state explicitly
+- until peer stream settings are modeled directly, pool reuse applies a fixed
+  conservative concurrent-stream ceiling per connection
 
 ## 11. Current Runtime Notes
 
@@ -299,6 +301,8 @@ Important baseline details to preserve during migration:
   `hyper::client::conn::http1` / `http2`
 - HTTP/1.1 idle timeout and max-idle-per-address limits now enforce
   opportunistically on pool touch points; there is still no background sweeper
+- HTTP/2 reuse currently uses a fixed conservative per-connection stream cap
+  until negotiated peer settings are tracked explicitly
 - response-body lifecycle currently drives connection release bookkeeping
 - retained `hyper-util` usage is now limited to
   `hyper_util::client::legacy::connect::{Connection, Connected}` as a temporary
