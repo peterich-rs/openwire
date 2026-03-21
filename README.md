@@ -83,3 +83,7 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 
 This suite is opt-in, hits public internet endpoints, and is not part of the
 required CI gate.
+
+The repository also provides a separate GitHub Actions workflow at
+`.github/workflows/live-network.yml` for manual dispatches and weekly scheduled
+runs without affecting the required CI path.

@@ -563,6 +563,14 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 The live suite remains outside the required CI gate and does not change the
 existing `.github/workflows/ci.yml` required path.
 
+Automation contract for repository-hosted execution:
+
+- `.github/workflows/live-network.yml` is a separate workflow from `CI`
+- it runs only by `workflow_dispatch` or a weekly `schedule`
+- it executes the same serial command used for local live validation:
+  `cargo test -p openwire --test live_network -- --ignored --test-threads=1`
+- it must never become a dependency of the `CI Gate` job in `.github/workflows/ci.yml`
+
 Current live-network coverage on this branch includes:
 
 - `httpbingo` GET / POST echo smoke checks

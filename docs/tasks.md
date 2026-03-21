@@ -95,7 +95,7 @@ This tracker implements `DESIGN.md` section `12. Real-Network Validation Archite
 |---|---|---|---|---|---|
 | LNV-500 | `DONE` | Document the live-suite command and non-CI status in user-facing docs | `README.md`, `docs/DESIGN.md` | LNV-104 | Docs explain how to run live tests locally and clarify that they are not part of the required CI gate |
 | LNV-501 | `DONE` | Add a short maintenance section for endpoint drift and flaky-public-origin handling | `docs/DESIGN.md`, `docs/tasks.md` | LNV-500 | Docs explain that public endpoints require coarse assertions and may need periodic review |
-| LNV-502 | `DEFERRED` | Add a separate manual or scheduled live-network workflow without touching `CI Gate` | `.github/workflows/live-network.yml` | LNV-400 | Workflow is independent from required checks and runs only by dispatch or schedule |
+| LNV-502 | `DONE` | Add a separate manual or scheduled live-network workflow without touching `CI Gate` | `.github/workflows/live-network.yml` | LNV-400 | Workflow is independent from required checks and runs only by dispatch or schedule |
 
 ## Explicit Deferrals For This Execution Slice
 
