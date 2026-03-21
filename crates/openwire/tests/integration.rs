@@ -2106,10 +2106,31 @@ impl ScopedEnv {
         K: Into<String>,
         V: AsRef<str>,
     {
-        let mut previous = Vec::new();
+        // Windows treats environment variable names as case-insensitive, so
+        // pairs like `http_proxy` and `HTTP_PROXY` must collapse to one logical
+        // entry or later cleanup entries will erase the value we just set.
+        let mut merged = Vec::<(String, String, String)>::new();
         for (key, value) in vars {
             let key = key.into();
-            let value = value.as_ref();
+            let value = value.as_ref().to_owned();
+            let normalized = normalize_env_key_for_platform(&key);
+
+            if let Some((_, existing_key, existing_value)) = merged
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == normalized)
+            {
+                if existing_value.is_empty() && !value.is_empty() {
+                    *existing_key = key;
+                    *existing_value = value;
+                }
+                continue;
+            }
+
+            merged.push((normalized, key, value));
+        }
+
+        let mut previous = Vec::new();
+        for (_, key, value) in merged {
             previous.push((key.clone(), std::env::var(&key).ok()));
             if value.is_empty() {
                 unsafe {
@@ -2137,6 +2158,14 @@ impl Drop for ScopedEnv {
                 },
             }
         }
+    }
+}
+
+fn normalize_env_key_for_platform(key: &str) -> String {
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key.to_owned()
     }
 }
 
