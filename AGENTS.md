@@ -45,7 +45,14 @@ User API
 - One task per subagent for focused execution
 - Default subagent configuration is model `gpt-5.4-mini` with reasoning effort `high`
 
-## 3. Autonomous Documentation Maintenance
+## 3. Worktree Strategy
+- The repository root is the primary worktree
+- For parallelizable and cleanly separated workstreams, use `git worktree`
+- Keep secondary worktrees under `../openwire-worktrees`
+- Use conventional branch prefixes such as `feature/`, `bugfix/`, `refactor/`, and `docs/` based on the change type
+- Do not split tightly coupled or short single-path tasks into separate worktrees
+
+## 4. Autonomous Documentation Maintenance
 - Maintain documentation proactively after ANY implementation change — do not wait to be asked
 - Before closing a task, sync all affected docs to the current code
 - Treat the codebase as the single source of truth and align docs to it
@@ -54,19 +61,19 @@ User API
 - Ensure examples, commands, file paths, configs, and behavior descriptions reflect reality
 - If documentation is already correct, explicitly confirm that it was checked
 
-## 4. Verification Before Done
+## 5. Verification Before Done
 - Never mark a task complete without proving it works
 - Diff behavior between main and your changes when relevant
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
 
-## 5. Demand Elegance (Balanced)
+## 6. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask "is there a more elegant way?"
 - If a fix feels hacky: know everything you know, implement the elegant solution
 - Skip this for simple, obvious fixes — don't over-engineer
 - Challenge your own work before presenting it
 
-## 6. Autonomous Bug Fixing
+## 7. Autonomous Bug Fixing
 - When given a bug report: just fix it. Don't ask for hand-holding
 - Point at logs, errors, failing tests — then resolve them
 - Zero context switching required from the user

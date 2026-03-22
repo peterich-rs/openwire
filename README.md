@@ -31,6 +31,7 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
+- [docs/plans/core-review-plan-spec.md](docs/plans/core-review-plan-spec.md): implementation split for the current core review backlog
 - [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start
