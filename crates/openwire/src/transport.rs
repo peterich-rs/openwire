@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use futures_util::task::AtomicWaker;
-use http::header::HOST;
+use http::header::{CONNECTION, HOST};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -1936,9 +1936,9 @@ impl ObservedIncomingBody {
         let Some(deadline_signal) = self.deadline_signal.as_ref() else {
             return Poll::Pending;
         };
-        if !deadline_signal.expired.load(Ordering::Relaxed) {
+        if !deadline_signal.expired.load(Ordering::Acquire) {
             deadline_signal.waker.register(cx.waker());
-            if !deadline_signal.expired.load(Ordering::Relaxed) {
+            if !deadline_signal.expired.load(Ordering::Acquire) {
                 return Poll::Pending;
             }
         }
@@ -2099,7 +2099,7 @@ fn spawn_body_deadline_signal(
         waker: AtomicWaker::new(),
     });
     if remaining == Duration::ZERO {
-        signal.expired.store(true, Ordering::Relaxed);
+        signal.expired.store(true, Ordering::Release);
         return Ok(Some(signal));
     }
 
@@ -2107,7 +2107,7 @@ fn spawn_body_deadline_signal(
     let signal_task = signal.clone();
     let _ = runtime.spawn(Box::pin(async move {
         sleep_runtime.sleep(remaining).await;
-        signal_task.expired.store(true, Ordering::Relaxed);
+        signal_task.expired.store(true, Ordering::Release);
         signal_task.waker.wake();
     }))?;
 
@@ -2295,11 +2295,22 @@ fn http1_response_allows_reuse(response: &Response<Incoming>) -> bool {
         return false;
     }
 
-    !response.headers().get("connection").is_some_and(|value| {
+    !connection_header_requests_close(response.headers())
+}
+
+fn connection_header_requests_close(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .any(|value| header_value_contains_token(value, "close"))
+}
+
+fn header_value_contains_token(value: &HeaderValue, token: &str) -> bool {
+    value.to_str().ok().is_some_and(|value| {
         value
-            .to_str()
-            .map(|value| value.eq_ignore_ascii_case("close"))
-            .unwrap_or(false)
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate.eq_ignore_ascii_case(token))
     })
 }
 
@@ -2375,6 +2386,8 @@ mod tests {
     use std::task::{Context, Poll};
 
     use bytes::Bytes;
+    use http::header::{CONNECTION, HeaderValue};
+    use http::HeaderMap;
     use futures_util::task::noop_waker_ref;
     use hyper::rt::{Read, ReadBuf, Write};
     use hyper_util::client::legacy::connect::Connected;
@@ -2536,6 +2549,31 @@ mod tests {
             span.fields.get("connect_winner").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn connection_header_close_matches_multiple_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.append(CONNECTION, HeaderValue::from_static("close"));
+
+        assert!(super::connection_header_requests_close(&headers));
+    }
+
+    #[test]
+    fn connection_header_close_matches_comma_separated_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, close"));
+
+        assert!(super::connection_header_requests_close(&headers));
+    }
+
+    #[test]
+    fn connection_header_close_ignores_non_close_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, upgrade"));
+
+        assert!(!super::connection_header_requests_close(&headers));
     }
 
     fn make_address() -> Address {

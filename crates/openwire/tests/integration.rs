@@ -1360,6 +1360,43 @@ async fn shared_client_reuses_connection_pool_across_calls() {
 }
 
 #[tokio::test]
+async fn shared_client_does_not_reuse_http1_connections_marked_close_in_connection_tokens() {
+    let server = spawn_http1(|_request| async move {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("connection", "keep-alive, close")
+            .body(http_body_util::Full::new(Bytes::from_static(b"closed")))
+            .expect("response")
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+
+    let response_one = client
+        .execute(empty_request(server.http_url("/first")))
+        .await
+        .expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let response_two = client
+        .execute(empty_request(server.http_url("/second")))
+        .await
+        .expect("response");
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_two.into_body().text().await.expect("body");
+
+    assert_ne!(connection_one, connection_two);
+}
+
+#[tokio::test]
 async fn shared_client_coalesces_https_http2_connections_across_verified_authorities() {
     let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], |_request| async move {
         ok_text("coalesced h2")
