@@ -2753,7 +2753,7 @@ mod tests {
 
     use openwire_core::{
         BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver, NoopEventListener,
-        Runtime, SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
+        SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
     };
 
     use super::{
@@ -3074,21 +3074,11 @@ mod tests {
         fn abort(&self) {}
     }
 
-    impl Runtime for CountingSpawnRuntime {
+    impl WireExecutor for CountingSpawnRuntime {
         fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
             self.spawns
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Box::new(NoopTaskHandle))
-        }
-
-        fn sleep(&self, _duration: Duration) -> BoxFuture<()> {
-            Box::pin(async {})
-        }
-    }
-
-    impl WireExecutor for CountingSpawnRuntime {
-        fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
-            Runtime::spawn(self, future)
         }
     }
 

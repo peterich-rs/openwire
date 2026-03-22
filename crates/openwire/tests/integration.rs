@@ -15,8 +15,8 @@ use hyper::rt::{Sleep, Timer};
 use openwire::{
     AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DnsResolver,
     EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
-    ResponseBody, Runtime, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector,
-    TokioTcpConnector, Url, WireError, WireErrorKind,
+    ResponseBody, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url, WireError,
+    WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_core::WireExecutor;
@@ -24,6 +24,7 @@ use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
     RecordingEventListenerFactory, StaticDnsResolver,
 };
+use openwire_tokio::TokioTcpConnector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::field::{Field, Visit};
@@ -2087,7 +2088,7 @@ async fn http2_publication_failure_does_not_leave_pool_entry() {
     let events = RecordingEventListenerFactory::default();
     let client = Client::builder()
         .dns_resolver(HostMapResolver::new([("a.test".to_owned(), server.addr())]))
-        .runtime(SpawnFailingRuntime)
+        .executor(SpawnFailingRuntime)
         .event_listener_factory(events.clone())
         .tls_connector(
             RustlsTlsConnector::builder()
@@ -2124,7 +2125,7 @@ async fn dropping_client_aborts_owned_connection_tasks() {
     let server = spawn_http1(|_request| async move { ok_text("keep-alive") }).await;
     let runtime = AbortCountingRuntime::default();
     let client = Client::builder()
-        .runtime(runtime.clone())
+        .executor(runtime.clone())
         .build()
         .expect("client");
 
@@ -3871,22 +3872,12 @@ impl Timer for CountingTimer {
 #[derive(Clone, Default)]
 struct SpawnFailingRuntime;
 
-impl Runtime for SpawnFailingRuntime {
+impl WireExecutor for SpawnFailingRuntime {
     fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         Err(WireError::internal(
             "scripted spawn failure",
             io::Error::other("scripted spawn failure"),
         ))
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-}
-
-impl WireExecutor for SpawnFailingRuntime {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
-        Runtime::spawn(self, future)
     }
 }
 
@@ -3913,22 +3904,12 @@ impl TaskHandle for AbortCountingTaskHandle {
     }
 }
 
-impl Runtime for AbortCountingRuntime {
+impl WireExecutor for AbortCountingRuntime {
     fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         Ok(Box::new(AbortCountingTaskHandle {
             handle: tokio::spawn(future),
             aborts: self.aborts.clone(),
         }))
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-}
-
-impl WireExecutor for AbortCountingRuntime {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
-        Runtime::spawn(self, future)
     }
 }
 

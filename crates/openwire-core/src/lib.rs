@@ -25,10 +25,12 @@ pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,
 };
 pub use policy::{RedirectContext, RedirectDecision, RedirectPolicy, RetryContext, RetryPolicy};
-pub use runtime::{BoxTaskHandle, HyperExecutor, Runtime, SharedTimer, TaskHandle, WireExecutor};
+pub use runtime::{BoxTaskHandle, HyperExecutor, SharedTimer, TaskHandle, WireExecutor};
 pub use transport::{
-    BoxConnection, CoalescingInfo, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector,
-    TlsConnector,
+    BoxConnection, BoxDnsService, BoxTcpService, BoxTlsService, CoalescingInfo, ConnectionInfo,
+    ConnectionIo, DnsRequest, DnsResolver, DnsResolverService, TcpConnectRequest, TcpConnector,
+    TcpConnectorService, TlsConnectRequest, TlsConnector, TlsConnectorService, TowerDnsResolver,
+    TowerTcpConnector, TowerTlsConnector,
 };
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

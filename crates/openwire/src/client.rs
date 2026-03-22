@@ -10,10 +10,10 @@ use hyper::rt::Timer;
 use openwire_core::{
     Authenticator, BoxWireService, CallContext, CookieJar, DnsResolver, EventListenerFactory,
     Exchange, InterceptorLayer, NoopEventListenerFactory, RedirectPolicy, RequestBody,
-    ResponseBody, RetryPolicy, Runtime, SharedEventListenerFactory, SharedInterceptor, SharedTimer,
+    ResponseBody, RetryPolicy, SharedEventListenerFactory, SharedInterceptor, SharedTimer,
     TcpConnector, TlsConnector, WireError, WireExecutor,
 };
-use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector, TokioTimer};
+use openwire_tokio::{SystemDnsResolver, TokioExecutor, TokioTcpConnector, TokioTimer};
 use pin_project_lite::pin_project;
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -41,7 +41,6 @@ pub struct Client {
 
 struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
-    runtime: Arc<dyn Runtime>,
     timer: SharedTimer,
     call_timeout: Option<Duration>,
     proxy_selector: ProxySelector,
@@ -71,7 +70,6 @@ pub struct ClientBuilder {
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     event_listener_factory: SharedEventListenerFactory,
-    runtime: Arc<dyn Runtime>,
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
     transport: TransportConfig,
@@ -110,16 +108,6 @@ impl ClientBuilder {
         F: EventListenerFactory,
     {
         self.event_listener_factory = Arc::new(factory);
-        self
-    }
-
-    pub fn runtime<R>(mut self, runtime: R) -> Self
-    where
-        R: Runtime + WireExecutor,
-    {
-        let runtime = Arc::new(runtime);
-        self.runtime = runtime.clone();
-        self.executor = runtime;
         self
     }
 
@@ -384,7 +372,6 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner {
                 event_listener_factory: self.event_listener_factory,
-                runtime: self.runtime,
                 timer: self.timer,
                 call_timeout: self.policy.call_timeout,
                 proxy_selector,
@@ -397,13 +384,11 @@ impl ClientBuilder {
 
 impl Default for ClientBuilder {
     fn default() -> Self {
-        let runtime = Arc::new(TokioRuntime);
         Self {
             application_interceptors: Vec::new(),
             network_interceptors: Vec::new(),
             event_listener_factory: Arc::new(NoopEventListenerFactory),
-            runtime: runtime.clone(),
-            executor: runtime,
+            executor: Arc::new(TokioExecutor::new()),
             timer: SharedTimer::new(TokioTimer::new()),
             transport: TransportConfig {
                 connect_timeout: None,
@@ -447,10 +432,6 @@ impl Client {
             client: self.clone(),
             request,
         }
-    }
-
-    pub fn runtime(&self) -> Arc<dyn Runtime> {
-        self.inner.runtime.clone()
     }
 
     pub async fn execute(

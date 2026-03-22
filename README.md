@@ -4,7 +4,7 @@ OpenWire is an OkHttp-inspired async HTTP client for Rust.
 
 It uses `hyper` for HTTP protocol state, but owns the client-side semantics
 around request policy, route planning, connection pooling, fast fallback, and
-protocol binding. The default runtime and TLS integrations are Tokio and
+protocol binding. The default executor/timer and TLS integrations are Tokio and
 Rustls.
 
 ## What It Provides
@@ -16,7 +16,7 @@ Rustls.
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
   including `socks5://user:pass@host:port` credentials and proxy-endpoint
   fast fallback
-- custom DNS, TCP, TLS, and runtime hooks
+- custom DNS, TCP, TLS, executor, and timer hooks
 - an owned connection core with route planning, pooling, and direct HTTP/1.1 /
   HTTP/2 protocol binding
 - `RequestBody::absent()` for typical no-body requests and
@@ -28,10 +28,13 @@ Rustls.
 
 - `crates/openwire`: public client API, policy layer, transport integration
 - `crates/openwire-cache`: cache interceptor and in-memory cache store
-- `crates/openwire-core`: shared body, error, event, runtime, transport, and policy traits
-- `crates/openwire-tokio`: Tokio runtime, I/O, DNS, and TCP adapters
+- `crates/openwire-core`: shared body, error, event, executor/timer, transport, and policy traits
+- `crates/openwire-tokio`: Tokio executor, timer, I/O, DNS, and TCP adapters
 - `crates/openwire-rustls`: default Rustls TLS connector
 - `crates/openwire-test`: local test support
+
+Tokio-specific adapters are imported from `openwire-tokio` directly; `openwire`
+keeps the client API and higher-level policy / planning surfaces.
 
 ## Docs
 

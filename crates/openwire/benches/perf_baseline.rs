@@ -8,10 +8,11 @@ use futures_util::future::try_join_all;
 use http::Request;
 use openwire::{
     BoxFuture, CallContext, Client, DnsResolver, RequestBody, RustlsTlsConnector, TcpConnector,
-    TokioTcpConnector, WireError,
+    WireError,
 };
 use openwire_core::BoxConnection;
 use openwire_test::{ok_text, spawn_http1, spawn_https_http2, TestServer};
+use openwire_tokio::TokioTcpConnector;
 use tokio::runtime::Runtime;
 
 fn perf_baseline(c: &mut Criterion) {

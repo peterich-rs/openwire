@@ -69,7 +69,7 @@ Source-file map for the main runtime path:
 | Request policy / follow-ups | OpenWire-owned | `openwire` |
 | Connection acquisition / pooling / route planning | OpenWire-owned | `openwire` |
 | Fast fallback for route dialing | OpenWire-owned | `FastFallbackDialer` |
-| Runtime integration | OpenWire-owned trait boundary | Tokio |
+| Task execution / timing | OpenWire-owned trait boundaries | Tokio executor + timer |
 | DNS | Trait boundary + default adapter | system resolver |
 | TCP | Trait boundary + default adapter | Tokio TCP |
 | TLS | Trait boundary + default adapter | Rustls |
@@ -102,7 +102,6 @@ Important extension traits:
 - `TcpConnector`
 - `TlsConnector`
 - `RoutePlanner`
-- `Runtime`
 - `WireExecutor`
 - `hyper::rt::Timer`
 
@@ -110,8 +109,7 @@ Important extension traits:
 
 | Setting | Default |
 |---|---|
-| runtime | `TokioRuntime` |
-| executor | `TokioRuntime` |
+| executor | `TokioExecutor` |
 | timer | `TokioTimer` |
 | DNS | `SystemDnsResolver` |
 | TCP | `TokioTcpConnector` |
@@ -147,7 +145,6 @@ Extension boundary contracts:
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `RoutePlanner` | `dns_target(&Address) -> (String, u16)` and `plan(&Address, Vec<SocketAddr>) -> Result<RoutePlan, WireError>` | `crates/openwire/src/connection/planning.rs` |
-| `Runtime` | legacy compatibility surface retained by `ClientBuilder::runtime()` / `Client::runtime()` | `crates/openwire-core` |
 | `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
 | `hyper::rt::Timer` | `sleep`, `sleep_until`, `reset`, `now` | external trait configured through `ClientBuilder::timer(...)` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
@@ -159,7 +156,6 @@ Current extension-point rules:
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- `Runtime` is now a compatibility handle kept on `Client`; framework execution no longer depends on it
 - custom executors own bound-connection background-task spawning through `WireExecutor`
 - custom timers supply call deadlines, body deadlines, CONNECT/SOCKS timeouts, and HTTP/2 binding timers through `ClientBuilder::timer(...)`
 
@@ -436,11 +432,13 @@ Protocol-specific rules:
 
 Current default adapters:
 
-- Tokio runtime through `openwire-tokio` implementing `Runtime` and `WireExecutor`
+- Tokio executor through `openwire-tokio::TokioExecutor`
 - Tokio timer through `openwire-tokio::TokioTimer`
 - system DNS through `DnsResolver`
 - Tokio TCP through `TcpConnector`
 - Rustls through `TlsConnector`
+- Tokio adapter types are imported from `openwire-tokio` directly; `openwire`
+  no longer re-exports them
 
 Design constraints:
 
@@ -453,6 +451,9 @@ Adapter boundaries that are part of the current code shape:
 - DNS resolution happens only through `DnsResolver`
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
+- `openwire-core` exposes `TowerDnsResolver`, `TowerTcpConnector`,
+  `TowerTlsConnector`, `DnsResolverService`, `TcpConnectorService`, and
+  `TlsConnectorService` for tower interop without changing the core traits
 - HTTP/2 binding uses `HyperExecutor` over the configured `WireExecutor` plus
   the configured `hyper::rt::Timer`
 - background protocol tasks are spawned only through `WireExecutor::spawn`

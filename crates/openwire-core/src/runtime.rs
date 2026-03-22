@@ -60,8 +60,3 @@ impl Timer for SharedTimer {
         self.0.now()
     }
 }
-
-pub trait Runtime: Send + Sync + 'static {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError>;
-    fn sleep(&self, duration: Duration) -> BoxFuture<()>;
-}

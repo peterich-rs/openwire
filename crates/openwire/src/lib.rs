@@ -21,12 +21,11 @@ pub use openwire_core::{
     ConnectionId, ConnectionInfo, CookieJar, DnsResolver, EstablishmentStage, EventListener,
     EventListenerFactory, Exchange, HyperExecutor, Interceptor, Next, NoopEventListener,
     NoopEventListenerFactory, RedirectContext, RedirectDecision, RedirectPolicy, RequestBody,
-    ResponseBody, RetryContext, RetryPolicy, Runtime, SharedTimer, TaskHandle, TcpConnector,
-    TlsConnector, WireError, WireErrorKind, WireExecutor,
+    ResponseBody, RetryContext, RetryPolicy, SharedTimer, TaskHandle, TcpConnector, TlsConnector,
+    WireError, WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};
-pub use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector};
 pub use policy::{DefaultRedirectPolicy, DefaultRetryPolicy};
 pub use proxy::{NoProxy, Proxy};
 pub use url::Url;

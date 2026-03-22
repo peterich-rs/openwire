@@ -8,8 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["runtime-tokio", "tls-rustls", "platform-verifier"]
-runtime-tokio = []
+default = ["tls-rustls", "platform-verifier"]
 tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 json = ["openwire-core/json"]
