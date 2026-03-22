@@ -38,8 +38,8 @@ use crate::auth::{
 };
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
-    ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, RequestAdmissionLimiter, Route,
-    RouteKind, RoutePlan, RoutePlanner, UriScheme,
+    DirectDialDeps, ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,
+    RequestAdmissionLimiter, Route, RouteKind, RoutePlan, RoutePlanner, UriScheme,
 };
 use crate::proxy::ProxyCredentials;
 use crate::sync_util::lock_mutex;
@@ -176,17 +176,14 @@ async fn connect_route_plan(
 
     match first_route.kind() {
         RouteKind::Direct { .. } => {
-            connect_direct(
-                ctx,
-                uri,
-                route_plan,
+            let deps = DirectDialDeps::new(
                 deps.executor,
                 deps.timer,
                 deps.tcp_connector,
                 deps.tls_connector,
                 deps.connect_timeout,
-            )
-            .await
+            );
+            connect_direct(ctx, uri, route_plan, deps).await
         }
         RouteKind::HttpForwardProxy { .. } => {
             connect_via_http_forward_proxy(
@@ -209,24 +206,11 @@ async fn connect_direct(
     ctx: CallContext,
     uri: Uri,
     route_plan: RoutePlan,
-    executor: Arc<dyn WireExecutor>,
-    timer: SharedTimer,
-    tcp_connector: Arc<dyn TcpConnector>,
-    tls_connector: Option<Arc<dyn TlsConnector>>,
-    connect_timeout: Option<Duration>,
+    deps: DirectDialDeps,
 ) -> Result<BoxConnection, WireError> {
     let connect_span = tracing::Span::current();
     let (stream, outcome) = FastFallbackDialer
-        .dial_direct(
-            ctx.clone(),
-            uri,
-            route_plan,
-            executor,
-            timer,
-            tcp_connector,
-            tls_connector,
-            connect_timeout,
-        )
+        .dial_direct(ctx.clone(), uri, route_plan, deps)
         .instrument(connect_span)
         .with_current_subscriber()
         .await?;
@@ -257,8 +241,7 @@ async fn connect_via_http_forward_proxy(
             ctx,
             target_uri,
             route_plan,
-            executor,
-            timer,
+            FastFallbackRuntime::new(executor, timer),
             move |ctx, route| {
                 let tcp_connector = tcp_connector.clone();
                 async move {
@@ -307,8 +290,7 @@ async fn connect_via_http_proxy(
             ctx,
             target_uri,
             route_plan,
-            deps.executor.clone(),
-            deps.timer.clone(),
+            FastFallbackRuntime::new(deps.executor.clone(), deps.timer.clone()),
             {
                 let deps = deps.clone();
                 move |ctx, route| {
@@ -389,8 +371,7 @@ async fn connect_via_socks_proxy(
             ctx,
             target_uri,
             route_plan,
-            deps.executor.clone(),
-            deps.timer.clone(),
+            FastFallbackRuntime::new(deps.executor.clone(), deps.timer.clone()),
             {
                 let deps = deps.clone();
                 move |ctx, route| {
@@ -3118,9 +3099,11 @@ mod tests {
         }
     }
 
+    type PlannedRoutes = Arc<Mutex<Vec<(Address, Vec<std::net::SocketAddr>)>>>;
+
     #[derive(Clone)]
     struct RecordingRoutePlanner {
-        planned: Arc<Mutex<Vec<(Address, Vec<std::net::SocketAddr>)>>>,
+        planned: PlannedRoutes,
     }
 
     impl RoutePlanner for RecordingRoutePlanner {

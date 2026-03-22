@@ -6,7 +6,7 @@ use openwire_core::{
     RetryPolicy, WireError, WireErrorKind,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct RetryPolicyConfig {
     default: DefaultRetryPolicy,
     custom: Option<Arc<dyn RetryPolicy>>,
@@ -30,15 +30,6 @@ impl RetryPolicyConfig {
         P: RetryPolicy,
     {
         self.custom = Some(Arc::new(policy));
-    }
-}
-
-impl Default for RetryPolicyConfig {
-    fn default() -> Self {
-        Self {
-            default: DefaultRetryPolicy::default(),
-            custom: None,
-        }
     }
 }
 
@@ -141,7 +132,7 @@ impl RetryPolicy for DefaultRetryPolicy {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct RedirectPolicyConfig {
     default: DefaultRedirectPolicy,
     custom: Option<Arc<dyn RedirectPolicy>>,
@@ -169,15 +160,6 @@ impl RedirectPolicyConfig {
         P: RedirectPolicy,
     {
         self.custom = Some(Arc::new(policy));
-    }
-}
-
-impl Default for RedirectPolicyConfig {
-    fn default() -> Self {
-        Self {
-            default: DefaultRedirectPolicy::default(),
-            custom: None,
-        }
     }
 }
 

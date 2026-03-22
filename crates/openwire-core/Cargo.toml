@@ -11,7 +11,6 @@ rust-version.workspace = true
 json = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
-async-trait.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true

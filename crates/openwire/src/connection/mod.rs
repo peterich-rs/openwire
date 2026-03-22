@@ -10,7 +10,9 @@ mod real_connection;
 pub(crate) use exchange_finder::{
     ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
 };
-pub(crate) use fast_fallback::{FastFallbackDialer, FastFallbackOutcome};
+pub(crate) use fast_fallback::{
+    DirectDialDeps, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,
+};
 pub(crate) use limits::{
     ConnectionAvailability, ConnectionLimiter, ConnectionPermit, RequestAdmissionLimiter,
     RequestAdmissionPermit,
