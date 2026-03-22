@@ -62,8 +62,8 @@ Today the repository includes:
 - request normalization for `Host`, `User-Agent`, and body framing
 - route planning plus direct-route fast fallback
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
-- connection pooling for HTTP/1.1 and HTTP/2, including conservative HTTPS
-  HTTP/2 coalescing for verified authorities
+- connection pooling for HTTP/1.1 and HTTP/2, including verified-authority
+  HTTPS HTTP/2 coalescing
 - opt-in system proxy loading from standard environment variables
 - local performance tests and Criterion benchmarks for warm and cold paths
 

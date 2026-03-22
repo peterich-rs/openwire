@@ -1,6 +1,6 @@
 # OpenWire Technical Design
 
-Date: 2026-03-21
+Date: 2026-03-22
 
 This is the canonical architecture document for OpenWire. Keep it short,
 current, and focused on the code that exists today.
@@ -79,6 +79,7 @@ Stable external rules:
   `Client::new_call(request).execute()`
 - `ClientBuilder` owns transport and policy configuration
 - request-scoped metadata lives in `http::Extensions`
+- retries, redirects, and authenticator follow-ups preserve request extensions
 - custom integration points are traits, not convenience mini-frameworks
 
 Important extension traits:
@@ -247,14 +248,16 @@ Current connection-core rules:
 - direct HTTPS HTTP/2 may coalesce only when certificate SANs authorize the
   target authority and the resolved route plan overlaps the connected remote
   address
+- same-authority traffic still requires the exact-address reuse path; the
+  coalescing path is only for alternate verified authorities
 - direct routes race resolved target addresses
 - proxy routes resolve proxy endpoints into `RoutePlan`, but currently dial
   sequentially
 - target addresses behind forward proxies / CONNECT tunnels are not part of the
   current fast-fallback race
 - HTTP/1.1 reuse is single-exchange and body-lifecycle-driven
-- HTTP/2 reuse uses a conservative fixed stream cap until peer settings are
-  modeled directly
+- HTTP/2 reuse is admitted by bound-sender readiness instead of a separate fixed
+  local stream cap
 - HTTP/1.1 idle timeout and max-idle limits are enforced opportunistically on
   pool touch points; there is no background sweeper today
 
@@ -296,6 +299,8 @@ Pool and reuse rules:
 - `TransportService::try_acquire_coalesced()` performs the secondary HTTPS
   HTTP/2 coalesced lookup after route planning on miss path
 - `ObservedIncomingBody` drives `ConnectionPool::release()` on body completion
+- abandoning an HTTP/2 response body releases only the stream allocation; it
+  does not poison the whole session
 - broken HTTP/1.1 exchanges remove the connection instead of returning it to
   idle reuse
 
@@ -303,17 +308,19 @@ Operational invariants:
 
 - `RealConnection::try_acquire()` must fail for unhealthy or closed connections
 - HTTP/1.1 may have at most one active allocation per `RealConnection`
-- HTTP/2 allocation count is capped at the current fixed limit of `100`
+- HTTP/2 allocation count is bookkeeping for release and lifecycle handling;
+  sender readiness decides whether another exchange can be dispatched
 - `RealConnection::release()` increments `completed_exchanges` and restores
   `idle_since` only when the allocation count reaches zero
 - `ConnectionPool::remove()` always closes the removed connection
 - `ConnectionPool::release()` is valid only for connections that were
   previously acquired
-- pool pruning may evict only closed connections or idle HTTP/1.1 connections
+- pool pruning evicts non-healthy connections and idle HTTP/1.1 connections
   past `idle_timeout`
 - HTTP/2 connections are not subject to HTTP/1.1 idle eviction rules
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
-  name authorization and route overlap
+  name authorization, route overlap, and a different authority than the pooled
+  connection
 
 ## 8. Protocol Binding
 
@@ -339,6 +346,8 @@ connect_route_plan(...)
   -> RealConnection::with_id_and_coalescing(...)
   -> bind_http1(...) or bind_http2(...)
   -> ConnectionBindings::insert_http1(...) or insert_http2(...)
+  -> ConnectionBindings::acquire(...) for the current request
+  -> ConnectionPool::insert(...)
   -> spawn_http1_task(...) or spawn_http2_task(...)
 ```
 
@@ -346,6 +355,8 @@ Protocol-specific rules:
 
 - HTTP/1.1 uses one active exchange per connection
 - HTTP/2 reuses a bound sender for multiple exchanges
+- CONNECT tunnel setup preserves any bytes already read past the proxy response
+  header block before handing the stream to TLS or HTTP
 - spawned background connection tasks remove bindings and pool entries on
   termination
 - `record_fast_fallback_trace()` writes `route_count`,
@@ -373,6 +384,10 @@ Adapter boundaries that are part of the current code shape:
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
 - background protocol tasks are spawned only through `Runtime::spawn`
+- `call_timeout` uses the configured `Runtime` instead of directly calling
+  Tokio timers
+- response-body deadline enforcement uses the same logical call deadline as the
+  request future
 - request policy code does not depend on Tokio-specific networking primitives
 
 ## 10. Observability And Verification
@@ -479,6 +494,8 @@ Retryability contracts:
   retried by connection-failure policy
 - retry-on-connection-failure applies only when the request snapshot is
   replayable
+- canceled requests are retried only when `retry_canceled_requests` is enabled
+  and the request snapshot is replayable
 - non-retryable TCP / TLS / proxy-tunnel establishment failures terminate the
   current retry or race path immediately
 

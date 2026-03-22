@@ -13,7 +13,7 @@ use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use openwire::{
     AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, EstablishmentStage,
-    Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody,
+    Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody, Runtime,
     RustlsTlsConnector, TcpConnector, TlsConnector, TokioTcpConnector, Url, WireError,
     WireErrorKind,
 };
@@ -65,6 +65,29 @@ async fn client_call_timeout_applies_to_requests() {
         .await
         .expect_err("default timeout should fail");
     assert_eq!(error.kind(), WireErrorKind::Timeout);
+}
+
+#[tokio::test]
+async fn call_timeout_uses_configured_runtime_sleep() {
+    let server = spawn_http1(|_request| async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ok_text("slow ok")
+    })
+    .await;
+
+    let runtime = CountingRuntime::immediate();
+    let client = Client::builder()
+        .runtime(runtime.clone())
+        .call_timeout(Duration::from_millis(25))
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(server.http_url("/slow-runtime")))
+        .await
+        .expect_err("timeout should use configured runtime");
+    assert_eq!(error.kind(), WireErrorKind::Timeout);
+    assert_eq!(runtime.sleep_calls(), 1);
 }
 
 #[tokio::test]
@@ -786,6 +809,140 @@ async fn http_proxy_can_retry_requests_after_407_with_proxy_authenticator() {
 }
 
 #[tokio::test]
+async fn http_proxy_redirects_keep_proxy_authorization_for_same_proxy() {
+    let proxy = spawn_proxy_redirect_requiring_authorization(
+        "Proxy-Authorization",
+        "Basic cHJveHk6c2VjcmV0",
+    )
+    .await;
+    let authenticator =
+        StaticHeaderAuthenticator::new("proxy-authorization", "Basic cHJveHk6c2VjcmV0");
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .proxy_authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri("http://source.test/start")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "redirect authorized");
+    assert_eq!(authenticator.calls(), 1);
+
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 3, "requests = {requests:?}");
+    assert!(
+        !requests[0].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}"
+    );
+    assert!(
+        requests[1].contains("GET http://source.test/start HTTP/1.1")
+            && requests[1].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}"
+    );
+    assert!(
+        requests[2].contains("GET http://target.test/finish HTTP/1.1")
+            && requests[2].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn canceled_requests_are_not_retried_by_default() {
+    let server = spawn_http1(|_request| async move { ok_text("unused") }).await;
+    let interceptor = CancelOnceInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/cancel-default",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("canceled request should not retry by default");
+
+    assert_eq!(error.kind(), WireErrorKind::Canceled);
+    assert_eq!(interceptor.calls(), 1);
+}
+
+#[tokio::test]
+async fn canceled_requests_are_retried_when_enabled() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let interceptor = CancelOnceInterceptor::default();
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .event_listener_factory(events.clone())
+        .network_interceptor(interceptor.clone())
+        .retry_canceled_requests(true)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/cancel-enabled",
+            server.addr().port()
+        )))
+        .await
+        .expect("canceled request should retry");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "retry ok");
+    assert_eq!(interceptor.calls(), 2);
+    assert!(
+        events
+            .events()
+            .iter()
+            .any(|event| event == "retry 1 canceled"),
+        "events = {:?}",
+        events.events()
+    );
+}
+
+#[tokio::test]
+async fn retry_follow_up_preserves_request_extensions() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let capture = ExtensionCaptureInterceptor::default();
+    let cancel = CancelOnceInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(capture.clone())
+        .network_interceptor(cancel)
+        .retry_canceled_requests(true)
+        .build()
+        .expect("client");
+
+    let mut request = empty_request(format!(
+        "http://openwire.test:{}/retry-extension",
+        server.addr().port()
+    ));
+    request
+        .extensions_mut()
+        .insert(RetainedRequestMarker("retry"));
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "retry ok");
+    assert_eq!(capture.seen(), vec![Some("retry"), Some("retry")]);
+}
+
+#[tokio::test]
 async fn declining_proxy_authenticator_returns_407_response() {
     let proxy =
         spawn_proxy_requiring_authorization("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0").await;
@@ -1031,6 +1188,48 @@ async fn declining_authenticator_returns_401_response() {
 }
 
 #[tokio::test]
+async fn auth_follow_up_preserves_request_extensions() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let authorized = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer good");
+        if authorized {
+            ok_text("auth ok")
+        } else {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"openwire\"")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("unauthorized response")
+        }
+    })
+    .await;
+    let capture = ExtensionCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(capture.clone())
+        .authenticator(StaticAuthorizationAuthenticator::new("Bearer good"))
+        .build()
+        .expect("client");
+
+    let mut request = empty_request(format!(
+        "http://openwire.test:{}/auth-extension",
+        server.addr().port()
+    ));
+    request
+        .extensions_mut()
+        .insert(RetainedRequestMarker("auth"));
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "auth ok");
+    assert_eq!(capture.seen(), vec![Some("auth"), Some("auth")]);
+}
+
+#[tokio::test]
 async fn cross_authority_redirect_drops_authorization_header() {
     let target = spawn_http1(|request: Request<Incoming>| async move {
         let auth = request
@@ -1074,6 +1273,37 @@ async fn cross_authority_redirect_drops_authorization_header() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "none");
+}
+
+#[tokio::test]
+async fn redirect_follow_up_preserves_request_extensions() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect complete"),
+        }
+    })
+    .await;
+    let capture = ExtensionCaptureInterceptor::default();
+    let client = Client::builder()
+        .network_interceptor(capture.clone())
+        .build()
+        .expect("client");
+
+    let mut request = empty_request(server.http_url("/redirect"));
+    request
+        .extensions_mut()
+        .insert(RetainedRequestMarker("redirect"));
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "redirect complete");
+    assert_eq!(capture.seen(), vec![Some("redirect"), Some("redirect")]);
 }
 
 #[tokio::test]
@@ -1190,6 +1420,49 @@ async fn shared_client_coalesces_https_http2_connections_across_verified_authori
             .filter(|event| event.starts_with("connect_end "))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn http2_publication_failure_does_not_leave_pool_entry() {
+    let server =
+        spawn_https_http2_with_hosts(
+            &["a.test"],
+            |_request| async move { ok_text("unreachable") },
+        )
+        .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([("a.test".to_owned(), server.addr())]))
+        .runtime(SpawnFailingRuntime)
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    for path in ["/first", "/second"] {
+        let error = client
+            .execute(empty_request(format!(
+                "https://a.test:{}{path}",
+                server.addr().port()
+            )))
+            .await
+            .expect_err("spawn failure should abort request");
+        assert_eq!(error.kind(), WireErrorKind::Internal);
+    }
+
+    let events = events.events();
+    let pool_misses = events.iter().filter(|event| *event == "pool_miss").count();
+    assert_eq!(pool_misses, 2, "events = {events:?}");
+    assert!(
+        !events.iter().any(|event| event.starts_with("pool_hit")),
+        "events = {events:?}",
     );
 }
 
@@ -1763,6 +2036,59 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
     assert!(
         body_failure.fields.contains_key("call_id"),
         "body failure event = {body_failure:?}",
+    );
+}
+
+#[tokio::test]
+async fn call_timeout_can_fail_during_body_read() {
+    let server = spawn_raw_http1_headers_then_stall_body(Duration::from_millis(200)).await;
+    let events = RecordingEventListenerFactory::default();
+    let runtime = CountingRuntime::tokio();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .runtime(runtime.clone())
+        .event_listener_factory(events.clone())
+        .call_timeout(Duration::from_millis(25))
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/stalling-body",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let error = response
+        .into_body()
+        .text()
+        .await
+        .expect_err("body should time out");
+    assert_eq!(error.kind(), WireErrorKind::Timeout);
+    assert_eq!(runtime.sleep_calls(), 2);
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "call_start GET",
+            "response_headers_end 200 OK",
+            "call_end 200 OK",
+            "response_body_failed timeout",
+            "connection_released ",
+        ],
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("call_failed ")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_body_end ")),
+        "events = {events:?}",
     );
 }
 
@@ -2514,11 +2840,25 @@ struct HeaderCaptureInterceptor {
     seen: Arc<Mutex<Vec<ObservedHeaders>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetainedRequestMarker(&'static str);
+
+#[derive(Clone, Default)]
+struct ExtensionCaptureInterceptor {
+    seen: Arc<Mutex<Vec<Option<&'static str>>>>,
+}
+
 impl HeaderCaptureInterceptor {
     fn take_single(&self) -> ObservedHeaders {
         let seen = self.seen.lock().expect("captured headers");
         assert_eq!(seen.len(), 1, "expected exactly one captured request");
         seen[0].clone()
+    }
+}
+
+impl ExtensionCaptureInterceptor {
+    fn seen(&self) -> Vec<Option<&'static str>> {
+        self.seen.lock().expect("captured extensions").clone()
     }
 }
 
@@ -2532,6 +2872,26 @@ impl Interceptor for HeaderCaptureInterceptor {
         let headers = ObservedHeaders::capture(exchange.request().headers());
         Box::pin(async move {
             seen.lock().expect("captured headers").push(headers);
+            next.run(exchange).await
+        })
+    }
+}
+
+impl Interceptor for ExtensionCaptureInterceptor {
+    fn intercept(
+        &self,
+        exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let seen = self.seen.clone();
+        let marker = exchange
+            .request()
+            .extensions()
+            .get::<RetainedRequestMarker>()
+            .copied()
+            .map(|marker| marker.0);
+        Box::pin(async move {
+            seen.lock().expect("captured extensions").push(marker);
             next.run(exchange).await
         })
     }
@@ -2673,6 +3033,91 @@ fn normalize_env_key_for_platform(key: &str) -> String {
 struct FailingTcpConnector {
     failures_remaining: Arc<Mutex<usize>>,
     attempts: Arc<Mutex<usize>>,
+}
+
+#[derive(Clone, Default)]
+struct CancelOnceInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+impl CancelOnceInterceptor {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Interceptor for CancelOnceInterceptor {
+    fn intercept(
+        &self,
+        exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            if call == 0 {
+                return Err(WireError::canceled("scripted canceled request"));
+            }
+            next.run(exchange).await
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CountingRuntime {
+    sleep_calls: Arc<AtomicUsize>,
+    immediate_sleep: bool,
+}
+
+impl CountingRuntime {
+    fn immediate() -> Self {
+        Self {
+            sleep_calls: Arc::new(AtomicUsize::new(0)),
+            immediate_sleep: true,
+        }
+    }
+
+    fn tokio() -> Self {
+        Self {
+            sleep_calls: Arc::new(AtomicUsize::new(0)),
+            immediate_sleep: false,
+        }
+    }
+
+    fn sleep_calls(&self) -> usize {
+        self.sleep_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Runtime for CountingRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<(), WireError> {
+        tokio::spawn(future);
+        Ok(())
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
+        self.sleep_calls.fetch_add(1, Ordering::Relaxed);
+        if self.immediate_sleep {
+            Box::pin(async {})
+        } else {
+            Box::pin(tokio::time::sleep(duration))
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SpawnFailingRuntime;
+
+impl Runtime for SpawnFailingRuntime {
+    fn spawn(&self, _future: BoxFuture<()>) -> Result<(), WireError> {
+        Err(WireError::internal(
+            "scripted spawn failure",
+            io::Error::other("scripted spawn failure"),
+        ))
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
 }
 
 impl FailingTcpConnector {
@@ -2962,12 +3407,17 @@ impl Drop for ConnectProxyServer {
 
 struct AuthorizationProxyServer {
     addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl AuthorizationProxyServer {
     fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("proxy requests").clone()
     }
 }
 
@@ -3042,6 +3492,37 @@ async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
                     let mut buffer = [0u8; 1024];
                     let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer)).await;
                     let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_raw_http1_headers_then_stall_body(delay: Duration) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut shutdown_rx => {}
+            accepted = listener.accept() => {
+                if let Ok((mut stream, _)) = accepted {
+                    let mut buffer = [0u8; 1024];
+                    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer)).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(delay).await;
                     let _ = stream.shutdown().await;
                 }
             }
@@ -3384,6 +3865,8 @@ async fn spawn_proxy_requiring_authorization(
         .await
         .expect("bind auth proxy listener");
     let addr = listener.local_addr().expect("auth proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -3394,6 +3877,7 @@ async fn spawn_proxy_requiring_authorization(
                     let Ok((mut client, _)) = accepted else {
                         break;
                     };
+                    let requests = requests_clone.clone();
                     tokio::spawn(async move {
                         let mut head = Vec::new();
                         let mut buf = [0u8; 1024];
@@ -3409,6 +3893,7 @@ async fn spawn_proxy_requiring_authorization(
                         }
 
                         let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request.clone());
                         let authorized = request.lines().any(|line| {
                             line.eq_ignore_ascii_case(&format!("{header_name}: {expected_value}"))
                         });
@@ -3432,6 +3917,76 @@ async fn spawn_proxy_requiring_authorization(
 
     AuthorizationProxyServer {
         addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_proxy_redirect_requiring_authorization(
+    header_name: &'static str,
+    expected_value: &'static str,
+) -> AuthorizationProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind auth proxy listener");
+    let addr = listener.local_addr().expect("auth proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request.clone());
+                        let authorized = request.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!("{header_name}: {expected_value}"))
+                        });
+
+                        let response = if !authorized {
+                            "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                        } else if request.starts_with("GET http://source.test/start HTTP/1.1\r\n") {
+                            "HTTP/1.1 302 Found\r\nLocation: http://target.test/finish\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                        } else if request.starts_with("GET http://target.test/finish HTTP/1.1\r\n") {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 19\r\nConnection: close\r\n\r\nredirect authorized".to_owned()
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\nConnection: close\r\n\r\nunexpected".to_owned()
+                        };
+
+                        client
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write auth proxy response");
+                        let _ = client.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+
+    AuthorizationProxyServer {
+        addr,
+        requests,
         shutdown: Some(shutdown_tx),
     }
 }
