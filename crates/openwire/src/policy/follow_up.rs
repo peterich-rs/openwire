@@ -48,6 +48,7 @@ pub(crate) struct RetryPolicyConfig {
 pub(crate) struct RedirectPolicyConfig {
     pub(crate) follow_redirects: bool,
     pub(crate) max_redirects: usize,
+    pub(crate) allow_insecure_redirects: bool,
 }
 
 #[derive(Clone)]
@@ -76,12 +77,13 @@ impl Service<Exchange> for FollowUpPolicyService {
     type Error = WireError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.network.poll_ready(cx)
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let network = self.network.clone();
+        let replacement = self.network.clone();
+        let mut network = std::mem::replace(&mut self.network, replacement);
         let config = self.config.clone();
         let proxy_selector = self.proxy_selector.clone();
         Box::pin(async move {
@@ -94,6 +96,7 @@ impl Service<Exchange> for FollowUpPolicyService {
             let mut retries = policy_trace.retry_count;
             let mut redirects = policy_trace.redirect_count;
             let mut auths = policy_trace.auth_count;
+            let mut first_network_attempt = true;
 
             loop {
                 validate_request(&request)?;
@@ -104,12 +107,17 @@ impl Service<Exchange> for FollowUpPolicyService {
 
                 let snapshot = RequestSnapshot::capture(&request);
                 apply_request_cookies(&mut request, config.cookie_jar.as_deref())?;
-                let mut svc = network.clone();
-                let result = tower::ServiceExt::ready(&mut svc)
-                    .await
-                    .map_err(|error| WireError::internal("network chain not ready", error))?
-                    .call(Exchange::new(request, ctx.clone(), attempt))
-                    .await;
+                let exchange = Exchange::new(request, ctx.clone(), attempt);
+                let result = if first_network_attempt {
+                    first_network_attempt = false;
+                    network.call(exchange).await
+                } else {
+                    tower::ServiceExt::ready(&mut network)
+                        .await
+                        .map_err(|error| WireError::internal("network chain not ready", error))?
+                        .call(exchange)
+                        .await
+                };
 
                 match result {
                     Ok(response) => {
@@ -173,6 +181,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                         }
 
                         let next_uri = resolve_redirect_uri(&snapshot.uri, location)?;
+                        validate_redirect_target(&snapshot.uri, &next_uri, &config.redirect)?;
                         ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
 
                         let next_attempt = attempt + 1;
@@ -407,9 +416,9 @@ impl RequestSnapshot {
                 WireError::redirect("cannot follow redirect for a non-replayable request body")
             })?
         } else if should_switch_to_get {
-            RequestBody::empty()
+            RequestBody::absent()
         } else {
-            self.body.unwrap_or_else(RequestBody::empty)
+            self.body.unwrap_or_else(RequestBody::absent)
         };
 
         let method = if preserve_body {
@@ -447,8 +456,11 @@ impl RequestSnapshot {
 }
 
 fn validate_request(request: &Request<RequestBody>) -> Result<(), WireError> {
-    let scheme = request
-        .uri()
+    validate_request_uri(request.uri())
+}
+
+fn validate_request_uri(uri: &Uri) -> Result<(), WireError> {
+    let scheme = uri
         .scheme_str()
         .ok_or_else(|| WireError::invalid_request("request URI is missing a scheme"))?;
 
@@ -458,8 +470,28 @@ fn validate_request(request: &Request<RequestBody>) -> Result<(), WireError> {
         ));
     }
 
-    if request.uri().host().is_none() {
+    if uri.host().is_none() {
         return Err(WireError::invalid_request("request URI is missing a host"));
+    }
+
+    Ok(())
+}
+
+fn validate_redirect_target(
+    current_uri: &Uri,
+    next_uri: &Uri,
+    config: &RedirectPolicyConfig,
+) -> Result<(), WireError> {
+    validate_request_uri(next_uri)?;
+
+    if !config.allow_insecure_redirects
+        && current_uri.scheme_str() == Some("https")
+        && next_uri.scheme_str() == Some("http")
+    {
+        return Err(WireError::redirect(format!(
+            "refusing insecure redirect from {} to {}",
+            current_uri, next_uri
+        )));
     }
 
     Ok(())
@@ -563,17 +595,28 @@ fn retry_reason(error: &WireError, config: &RetryPolicyConfig) -> Option<&'stati
 
 #[cfg(test)]
 mod tests {
-    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
-    use http::{HeaderValue, Request, StatusCode};
+    use std::task::{Context, Poll};
 
-    use super::{same_origin, PolicyTraceContext, RequestSnapshot};
+    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    use http::{HeaderValue, Request, Response, StatusCode};
+    use openwire_core::{
+        BoxFuture, BoxWireService, CallContext, Exchange, NoopEventListenerFactory, ResponseBody,
+        WireError, WireErrorKind,
+    };
+    use tower::util::BoxCloneSyncService;
+    use tower::{Service, ServiceExt};
+
+    use super::{
+        same_origin, validate_redirect_target, AuthPolicyConfig, FollowUpPolicyService,
+        PolicyConfig, PolicyTraceContext, RedirectPolicyConfig, RequestSnapshot, RetryPolicyConfig,
+    };
     use crate::proxy::{NoProxy, Proxy, ProxySelector};
     use crate::RequestBody;
 
     fn snapshot_with_headers(uri: &str, headers: &[(&http::HeaderName, &str)]) -> RequestSnapshot {
         let mut request = Request::builder()
             .uri(uri)
-            .body(RequestBody::empty())
+            .body(RequestBody::absent())
             .expect("request");
         for (name, value) in headers {
             request.headers_mut().insert(
@@ -682,5 +725,134 @@ mod tests {
             .expect("redirect request");
 
         assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn downgrade_redirects_are_rejected_by_default() {
+        let error = validate_redirect_target(
+            &"https://secure.test/start".parse().expect("current uri"),
+            &"http://secure.test/next".parse().expect("redirect uri"),
+            &RedirectPolicyConfig {
+                follow_redirects: true,
+                max_redirects: 10,
+                allow_insecure_redirects: false,
+            },
+        )
+        .expect_err("downgrade redirect should fail");
+
+        assert_eq!(error.kind(), WireErrorKind::Redirect);
+        assert!(error.to_string().contains(
+            "refusing insecure redirect from https://secure.test/start to http://secure.test/next"
+        ));
+    }
+
+    #[test]
+    fn downgrade_redirects_can_be_enabled_explicitly() {
+        validate_redirect_target(
+            &"https://secure.test/start".parse().expect("current uri"),
+            &"http://secure.test/next".parse().expect("redirect uri"),
+            &RedirectPolicyConfig {
+                follow_redirects: true,
+                max_redirects: 10,
+                allow_insecure_redirects: true,
+            },
+        )
+        .expect("downgrade redirect should be allowed");
+    }
+
+    struct ReadinessTrackingService {
+        was_polled: bool,
+        is_clone: bool,
+    }
+
+    impl Clone for ReadinessTrackingService {
+        fn clone(&self) -> Self {
+            Self {
+                was_polled: false,
+                is_clone: true,
+            }
+        }
+    }
+
+    impl Service<Exchange> for ReadinessTrackingService {
+        type Response = Response<ResponseBody>;
+        type Error = WireError;
+        type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            assert!(
+                !self.is_clone,
+                "poll_ready should not be re-run against a cloned network service",
+            );
+            self.was_polled = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _exchange: Exchange) -> Self::Future {
+            let was_polled = std::mem::take(&mut self.was_polled);
+            Box::pin(async move {
+                assert!(
+                    was_polled,
+                    "call must use the network service instance that was polled ready",
+                );
+                Ok(Response::new(ResponseBody::empty()))
+            })
+        }
+    }
+
+    fn default_policy_config() -> PolicyConfig {
+        PolicyConfig {
+            call_timeout: None,
+            cookie_jar: None,
+            auth: AuthPolicyConfig {
+                authenticator: None,
+                proxy_authenticator: None,
+                max_auth_attempts: 3,
+            },
+            retry: RetryPolicyConfig {
+                retry_on_connection_failure: true,
+                max_retries: 1,
+                retry_canceled_requests: false,
+            },
+            redirect: RedirectPolicyConfig {
+                follow_redirects: true,
+                max_redirects: 10,
+                allow_insecure_redirects: false,
+            },
+        }
+    }
+
+    fn test_exchange() -> Exchange {
+        let request = Request::builder()
+            .uri("http://example.com/")
+            .body(RequestBody::absent())
+            .expect("request");
+        let factory = std::sync::Arc::new(NoopEventListenerFactory)
+            as openwire_core::SharedEventListenerFactory;
+        let ctx = CallContext::from_factory(&factory, &request, None);
+        Exchange::new(request, ctx, 1)
+    }
+
+    #[tokio::test]
+    async fn follow_up_policy_service_preserves_ready_network_service() {
+        let network: BoxWireService = BoxCloneSyncService::new(ReadinessTrackingService {
+            was_polled: false,
+            is_clone: false,
+        });
+        let mut service = FollowUpPolicyService::new(
+            network,
+            default_policy_config(),
+            ProxySelector::new(Vec::new()),
+        );
+
+        let response = service
+            .ready()
+            .await
+            .expect("service ready")
+            .call(test_exchange())
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

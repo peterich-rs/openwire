@@ -5,6 +5,8 @@ use cookie as cookie_crate;
 use cookie_store::CookieStore;
 use http::header::HeaderValue;
 
+use crate::sync_util::{read_rwlock, write_rwlock};
+
 pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 
 /// Cookie loading and persistence for automatic request handling.
@@ -43,10 +45,7 @@ impl Jar {
             .ok()
             .map(cookie_crate::Cookie::into_owned)
             .into_iter();
-        self.0
-            .write()
-            .expect("cookie store lock")
-            .store_response_cookies(cookies, url);
+        write_rwlock(&self.0).store_response_cookies(cookies, url);
     }
 }
 
@@ -59,14 +58,11 @@ impl CookieJar for Jar {
                 .and_then(|value| cookie_crate::Cookie::parse(value).ok())
                 .map(cookie_crate::Cookie::into_owned)
         });
-        self.0
-            .write()
-            .expect("cookie store lock")
-            .store_response_cookies(cookies, url);
+        write_rwlock(&self.0).store_response_cookies(cookies, url);
     }
 
     fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
-        let store = self.0.read().expect("cookie store lock");
+        let store = read_rwlock(&self.0);
         let mut values = store.get_request_values(url).peekable();
         values.peek()?;
 
@@ -83,5 +79,27 @@ impl CookieJar for Jar {
         }
 
         HeaderValue::from_maybe_shared(Bytes::from(cookies)).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{self, AssertUnwindSafe};
+
+    use super::{CookieJar, Jar};
+
+    #[test]
+    fn jar_recovers_after_rwlock_poisoning() {
+        let jar = Jar::new();
+        let url = url::Url::parse("https://example.com/").expect("url");
+
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = jar.0.write().expect("poison cookie store lock for test");
+            panic!("poison cookie store");
+        }));
+
+        jar.add_cookie_str("session=abc; Path=/", &url);
+        let cookies = jar.cookies(&url).expect("cookies");
+        assert_eq!(cookies.to_str().ok(), Some("session=abc"));
     }
 }

@@ -20,20 +20,35 @@ pin_project! {
         #[pin]
         inner: RequestBodyInner,
         replayable_len: Option<u64>,
+        presence: RequestBodyPresence,
     }
 }
 
 impl RequestBody {
-    pub fn empty() -> Self {
+    pub fn absent() -> Self {
         Self {
             inner: RequestBodyInner::Empty,
             replayable_len: Some(0),
+            presence: RequestBodyPresence::Absent,
         }
+    }
+
+    pub fn explicit_empty() -> Self {
+        Self {
+            inner: RequestBodyInner::Empty,
+            replayable_len: Some(0),
+            presence: RequestBodyPresence::Present,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::absent()
     }
 
     pub fn from_bytes(bytes: Bytes) -> Self {
         Self {
             replayable_len: Some(bytes.len() as u64),
+            presence: RequestBodyPresence::Present,
             inner: RequestBodyInner::Replayable {
                 bytes,
                 emitted: false,
@@ -67,12 +82,16 @@ impl RequestBody {
                 inner: StreamBody::new(stream).boxed(),
             },
             replayable_len: None,
+            presence: RequestBodyPresence::Present,
         }
     }
 
     pub fn try_clone(&self) -> Option<Self> {
         match &self.inner {
-            RequestBodyInner::Empty => Some(Self::empty()),
+            RequestBodyInner::Empty => Some(match self.presence {
+                RequestBodyPresence::Absent => Self::absent(),
+                RequestBodyPresence::Present => Self::explicit_empty(),
+            }),
             RequestBodyInner::Replayable { bytes, .. } => Some(Self::from_bytes(bytes.clone())),
             RequestBodyInner::Streaming { .. } => None,
         }
@@ -81,11 +100,15 @@ impl RequestBody {
     pub fn replayable_len(&self) -> Option<u64> {
         self.replayable_len
     }
+
+    pub fn is_absent(&self) -> bool {
+        self.presence == RequestBodyPresence::Absent
+    }
 }
 
 impl Default for RequestBody {
     fn default() -> Self {
-        Self::empty()
+        Self::absent()
     }
 }
 
@@ -176,6 +199,12 @@ pin_project! {
             inner: http_body_util::combinators::BoxBody<Bytes, WireError>,
         },
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestBodyPresence {
+    Absent,
+    Present,
 }
 
 pin_project! {

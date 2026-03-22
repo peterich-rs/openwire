@@ -20,7 +20,7 @@ pub use event::{
 pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,
 };
-pub use runtime::Runtime;
+pub use runtime::{BoxTaskHandle, Runtime, TaskHandle};
 pub use tokio_rt::{TokioExecutor, TokioIo, TokioRuntime, TokioTimer};
 pub use transport::{
     BoxConnection, CoalescingInfo, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector,

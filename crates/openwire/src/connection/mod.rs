@@ -2,6 +2,7 @@
 
 mod exchange_finder;
 mod fast_fallback;
+mod limits;
 mod planning;
 mod pool;
 mod real_connection;
@@ -10,6 +11,10 @@ pub(crate) use exchange_finder::{
     ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
 };
 pub(crate) use fast_fallback::{FastFallbackDialer, FastFallbackOutcome};
+pub(crate) use limits::{
+    ConnectionAvailability, ConnectionLimiter, ConnectionPermit, RequestAdmissionLimiter,
+    RequestAdmissionPermit,
+};
 pub(crate) use planning::{
     Address, AuthorityKey, ConnectAttempt, ConnectAttemptState, ConnectFailure,
     ConnectFailureStage, ConnectPlan, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig,

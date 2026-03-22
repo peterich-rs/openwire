@@ -58,8 +58,15 @@ fn normalize_user_agent_header(request: &mut Request<RequestBody>) {
 
 fn normalize_body_headers(request: &mut Request<RequestBody>) {
     let version = request.version();
+    let body_is_absent = request.body().is_absent();
     let replayable_len = request.body().replayable_len();
     let headers = request.headers_mut();
+
+    if body_is_absent {
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(TRANSFER_ENCODING);
+        return;
+    }
 
     match replayable_len {
         Some(len) => {
@@ -81,4 +88,70 @@ fn normalize_body_headers(request: &mut Request<RequestBody>) {
 
 fn uses_chunked_transfer_encoding(version: Version) -> bool {
     version == Version::HTTP_11
+}
+
+#[cfg(test)]
+mod tests {
+    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+    use http::{Method, Request, Version};
+
+    use super::normalize_body_headers;
+    use crate::RequestBody;
+
+    #[test]
+    fn absent_body_omits_content_length() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_body_headers(&mut request);
+
+        assert!(request.headers().get(CONTENT_LENGTH).is_none());
+        assert!(request.headers().get(TRANSFER_ENCODING).is_none());
+    }
+
+    #[test]
+    fn explicit_empty_body_sets_content_length_zero() {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/")
+            .body(RequestBody::explicit_empty())
+            .expect("request");
+
+        normalize_body_headers(&mut request);
+
+        assert_eq!(
+            request
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert!(request.headers().get(TRANSFER_ENCODING).is_none());
+    }
+
+    #[test]
+    fn http11_streaming_body_uses_chunked_transfer_encoding() {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/")
+            .version(Version::HTTP_11)
+            .body(RequestBody::from_stream(futures_util::stream::empty::<
+                Result<bytes::Bytes, crate::WireError>,
+            >()))
+            .expect("request");
+
+        normalize_body_headers(&mut request);
+
+        assert!(request.headers().get(CONTENT_LENGTH).is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get(TRANSFER_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("chunked")
+        );
+    }
 }

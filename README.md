@@ -13,10 +13,14 @@ Rustls.
 - application and network interceptors
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
-- HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support
+- HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
+  including `socks5://user:pass@host:port` credentials and proxy-endpoint
+  fast fallback
 - custom DNS, TCP, TLS, and runtime hooks
 - an owned connection core with route planning, pooling, and direct HTTP/1.1 /
   HTTP/2 protocol binding
+- `RequestBody::absent()` for typical no-body requests and
+  `RequestBody::explicit_empty()` when zero-length framing must be explicit
 - optional JSON helpers behind the `json` feature
 - `openwire-cache` as a separate application-layer cache crate
 
@@ -31,6 +35,7 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
+- [docs/plans/core-review-plan-spec.md](docs/plans/core-review-plan-spec.md): implementation split for the current core review backlog
 - [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start
@@ -44,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().build()?;
     let request = Request::builder()
         .uri("http://example.com/")
-        .body(RequestBody::empty())?;
+        .body(RequestBody::absent())?;
 
     let response = client.execute(request).await?;
     println!("status = {}", response.status());
@@ -60,10 +65,19 @@ Today the repository includes:
 - application and network interceptor chains
 - redirect, retry, cookie, and authenticator follow-up handling
 - request normalization for `Host`, `User-Agent`, and body framing
-- route planning plus direct-route fast fallback
+- redirect policy defaults to rejecting `https -> http` downgrades unless
+  `ClientBuilder::allow_insecure_redirects(true)` is set
+- route planning plus TCP fast fallback across direct routes and resolved proxy
+  endpoints
+- SOCKS5 username/password tunnel authentication from proxy URL userinfo
+- request admission limits for logical in-flight calls plus fresh-connection
+  admission limits for transport fan-out
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
 - connection pooling for HTTP/1.1 and HTTP/2, including verified-authority
-  HTTPS HTTP/2 coalescing
+  HTTPS HTTP/2 coalescing and protocol-agnostic idle eviction
+- `ClientBuilder` knobs for `max_requests_total`,
+  `max_requests_per_host`, `max_connections_total`, and
+  `max_connections_per_host`
 - opt-in system proxy loading from standard environment variables
 - local performance tests and Criterion benchmarks for warm and cold paths
 

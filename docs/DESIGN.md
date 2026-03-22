@@ -107,11 +107,16 @@ Important extension traits:
 | `pool_max_idle_per_host` | `usize::MAX` |
 | `http2_keep_alive_interval` | `None` |
 | `http2_keep_alive_while_idle` | `false` |
+| `max_connections_total` | `usize::MAX` |
+| `max_connections_per_host` | `usize::MAX` |
+| `max_requests_total` | `usize::MAX` |
+| `max_requests_per_host` | `usize::MAX` |
 | `retry_canceled_requests` | `false` |
 | `retry_on_connection_failure` | `true` |
 | `max_retries` | `1` |
 | `follow_redirects` | `true` |
 | `max_redirects` | `10` |
+| `allow_insecure_redirects` | `false` |
 | `max_auth_attempts` | `3` |
 | `use_system_proxy` | `false` |
 
@@ -124,7 +129,7 @@ Extension boundary contracts:
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
-| `Runtime` | `spawn(BoxFuture<()>)` and `sleep(Duration)` | `crates/openwire-core` |
+| `Runtime` | `spawn(BoxFuture<()>) -> BoxTaskHandle` and `sleep(Duration)` | `crates/openwire-core` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
 
 Current extension-point rules:
@@ -134,7 +139,7 @@ Current extension-point rules:
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- custom runtimes must preserve `Runtime::spawn` semantics expected by bound
+- custom runtimes must return abort-capable `Runtime::spawn` handles for bound
   connection background tasks
 
 ## 5. Service Chain Construction
@@ -168,12 +173,23 @@ Construction details:
 
 Body-header rules are exact:
 
-- replayable body with known length: set `Content-Length`, remove
+- absent request body (`RequestBody::absent()` / `Default`): remove both
+  `Content-Length` and `Transfer-Encoding`
+- replayable or explicit-empty body with known length: set `Content-Length`, remove
   `Transfer-Encoding`
 - streaming body on HTTP/1.1: remove `Content-Length`, set
   `Transfer-Encoding: chunked`
 - streaming body on non-HTTP/1.1: remove both `Content-Length` and
   `Transfer-Encoding`
+
+Tower readiness rules are also exact:
+
+- interceptor layers move the polled-ready inner service into `Next`
+  instead of re-cloning and re-polling it inside `call()`
+- `FollowUpPolicyService::poll_ready()` delegates to the network chain
+- `TransportService::poll_ready()` reflects global request-admission readiness
+- follow-up retries and redirects re-poll readiness only for subsequent
+  network attempts inside the same logical call
 
 ## 6. Canonical Execution Chain
 
@@ -185,6 +201,7 @@ Client::execute(request)
     -> Call::execute()
       -> CallContext::from_factory(...)
       -> tower::ServiceExt::ready(...)
+      -> RequestAdmissionLimiter::acquire(address)
       -> Exchange::new(request, ctx, 1)
       -> build_service_chain(...)
         -> application interceptors
@@ -195,8 +212,10 @@ Client::execute(request)
           -> network interceptors
           -> TransportService::call()
             -> TransportService::execute_exchange()
+              -> request-admission permit stays attached to the response body
               -> ExchangeFinder::prepare()
               -> TransportService::acquire_connection()
+                -> wait for reusable connection or fresh-connection permit
                 -> TransportService::bind_fresh_connection() on miss
                   -> ConnectorStack::route_plan()
                   -> connect_route_plan()
@@ -207,6 +226,7 @@ Client::execute(request)
           -> store_response_cookies()
           -> authenticate_response()
           -> resolve_redirect_uri()
+          -> validate_redirect_target()
 ```
 
 No feature should bypass this chain.
@@ -219,6 +239,8 @@ No feature should bypass this chain.
 - proxy authentication
 - cookie request application
 - cookie response persistence
+- default rejection of `https -> http` downgrade redirects unless
+  `allow_insecure_redirects` is enabled
 
 `TransportService::execute_exchange()` owns:
 
@@ -226,6 +248,7 @@ No feature should bypass this chain.
 - connection acquisition
 - protocol binding on miss path
 - request execution on bound connection
+- pre-response-body RAII cleanup for acquired connections and leases
 - response-body release wrapping
 
 ## 7. Connection Core
@@ -240,7 +263,8 @@ Key internal types:
 - `ConnectionPool`: reusable connection storage and eviction policy
 - `ExchangeFinder`: pool lookup plus miss-path acquisition coordinator
 - `RoutePlanner`: direct and proxy route construction
-- `FastFallbackDialer`: staged racing across direct-route candidates
+- `FastFallbackDialer`: staged TCP racing plus route-local finalization across
+  direct and proxy candidates
 
 Current connection-core rules:
 
@@ -251,10 +275,16 @@ Current connection-core rules:
 - same-authority traffic still requires the exact-address reuse path; the
   coalescing path is only for alternate verified authorities
 - direct routes race resolved target addresses
-- proxy routes resolve proxy endpoints into `RoutePlan`, but currently dial
-  sequentially
-- target addresses behind forward proxies / CONNECT tunnels are not part of the
-  current fast-fallback race
+- proxy routes race resolved proxy endpoints and then run CONNECT / SOCKS /
+  TLS finalization on the winning or next still-viable route
+- retryable post-connect establishment failures continue to later route
+  candidates; non-retryable failures stop the race immediately
+- target addresses behind forward proxies / CONNECT / SOCKS tunnels are not
+  independently raced once a proxy connection is established
+- logical call admission is enforced before the request enters the transport
+  stack and is released when the returned response body is dropped or consumed
+- fresh-connection admission waits for either an existing reusable connection
+  or an available connection slot keyed by the logical `Address`
 - HTTP/1.1 reuse is single-exchange and body-lifecycle-driven
 - HTTP/2 reuse is admitted by bound-sender readiness instead of a separate fixed
   local stream cap
@@ -290,6 +320,9 @@ Route ownership rules:
 - `RoutePlanner::dns_target()` resolves the proxy endpoint when a proxy is
   configured, otherwise resolves the origin authority
 - `RoutePlanner::plan_*()` always returns an ordered `RoutePlan`
+- proxy URL credentials are parsed once on `Proxy` construction and carried
+  through `ProxyConfig` / `RouteKind` instead of being re-read from raw URLs in
+  transport code
 - `order_for_fast_fallback()` alternates IPv4 / IPv6 where both families are
   present and otherwise preserves resolver order within the single family
 
@@ -297,10 +330,18 @@ Pool and reuse rules:
 
 - `ExchangeFinder::prepare()` performs the first exact-address pool lookup
 - `TransportService::try_acquire_coalesced()` performs the secondary HTTPS
-  HTTP/2 coalesced lookup after route planning on miss path
+  HTTP/2 coalesced lookup after route planning on miss path, using a
+  secondary index keyed by direct target address instead of scanning the full
+  pool
+- `ConnectionBindings` is sharded by `ConnectionId` so exact-key binding
+  operations do not serialize through one global mutex
 - `ObservedIncomingBody` drives `ConnectionPool::release()` on body completion
+- `SelectedConnection` uses RAII cleanup so call timeout / cancellation before
+  request publication does not leak allocations
 - abandoning an HTTP/2 response body releases only the stream allocation; it
   does not poison the whole session
+- `ResponseLease` uses RAII cleanup so call timeout / cancellation after
+  response publication but before body wrapping does not leak allocations
 - broken HTTP/1.1 exchanges remove the connection instead of returning it to
   idle reuse
 
@@ -315,12 +356,16 @@ Operational invariants:
 - `ConnectionPool::remove()` always closes the removed connection
 - `ConnectionPool::release()` is valid only for connections that were
   previously acquired
-- pool pruning evicts non-healthy connections and idle HTTP/1.1 connections
-  past `idle_timeout`
-- HTTP/2 connections are not subject to HTTP/1.1 idle eviction rules
+- pool pruning evicts non-healthy connections and idle HTTP/1.1 or HTTP/2
+  connections past `idle_timeout`
+- `pool_max_idle_per_host` applies to every idle connection stored under the
+  logical address, not only HTTP/1.1
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
   name authorization, route overlap, and a different authority than the pooled
   connection
+- cookie jar, pool state, real connection state, and connection-task registry
+  locks recover from poisoning instead of cascading panics through subsequent
+  calls
 
 ## 8. Protocol Binding
 
@@ -354,11 +399,13 @@ connect_route_plan(...)
 Protocol-specific rules:
 
 - HTTP/1.1 uses one active exchange per connection
+- HTTP/1.1 response reuse checks `Connection` header members with RFC 9110
+  token parsing; malformed `Connection` values conservatively disable reuse
 - HTTP/2 reuses a bound sender for multiple exchanges
 - CONNECT tunnel setup preserves any bytes already read past the proxy response
   header block before handing the stream to TLS or HTTP
-- spawned background connection tasks remove bindings and pool entries on
-  termination
+- spawned background connection tasks are tracked per client lifetime, abort on
+  final owner drop, and remove bindings and pool entries on termination
 - `record_fast_fallback_trace()` writes `route_count`,
   `fast_fallback_enabled`, `connect_race_id`, and `connect_winner` into
   `openwire.attempt`
@@ -384,10 +431,13 @@ Adapter boundaries that are part of the current code shape:
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
 - background protocol tasks are spawned only through `Runtime::spawn`
+- `Runtime::spawn` must return a handle that can abort tracked background
+  protocol tasks during client shutdown
 - `call_timeout` uses the configured `Runtime` instead of directly calling
   Tokio timers
 - response-body deadline enforcement uses the same logical call deadline as the
-  request future
+  request future, with a release/acquire timeout signal between the spawned
+  sleep task and body polling
 - request policy code does not depend on Tokio-specific networking primitives
 
 ## 10. Observability And Verification
@@ -409,6 +459,8 @@ Current `EventListener` hook surface includes these call sites:
 - call lifecycle: `call_start`, `call_end`, `call_failed`
 - DNS lifecycle: `dns_start`, `dns_end`, `dns_failed`
 - connect lifecycle: `connect_start`, `connect_end`, `connect_failed`
+- raw TCP connect events are emitted by the connector itself exactly once per
+  dial attempt; proxy/tunnel failures do not synthesize a second `connect_failed`
 - TLS lifecycle: `tls_start`, `tls_end`, `tls_failed`
 - request / response body lifecycle
 - pool lookup and connection acquire / release
@@ -647,5 +699,5 @@ These are intentionally outside the current baseline:
 - response decompression policy
 - speculative connection warming
 - background pool sweeper ownership
-- broad proxy-route fast fallback
+- nested origin-address racing inside an already-established proxy tunnel
 - full negotiated HTTP/2 stream-setting ownership

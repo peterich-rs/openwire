@@ -65,11 +65,7 @@ impl Next {
     pub fn run(self, exchange: Exchange) -> BoxFuture<Result<WireResponse, WireError>> {
         Box::pin(async move {
             let mut inner = self.inner;
-            tower::ServiceExt::ready(&mut inner)
-                .await
-                .map_err(|error| WireError::interceptor("interceptor chain is not ready", error))?
-                .call(exchange)
-                .await
+            inner.call(exchange).await
         })
     }
 }
@@ -136,7 +132,107 @@ where
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let next = Next::new(BoxCloneSyncService::new(self.inner.clone()));
+        let replacement = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, replacement);
+        let next = Next::new(BoxCloneSyncService::new(inner));
         self.interceptor.intercept(exchange, next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll};
+
+    use http::Request;
+    use tower::{Service, ServiceExt};
+
+    use super::{Exchange, Interceptor, InterceptorService, Next, WireResponse};
+    use crate::{
+        BoxFuture, CallContext, NoopEventListenerFactory, RequestBody, ResponseBody, WireError,
+    };
+
+    #[derive(Clone)]
+    struct PassthroughInterceptor;
+
+    impl Interceptor for PassthroughInterceptor {
+        fn intercept(
+            &self,
+            exchange: Exchange,
+            next: Next,
+        ) -> BoxFuture<Result<WireResponse, WireError>> {
+            next.run(exchange)
+        }
+    }
+
+    struct ReadinessTrackingService {
+        was_polled: bool,
+        is_clone: bool,
+    }
+
+    impl Clone for ReadinessTrackingService {
+        fn clone(&self) -> Self {
+            Self {
+                was_polled: false,
+                is_clone: true,
+            }
+        }
+    }
+
+    impl Service<Exchange> for ReadinessTrackingService {
+        type Response = WireResponse;
+        type Error = WireError;
+        type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            assert!(
+                !self.is_clone,
+                "poll_ready should not be re-run against a cloned inner service",
+            );
+            self.was_polled = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _exchange: Exchange) -> Self::Future {
+            let was_polled = std::mem::take(&mut self.was_polled);
+            Box::pin(async move {
+                assert!(
+                    was_polled,
+                    "call must use the exact inner service instance that was polled ready",
+                );
+                Ok(http::Response::new(ResponseBody::empty()))
+            })
+        }
+    }
+
+    fn test_exchange() -> Exchange {
+        let request = Request::builder()
+            .uri("http://example.com/")
+            .body(RequestBody::absent())
+            .expect("request");
+        let factory =
+            std::sync::Arc::new(NoopEventListenerFactory) as crate::SharedEventListenerFactory;
+        let ctx = CallContext::from_factory(&factory, &request, None);
+        Exchange::new(request, ctx, 1)
+    }
+
+    #[tokio::test]
+    async fn interceptor_service_preserves_ready_inner_service() {
+        let mut service = InterceptorService {
+            inner: ReadinessTrackingService {
+                was_polled: false,
+                is_clone: false,
+            },
+            interceptor: std::sync::Arc::new(PassthroughInterceptor),
+        };
+
+        let response = service
+            .ready()
+            .await
+            .expect("service ready")
+            .call(test_exchange())
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
     }
 }

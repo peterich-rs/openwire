@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use openwire_core::{next_connection_id, CoalescingInfo, ConnectionId};
 
-use super::{Address, Route};
+use super::{Address, ConnectionPermit, Route};
+use crate::sync_util::lock_mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectionProtocol {
@@ -47,6 +48,7 @@ struct RealConnectionInner {
     route: Route,
     protocol: ConnectionProtocol,
     coalescing: CoalescingInfo,
+    _permit: Option<ConnectionPermit>,
     state: Mutex<RealConnectionState>,
 }
 
@@ -73,6 +75,16 @@ impl RealConnection {
         protocol: ConnectionProtocol,
         coalescing: CoalescingInfo,
     ) -> Self {
+        Self::with_id_permit_and_coalescing(id, route, protocol, None, coalescing)
+    }
+
+    pub(crate) fn with_id_permit_and_coalescing(
+        id: ConnectionId,
+        route: Route,
+        protocol: ConnectionProtocol,
+        permit: Option<ConnectionPermit>,
+        coalescing: CoalescingInfo,
+    ) -> Self {
         Self {
             inner: Arc::new(RealConnectionInner {
                 id,
@@ -80,6 +92,7 @@ impl RealConnection {
                 route,
                 protocol,
                 coalescing,
+                _permit: permit,
                 state: Mutex::new(RealConnectionState {
                     health: ConnectionHealth::Healthy,
                     allocations: 0,
@@ -111,7 +124,7 @@ impl RealConnection {
     }
 
     pub(crate) fn snapshot(&self) -> RealConnectionSnapshot {
-        let state = self.inner.state.lock().expect("real connection lock");
+        let state = lock_mutex(&self.inner.state);
         RealConnectionSnapshot {
             id: self.inner.id,
             protocol: self.inner.protocol,
@@ -123,7 +136,7 @@ impl RealConnection {
     }
 
     pub(crate) fn try_acquire(&self) -> bool {
-        let mut state = self.inner.state.lock().expect("real connection lock");
+        let mut state = lock_mutex(&self.inner.state);
         if state.health != ConnectionHealth::Healthy {
             return false;
         }
@@ -139,7 +152,7 @@ impl RealConnection {
     }
 
     pub(crate) fn release(&self) -> bool {
-        let mut state = self.inner.state.lock().expect("real connection lock");
+        let mut state = lock_mutex(&self.inner.state);
         if state.health == ConnectionHealth::Closed || state.allocations == 0 {
             return false;
         }
@@ -153,32 +166,32 @@ impl RealConnection {
     }
 
     pub(crate) fn mark_unhealthy(&self) {
-        let mut state = self.inner.state.lock().expect("real connection lock");
+        let mut state = lock_mutex(&self.inner.state);
         if state.health != ConnectionHealth::Closed {
             state.health = ConnectionHealth::Unhealthy;
         }
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
-        let state = self.inner.state.lock().expect("real connection lock");
+        let state = lock_mutex(&self.inner.state);
         state.health == ConnectionHealth::Healthy
     }
 
     pub(crate) fn close(&self) {
-        let mut state = self.inner.state.lock().expect("real connection lock");
+        let mut state = lock_mutex(&self.inner.state);
         state.health = ConnectionHealth::Closed;
         state.allocations = 0;
         state.idle_since = None;
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        let state = self.inner.state.lock().expect("real connection lock");
+        let state = lock_mutex(&self.inner.state);
         state.health == ConnectionHealth::Closed
     }
 
     #[cfg(test)]
     pub(crate) fn set_idle_since_for_test(&self, idle_since: Option<Instant>) {
-        let mut state = self.inner.state.lock().expect("real connection lock");
+        let mut state = lock_mutex(&self.inner.state);
         state.idle_since = idle_since;
     }
 }
@@ -198,6 +211,7 @@ fn allocation_state(state: &RealConnectionState) -> ConnectionAllocationState {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::panic::{self, AssertUnwindSafe};
 
     use super::{ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection};
     use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, Route, UriScheme};
@@ -295,5 +309,26 @@ mod tests {
 
         assert!(connection.release());
         assert!(connection.try_acquire());
+    }
+
+    #[test]
+    fn real_connection_recovers_after_state_mutex_poisoning() {
+        let connection = test_connection(ConnectionProtocol::Http1);
+
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = connection
+                .inner
+                .state
+                .lock()
+                .expect("poison real connection lock for test");
+            panic!("poison real connection state");
+        }));
+
+        assert!(connection.try_acquire());
+        assert_eq!(
+            connection.snapshot().allocation,
+            ConnectionAllocationState::InUse { allocations: 1 }
+        );
+        assert!(connection.release());
     }
 }

@@ -1,17 +1,20 @@
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::Uri;
-use openwire_core::{BoxConnection, CallContext, TcpConnector, TlsConnector, WireError};
+use openwire_core::{
+    BoxConnection, CallContext, EstablishmentStage, TcpConnector, TlsConnector, WireError,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::instrument::WithSubscriber;
 
 use super::{
-    ConnectAttemptState, ConnectFailure, ConnectFailureStage, ConnectPlan, RouteFamily, RouteKind,
-    RoutePlan,
+    ConnectAttemptState, ConnectFailure, ConnectFailureStage, ConnectPlan, Route, RouteFamily,
+    RouteKind, RoutePlan,
 };
 
 static NEXT_CONNECT_RACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -28,15 +31,20 @@ pub(crate) struct FastFallbackOutcome {
 pub(crate) struct FastFallbackDialer;
 
 impl FastFallbackDialer {
-    pub(crate) async fn dial_direct(
+    pub(crate) async fn dial_route_plan<C, CFut, F, FFut>(
         &self,
         ctx: CallContext,
         uri: Uri,
         route_plan: RoutePlan,
-        tcp_connector: Arc<dyn TcpConnector>,
-        tls_connector: Option<Arc<dyn TlsConnector>>,
-        connect_timeout: Option<Duration>,
-    ) -> Result<(BoxConnection, FastFallbackOutcome), WireError> {
+        connect: C,
+        finalize: F,
+    ) -> Result<(BoxConnection, FastFallbackOutcome), WireError>
+    where
+        C: Fn(CallContext, Route) -> CFut + Send + Sync + Clone + 'static,
+        CFut: Future<Output = Result<BoxConnection, WireError>> + Send + 'static,
+        F: Fn(CallContext, Uri, Route, BoxConnection) -> FFut + Send + Sync + Clone + 'static,
+        FFut: Future<Output = Result<BoxConnection, WireError>> + Send + 'static,
+    {
         let route_count = route_plan.len();
         let fast_fallback_enabled = route_count > 1;
         let race_id = next_connect_race_id();
@@ -47,13 +55,11 @@ impl FastFallbackDialer {
             route_count,
             fast_fallback_enabled,
             connect_race_id = race_id,
-            "planned direct connect routes",
+            "planned connect routes",
         );
 
         if route_plan.is_empty() {
-            return Err(WireError::route_exhausted(
-                "route plan produced no direct routes",
-            ));
+            return Err(WireError::route_exhausted("route plan produced no routes"));
         }
 
         let mut connect_plan = ConnectPlan::from_route_plan(&route_plan);
@@ -66,7 +72,7 @@ impl FastFallbackDialer {
                 .clone();
             let ctx = ctx.clone();
             let tx = tx.clone();
-            let tcp_connector = tcp_connector.clone();
+            let connect = connect.clone();
             handles.push(tokio::spawn(
                 async move {
                     if attempt.scheduled_after() > Duration::ZERO {
@@ -80,16 +86,7 @@ impl FastFallbackDialer {
                         route_family,
                     });
 
-                    let result = match attempt.route().kind() {
-                        RouteKind::Direct { target } => {
-                            tcp_connector.connect(ctx, *target, connect_timeout).await
-                        }
-                        other => Err(WireError::internal(
-                            format!("unexpected non-direct route in direct dialer: {other:?}"),
-                            io::Error::other("unexpected non-direct route"),
-                        )),
-                    };
-
+                    let result = connect(ctx, attempt.route().clone()).await;
                     let _ = tx.send(FastFallbackMessage::Finished {
                         route_index: index,
                         result,
@@ -100,9 +97,6 @@ impl FastFallbackDialer {
         }
         drop(tx);
 
-        let tls_required = uri
-            .scheme_str()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
         let mut last_error = None;
 
         while let Some(message) = rx.recv().await {
@@ -135,63 +129,12 @@ impl FastFallbackDialer {
                     result,
                 } => match result {
                     Ok(stream) => {
-                        if !tls_required {
-                            connect_plan.promote_winner(route_index);
-                            ctx.listener().connect_race_won(
-                                &ctx,
-                                race_id,
-                                route_index,
-                                route_count,
-                            );
-                            tracing::debug!(
-                                call_id = ctx.call_id().as_u64(),
-                                connect_race_id = race_id,
-                                route_index,
-                                route_count,
-                                "fast fallback connect attempt won",
-                            );
-                            cleanup_losers(
-                                &ctx,
-                                &mut connect_plan,
-                                race_id,
-                                route_index,
-                                route_count,
-                                &mut handles,
-                                &mut rx,
-                            )
-                            .await;
-                            return Ok((
-                                stream,
-                                FastFallbackOutcome {
-                                    race_id,
-                                    route_count,
-                                    winner_index: route_index,
-                                    fast_fallback_enabled,
-                                },
-                            ));
-                        }
-
-                        let Some(tls_connector) = tls_connector.as_ref() else {
-                            cleanup_losers(
-                                &ctx,
-                                &mut connect_plan,
-                                race_id,
-                                route_index,
-                                route_count,
-                                &mut handles,
-                                &mut rx,
-                            )
-                            .await;
-                            return Err(WireError::tls(
-                                "HTTPS requested but no TLS connector is configured",
-                                io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
-                            ));
-                        };
-
-                        match tls_connector
-                            .connect(ctx.clone(), uri.clone(), stream)
-                            .await
-                        {
+                        let route = connect_plan
+                            .attempt(route_index)
+                            .expect("connect plan should contain finished route")
+                            .route()
+                            .clone();
+                        match finalize(ctx.clone(), uri.clone(), route, stream).await {
                             Ok(stream) => {
                                 connect_plan.promote_winner(route_index);
                                 ctx.listener().connect_race_won(
@@ -228,28 +171,27 @@ impl FastFallbackDialer {
                                 ));
                             }
                             Err(error) => {
+                                let stage = failure_stage(&error);
                                 connect_plan.mark_failed(
                                     route_index,
-                                    ConnectFailure::new(
-                                        ConnectFailureStage::Tls,
-                                        error.message().to_owned(),
-                                    ),
+                                    ConnectFailure::new(stage, error.message().to_owned()),
                                 );
                                 ctx.listener().connect_race_lost(
                                     &ctx,
                                     race_id,
                                     route_index,
                                     route_count,
-                                    "tls_failed",
+                                    loss_reason(stage),
                                 );
                                 tracing::debug!(
                                     call_id = ctx.call_id().as_u64(),
                                     connect_race_id = race_id,
                                     route_index,
                                     route_count,
+                                    failure_stage = ?stage,
                                     error_kind = %error.kind(),
                                     error_message = %error.message(),
-                                    "fast fallback connect attempt lost after tls failure",
+                                    "fast fallback connect attempt lost after establishment failure",
                                 );
                                 if !error.is_retryable_establishment() {
                                     abort_all(&mut handles).await;
@@ -260,11 +202,6 @@ impl FastFallbackDialer {
                         }
                     }
                     Err(error) => {
-                        if let Some(addr) =
-                            direct_route_addr(connect_plan.attempt(route_index).expect("attempt"))
-                        {
-                            ctx.listener().connect_failed(&ctx, addr, &error);
-                        }
                         connect_plan.mark_failed(
                             route_index,
                             ConnectFailure::new(
@@ -281,6 +218,10 @@ impl FastFallbackDialer {
                             error_message = %error.message(),
                             "fast fallback connect attempt failed",
                         );
+                        if !error.is_retryable_establishment() {
+                            abort_all(&mut handles).await;
+                            return Err(error);
+                        }
                         last_error = Some(error);
                     }
                 },
@@ -291,6 +232,82 @@ impl FastFallbackDialer {
         Err(last_error.unwrap_or_else(|| {
             WireError::route_exhausted("no fast-fallback route could be connected")
         }))
+    }
+
+    pub(crate) async fn dial_direct(
+        &self,
+        ctx: CallContext,
+        uri: Uri,
+        route_plan: RoutePlan,
+        tcp_connector: Arc<dyn TcpConnector>,
+        tls_connector: Option<Arc<dyn TlsConnector>>,
+        connect_timeout: Option<Duration>,
+    ) -> Result<(BoxConnection, FastFallbackOutcome), WireError> {
+        self.dial_route_plan(
+            ctx,
+            uri,
+            route_plan,
+            move |ctx, route| {
+                let tcp_connector = tcp_connector.clone();
+                async move {
+                    match route.kind() {
+                        RouteKind::Direct { target } => {
+                            tcp_connector.connect(ctx, *target, connect_timeout).await
+                        }
+                        other => Err(WireError::internal(
+                            format!("unexpected non-direct route in direct dialer: {other:?}"),
+                            io::Error::other("unexpected non-direct route"),
+                        )),
+                    }
+                }
+            },
+            move |ctx, uri, _route, stream| {
+                let tls_connector = tls_connector.clone();
+                async move { finalize_direct_connection(ctx, uri, stream, tls_connector).await }
+            },
+        )
+        .await
+    }
+}
+
+async fn finalize_direct_connection(
+    ctx: CallContext,
+    uri: Uri,
+    stream: BoxConnection,
+    tls_connector: Option<Arc<dyn TlsConnector>>,
+) -> Result<BoxConnection, WireError> {
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    {
+        return Ok(stream);
+    }
+
+    let Some(tls_connector) = tls_connector else {
+        return Err(WireError::tls(
+            "HTTPS requested but no TLS connector is configured",
+            io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
+        ));
+    };
+
+    tls_connector.connect(ctx, uri, stream).await
+}
+
+fn failure_stage(error: &WireError) -> ConnectFailureStage {
+    match error.establishment_stage() {
+        Some(EstablishmentStage::Tls) => ConnectFailureStage::Tls,
+        Some(EstablishmentStage::ProtocolBinding) => ConnectFailureStage::ProtocolBinding,
+        Some(EstablishmentStage::ProxyTunnel) => ConnectFailureStage::ProxyTunnel,
+        _ => ConnectFailureStage::Tcp,
+    }
+}
+
+fn loss_reason(stage: ConnectFailureStage) -> &'static str {
+    match stage {
+        ConnectFailureStage::Tcp => "connect_failed",
+        ConnectFailureStage::Tls => "tls_failed",
+        ConnectFailureStage::ProtocolBinding => "protocol_failed",
+        ConnectFailureStage::ProxyTunnel => "proxy_failed",
     }
 }
 
@@ -315,13 +332,6 @@ fn route_family_label(family: RouteFamily) -> String {
     match family {
         RouteFamily::Ipv4 => "ipv4".to_owned(),
         RouteFamily::Ipv6 => "ipv6".to_owned(),
-    }
-}
-
-fn direct_route_addr(attempt: &super::ConnectAttempt) -> Option<std::net::SocketAddr> {
-    match attempt.route().kind() {
-        RouteKind::Direct { target } => Some(*target),
-        _ => None,
     }
 }
 
