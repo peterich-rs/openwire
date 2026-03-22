@@ -11,17 +11,20 @@ use futures_util::stream;
 use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT};
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
+use hyper::rt::{Sleep, Timer};
 use openwire::{
     AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DnsResolver,
     EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
-    ResponseBody, Runtime, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector,
-    TokioTcpConnector, Url, WireError, WireErrorKind,
+    ResponseBody, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url, WireError,
+    WireErrorKind,
 };
 use openwire_core::BoxConnection;
+use openwire_core::WireExecutor;
 use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
     RecordingEventListenerFactory, StaticDnsResolver,
 };
+use openwire_tokio::TokioTcpConnector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::field::{Field, Visit};
@@ -68,16 +71,16 @@ async fn client_call_timeout_applies_to_requests() {
 }
 
 #[tokio::test]
-async fn call_timeout_uses_configured_runtime_sleep() {
+async fn call_timeout_uses_configured_timer() {
     let server = spawn_http1(|_request| async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         ok_text("slow ok")
     })
     .await;
 
-    let runtime = CountingRuntime::immediate();
+    let timer = CountingTimer::immediate();
     let client = Client::builder()
-        .runtime(runtime.clone())
+        .timer(timer.clone())
         .call_timeout(Duration::from_millis(25))
         .build()
         .expect("client");
@@ -85,9 +88,9 @@ async fn call_timeout_uses_configured_runtime_sleep() {
     let error = client
         .execute(empty_request(server.http_url("/slow-runtime")))
         .await
-        .expect_err("timeout should use configured runtime");
+        .expect_err("timeout should use configured timer");
     assert_eq!(error.kind(), WireErrorKind::Timeout);
-    assert_eq!(runtime.sleep_calls(), 1);
+    assert_eq!(timer.sleep_calls(), 1);
 }
 
 #[tokio::test]
@@ -2085,7 +2088,7 @@ async fn http2_publication_failure_does_not_leave_pool_entry() {
     let events = RecordingEventListenerFactory::default();
     let client = Client::builder()
         .dns_resolver(HostMapResolver::new([("a.test".to_owned(), server.addr())]))
-        .runtime(SpawnFailingRuntime)
+        .executor(SpawnFailingRuntime)
         .event_listener_factory(events.clone())
         .tls_connector(
             RustlsTlsConnector::builder()
@@ -2122,7 +2125,7 @@ async fn dropping_client_aborts_owned_connection_tasks() {
     let server = spawn_http1(|_request| async move { ok_text("keep-alive") }).await;
     let runtime = AbortCountingRuntime::default();
     let client = Client::builder()
-        .runtime(runtime.clone())
+        .executor(runtime.clone())
         .build()
         .expect("client");
 
@@ -2724,10 +2727,10 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
 async fn call_timeout_can_fail_during_body_read() {
     let server = spawn_raw_http1_headers_then_stall_body(Duration::from_millis(200)).await;
     let events = RecordingEventListenerFactory::default();
-    let runtime = CountingRuntime::tokio();
+    let timer = CountingTimer::tokio();
     let client = Client::builder()
         .dns_resolver(StaticDnsResolver::new(server.addr()))
-        .runtime(runtime.clone())
+        .timer(timer.clone())
         .event_listener_factory(events.clone())
         .call_timeout(Duration::from_millis(25))
         .build()
@@ -2748,7 +2751,7 @@ async fn call_timeout_can_fail_during_body_read() {
         .await
         .expect_err("body should time out");
     assert_eq!(error.kind(), WireErrorKind::Timeout);
-    assert_eq!(runtime.sleep_calls(), 2);
+    assert_eq!(timer.sleep_calls(), 2);
 
     let events = events.events();
     assert_event_subsequence(
@@ -3797,12 +3800,12 @@ impl Interceptor for CancelOnceInterceptor {
 }
 
 #[derive(Clone)]
-struct CountingRuntime {
+struct CountingTimer {
     sleep_calls: Arc<AtomicUsize>,
     immediate_sleep: bool,
 }
 
-impl CountingRuntime {
+impl CountingTimer {
     fn immediate() -> Self {
         Self {
             sleep_calls: Arc::new(AtomicUsize::new(0)),
@@ -3822,25 +3825,46 @@ impl CountingRuntime {
     }
 }
 
-#[derive(Debug, Default)]
-struct NoopTaskHandle;
+#[derive(Debug)]
+struct ImmediateSleep;
 
-impl TaskHandle for NoopTaskHandle {
-    fn abort(&self) {}
+impl std::future::Future for ImmediateSleep {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(())
+    }
 }
 
-impl Runtime for CountingRuntime {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
-        tokio::spawn(future);
-        Ok(Box::new(NoopTaskHandle))
-    }
+impl Sleep for ImmediateSleep {}
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
+impl Timer for CountingTimer {
+    fn sleep(&self, duration: Duration) -> std::pin::Pin<Box<dyn Sleep>> {
         self.sleep_calls.fetch_add(1, Ordering::Relaxed);
         if self.immediate_sleep {
-            Box::pin(async {})
+            Box::pin(ImmediateSleep)
         } else {
-            Box::pin(tokio::time::sleep(duration))
+            openwire_tokio::TokioTimer::new().sleep(duration)
+        }
+    }
+
+    fn sleep_until(&self, deadline: std::time::Instant) -> std::pin::Pin<Box<dyn Sleep>> {
+        self.sleep_calls.fetch_add(1, Ordering::Relaxed);
+        if self.immediate_sleep {
+            Box::pin(ImmediateSleep)
+        } else {
+            openwire_tokio::TokioTimer::new().sleep_until(deadline)
+        }
+    }
+
+    fn reset(&self, sleep: &mut std::pin::Pin<Box<dyn Sleep>>, new_deadline: std::time::Instant) {
+        if self.immediate_sleep {
+            *sleep = Box::pin(ImmediateSleep);
+        } else {
+            openwire_tokio::TokioTimer::new().reset(sleep, new_deadline);
         }
     }
 }
@@ -3848,16 +3872,12 @@ impl Runtime for CountingRuntime {
 #[derive(Clone, Default)]
 struct SpawnFailingRuntime;
 
-impl Runtime for SpawnFailingRuntime {
+impl WireExecutor for SpawnFailingRuntime {
     fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         Err(WireError::internal(
             "scripted spawn failure",
             io::Error::other("scripted spawn failure"),
         ))
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
     }
 }
 
@@ -3884,16 +3904,12 @@ impl TaskHandle for AbortCountingTaskHandle {
     }
 }
 
-impl Runtime for AbortCountingRuntime {
+impl WireExecutor for AbortCountingRuntime {
     fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         Ok(Box::new(AbortCountingTaskHandle {
             handle: tokio::spawn(future),
             aborts: self.aborts.clone(),
         }))
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
-        Box::pin(tokio::time::sleep(duration))
     }
 }
 

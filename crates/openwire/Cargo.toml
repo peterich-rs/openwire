@@ -8,8 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["runtime-tokio", "tls-rustls", "platform-verifier"]
-runtime-tokio = []
+default = ["tls-rustls", "platform-verifier"]
 tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 json = ["openwire-core/json"]
@@ -18,13 +17,15 @@ json = ["openwire-core/json"]
 bytes.workspace = true
 cookie = "0.18.0"
 cookie_store = { version = "0.21.1", default-features = false, features = ["public_suffix"] }
-futures-util.workspace = true
+futures-channel.workspace = true
+futures-util = { workspace = true, features = ["io"] }
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
+openwire-tokio = { path = "../openwire-tokio" }
 openwire-rustls = { path = "../openwire-rustls", optional = true, default-features = false }
 pin-project-lite.workspace = true
 tokio.workspace = true

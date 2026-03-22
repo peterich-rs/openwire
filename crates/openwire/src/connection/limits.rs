@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use futures_util::task::AtomicWaker;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use futures_util::future::poll_fn;
 
 use openwire_core::WireError;
 
@@ -17,14 +16,8 @@ pub(crate) struct RequestAdmissionLimiter {
 
 #[derive(Debug)]
 struct RequestAdmissionLimiterInner {
-    global: Option<Arc<RequestGlobalState>>,
+    global: Option<Arc<AsyncSemaphore>>,
     per_address: Option<AddressSemaphoreSet>,
-}
-
-#[derive(Debug)]
-struct RequestGlobalState {
-    semaphore: Arc<Semaphore>,
-    ready_waker: AtomicWaker,
 }
 
 #[derive(Debug)]
@@ -35,7 +28,6 @@ pub(crate) struct RequestAdmissionPermit {
 
 #[derive(Debug)]
 struct RequestGlobalPermit {
-    state: Arc<RequestGlobalState>,
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -46,7 +38,7 @@ pub(crate) struct ConnectionLimiter {
 
 #[derive(Debug)]
 struct ConnectionLimiterInner {
-    global: Option<Arc<Semaphore>>,
+    global: Option<Arc<AsyncSemaphore>>,
     per_address: Option<AddressSemaphoreSet>,
     availability: ConnectionAvailability,
 }
@@ -65,7 +57,13 @@ struct ConnectionPermitInner {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConnectionAvailability {
-    notify: Arc<tokio::sync::Notify>,
+    inner: Arc<AvailabilityState>,
+}
+
+#[derive(Debug, Default)]
+struct AvailabilityState {
+    version: AtomicU64,
+    wakers: Mutex<Vec<Waker>>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,25 +74,38 @@ struct AddressSemaphoreSet {
 #[derive(Debug)]
 struct AddressSemaphoreSetInner {
     limit: usize,
-    semaphores: Mutex<HashMap<Address, Arc<Semaphore>>>,
+    semaphores: Mutex<HashMap<Address, Arc<AsyncSemaphore>>>,
 }
 
 #[derive(Debug)]
 struct AddressSemaphorePermit {
     key: Address,
     owner: AddressSemaphoreSet,
-    semaphore: Arc<Semaphore>,
+    semaphore: Arc<AsyncSemaphore>,
     permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
+struct AsyncSemaphore {
+    limit: usize,
+    state: Mutex<SemaphoreState>,
+}
+
+#[derive(Debug)]
+struct SemaphoreState {
+    available: usize,
+    wakers: Vec<Waker>,
+}
+
+#[derive(Debug)]
+struct OwnedSemaphorePermit {
+    semaphore: Arc<AsyncSemaphore>,
+    released: bool,
 }
 
 impl RequestAdmissionLimiter {
     pub(crate) fn new(max_total: usize, max_per_address: usize) -> Self {
-        let global = limit_semaphore(max_total).map(|semaphore| {
-            Arc::new(RequestGlobalState {
-                semaphore,
-                ready_waker: AtomicWaker::new(),
-            })
-        });
+        let global = limit_semaphore(max_total);
         let per_address = AddressSemaphoreSet::new(max_per_address);
         if global.is_none() && per_address.is_none() {
             return Self::default();
@@ -121,15 +132,7 @@ impl RequestAdmissionLimiter {
 
         let global = match &inner.global {
             Some(state) => Some(RequestGlobalPermit {
-                permit: Some(
-                    state
-                        .semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| limiter_closed("request global admission"))?,
-                ),
-                state: state.clone(),
+                permit: Some(state.acquire_owned().await),
             }),
             None => None,
         };
@@ -153,16 +156,7 @@ impl RequestAdmissionLimiter {
             return Poll::Ready(Ok(()));
         };
 
-        if global.semaphore.available_permits() > 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        global.ready_waker.register(cx.waker());
-        if global.semaphore.available_permits() > 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+        global.poll_ready(cx).map(Ok)
     }
 }
 
@@ -199,10 +193,9 @@ impl ConnectionLimiter {
         };
 
         let global = match &inner.global {
-            Some(semaphore) => match semaphore.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(TryAcquireError::NoPermits) => return None,
-                Err(TryAcquireError::Closed) => return None,
+            Some(semaphore) => match semaphore.try_acquire_owned() {
+                Some(permit) => Some(permit),
+                None => return None,
             },
             None => None,
         };
@@ -227,11 +220,31 @@ impl ConnectionLimiter {
 
 impl ConnectionAvailability {
     pub(crate) fn notify(&self) {
-        self.notify.notify_waiters();
+        self.inner.version.fetch_add(1, Ordering::Release);
+        let wakers = {
+            let mut wakers = self.inner.wakers.lock().expect("availability waker lock");
+            std::mem::take(&mut *wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
-    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.notify.notified()
+    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> {
+        let inner = self.inner.clone();
+        let observed = inner.version.load(Ordering::Acquire);
+        poll_fn(move |cx| {
+            if inner.version.load(Ordering::Acquire) != observed {
+                return Poll::Ready(());
+            }
+
+            register_waker(&inner.wakers, cx.waker());
+            if inner.version.load(Ordering::Acquire) != observed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
     }
 }
 
@@ -247,11 +260,7 @@ impl AddressSemaphoreSet {
 
     async fn acquire(&self, key: Address) -> Result<AddressSemaphorePermit, WireError> {
         let semaphore = self.semaphore_for(&key);
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| limiter_closed("address admission"))?;
+        let permit = semaphore.acquire_owned().await;
         Ok(AddressSemaphorePermit {
             key,
             owner: self.clone(),
@@ -262,18 +271,17 @@ impl AddressSemaphoreSet {
 
     fn try_acquire(&self, key: Address) -> Option<AddressSemaphorePermit> {
         let semaphore = self.semaphore_for(&key);
-        match semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(AddressSemaphorePermit {
+        semaphore
+            .try_acquire_owned()
+            .map(|permit| AddressSemaphorePermit {
                 key,
                 owner: self.clone(),
                 semaphore,
                 permit: Some(permit),
-            }),
-            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => None,
-        }
+            })
     }
 
-    fn semaphore_for(&self, key: &Address) -> Arc<Semaphore> {
+    fn semaphore_for(&self, key: &Address) -> Arc<AsyncSemaphore> {
         let mut semaphores = self
             .inner
             .semaphores
@@ -292,7 +300,6 @@ impl AddressSemaphoreSet {
 impl Drop for RequestGlobalPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
-        self.state.ready_waker.wake();
     }
 }
 
@@ -331,13 +338,99 @@ impl Drop for AddressSemaphorePermit {
     }
 }
 
-fn limit_semaphore(limit: usize) -> Option<Arc<Semaphore>> {
-    (limit != usize::MAX).then(|| Arc::new(Semaphore::new(limit)))
+impl AsyncSemaphore {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: Mutex::new(SemaphoreState {
+                available: limit,
+                wakers: Vec::new(),
+            }),
+        }
+    }
+
+    fn available_permits(&self) -> usize {
+        self.state.lock().expect("semaphore lock").available
+    }
+
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock().expect("semaphore lock");
+        if state.available > 0 {
+            return Poll::Ready(());
+        }
+
+        register_waker_locked(&mut state.wakers, cx.waker());
+        if state.available > 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn try_acquire_owned(self: &Arc<Self>) -> Option<OwnedSemaphorePermit> {
+        let mut state = self.state.lock().expect("semaphore lock");
+        if state.available == 0 {
+            return None;
+        }
+        state.available -= 1;
+        Some(OwnedSemaphorePermit {
+            semaphore: self.clone(),
+            released: false,
+        })
+    }
+
+    async fn acquire_owned(self: &Arc<Self>) -> OwnedSemaphorePermit {
+        let semaphore = self.clone();
+        poll_fn(move |cx| {
+            let mut state = semaphore.state.lock().expect("semaphore lock");
+            if state.available > 0 {
+                state.available -= 1;
+                return Poll::Ready(OwnedSemaphorePermit {
+                    semaphore: semaphore.clone(),
+                    released: false,
+                });
+            }
+
+            register_waker_locked(&mut state.wakers, cx.waker());
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn release(&self) {
+        let wakers = {
+            let mut state = self.state.lock().expect("semaphore lock");
+            state.available = (state.available + 1).min(self.limit);
+            std::mem::take(&mut state.wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
 }
 
-fn limiter_closed(scope: &str) -> WireError {
-    WireError::internal(
-        format!("{scope} limiter was unexpectedly closed"),
-        io::Error::other("limiter closed"),
-    )
+impl Drop for OwnedSemaphorePermit {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.semaphore.release();
+    }
+}
+
+fn limit_semaphore(limit: usize) -> Option<Arc<AsyncSemaphore>> {
+    (limit != usize::MAX).then(|| Arc::new(AsyncSemaphore::new(limit)))
+}
+
+fn register_waker(waiters: &Mutex<Vec<Waker>>, waker: &Waker) {
+    let mut waiters = waiters.lock().expect("waker lock");
+    register_waker_locked(&mut waiters, waker);
+}
+
+fn register_waker_locked(waiters: &mut Vec<Waker>, waker: &Waker) {
+    if waiters.iter().any(|existing| existing.will_wake(waker)) {
+        return;
+    }
+    waiters.push(waker.clone());
 }

@@ -11,8 +11,9 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use openwire_core::{
     BoxFuture, CallContext, ConnectionId, DnsResolver, EventListener, EventListenerFactory,
-    RequestBody, ResponseBody, SharedEventListener, TokioExecutor, TokioIo, WireError,
+    RequestBody, ResponseBody, SharedEventListener, WireError,
 };
+use openwire_tokio::{TokioExecutor, TokioIo};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;

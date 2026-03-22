@@ -1,5 +1,5 @@
 [package]
-name = "openwire-test"
+name = "openwire-tokio"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -8,15 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bytes.workspace = true
-futures-util.workspace = true
-http.workspace = true
-http-body-util.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
-openwire-tokio = { path = "../openwire-tokio" }
-rcgen.workspace = true
-rustls.workspace = true
+pin-project-lite.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tracing.workspace = true

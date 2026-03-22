@@ -6,11 +6,14 @@ use futures_util::future::{select, Either};
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
+use hyper::rt::Timer;
 use openwire_core::{
-    BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
-    NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
-    SharedInterceptor, TcpConnector, TlsConnector, TokioRuntime, WireError,
+    Authenticator, BoxWireService, CallContext, CookieJar, DnsResolver, EventListenerFactory,
+    Exchange, InterceptorLayer, NoopEventListenerFactory, RedirectPolicy, RequestBody,
+    ResponseBody, RetryPolicy, SharedEventListenerFactory, SharedInterceptor, SharedTimer,
+    TcpConnector, TlsConnector, WireError, WireExecutor,
 };
+use openwire_tokio::{SystemDnsResolver, TokioExecutor, TokioTcpConnector, TokioTimer};
 use pin_project_lite::pin_project;
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -18,18 +21,18 @@ use tower::Service;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
-use crate::auth::{Authenticator, SharedAuthenticator};
+use crate::auth::SharedAuthenticator;
 use crate::bridge::BridgeInterceptor;
 use crate::connection::{
-    Address, ConnectionPool, ExchangeFinder, PoolSettings, RequestAdmissionLimiter,
-    RequestAdmissionPermit, RoutePlanner,
+    Address, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
+    RequestAdmissionLimiter, RequestAdmissionPermit, RoutePlanner,
 };
-use crate::cookie::{CookieJar, SharedCookieJar};
+use crate::cookie::SharedCookieJar;
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
 use crate::proxy::{system_proxies_from_env, Proxy, ProxySelector};
-use crate::transport::{ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService};
+use crate::transport::{ConnectorStack, TransportService};
 
 #[derive(Clone)]
 pub struct Client {
@@ -38,7 +41,7 @@ pub struct Client {
 
 struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
-    runtime: Arc<dyn Runtime>,
+    timer: SharedTimer,
     call_timeout: Option<Duration>,
     proxy_selector: ProxySelector,
     request_admission: RequestAdmissionLimiter,
@@ -67,12 +70,14 @@ pub struct ClientBuilder {
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     event_listener_factory: SharedEventListenerFactory,
-    runtime: Arc<dyn Runtime>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     transport: TransportConfig,
     policy: PolicyConfig,
     dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
+    route_planner: Arc<dyn RoutePlanner>,
     proxies: Vec<Proxy>,
     use_system_proxy: bool,
 }
@@ -106,11 +111,19 @@ impl ClientBuilder {
         self
     }
 
-    pub fn runtime<R>(mut self, runtime: R) -> Self
+    pub fn executor<E>(mut self, executor: E) -> Self
     where
-        R: Runtime,
+        E: WireExecutor,
     {
-        self.runtime = Arc::new(runtime);
+        self.executor = Arc::new(executor);
+        self
+    }
+
+    pub fn timer<T>(mut self, timer: T) -> Self
+    where
+        T: Timer + Send + Sync + 'static,
+    {
+        self.timer = SharedTimer::new(timer);
         self
     }
 
@@ -135,6 +148,14 @@ impl ClientBuilder {
         T: TlsConnector,
     {
         self.tls_connector = Some(Arc::new(connector));
+        self
+    }
+
+    pub fn route_planner<P>(mut self, planner: P) -> Self
+    where
+        P: RoutePlanner,
+    {
+        self.route_planner = Arc::new(planner);
         self
     }
 
@@ -192,27 +213,39 @@ impl ClientBuilder {
     }
 
     pub fn follow_redirects(mut self, enabled: bool) -> Self {
-        self.policy.redirect.follow_redirects = enabled;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_follow_redirects(enabled);
         self
     }
 
     pub fn max_redirects(mut self, max_redirects: usize) -> Self {
-        self.policy.redirect.max_redirects = max_redirects;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_max_redirects(max_redirects);
         self
     }
 
     pub fn allow_insecure_redirects(mut self, enabled: bool) -> Self {
-        self.policy.redirect.allow_insecure_redirects = enabled;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_allow_insecure_redirects(enabled);
         self
     }
 
     pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
-        self.policy.retry.retry_on_connection_failure = enabled;
+        self.policy
+            .retry
+            .default_mut()
+            .set_retry_on_connection_failure(enabled);
         self
     }
 
     pub fn max_retries(mut self, max_retries: usize) -> Self {
-        self.policy.retry.max_retries = max_retries;
+        self.policy.retry.default_mut().set_max_retries(max_retries);
         self
     }
 
@@ -257,7 +290,26 @@ impl ClientBuilder {
     }
 
     pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
-        self.policy.retry.retry_canceled_requests = enabled;
+        self.policy
+            .retry
+            .default_mut()
+            .set_retry_canceled_requests(enabled);
+        self
+    }
+
+    pub fn retry_policy<P>(mut self, policy: P) -> Self
+    where
+        P: RetryPolicy,
+    {
+        self.policy.retry.set_custom(policy);
+        self
+    }
+
+    pub fn redirect_policy<P>(mut self, policy: P) -> Self
+    where
+        P: RedirectPolicy,
+    {
+        self.policy.redirect.set_custom(policy);
         self
     }
 
@@ -294,7 +346,9 @@ impl ClientBuilder {
             tcp_connector: self.tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
-            route_planner: RoutePlanner::default(),
+            executor: self.executor.clone(),
+            timer: self.timer.clone(),
+            route_planner: self.route_planner,
             proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
         };
@@ -302,7 +356,8 @@ impl ClientBuilder {
         let transport = TransportService::new(
             connector,
             self.transport.clone(),
-            self.runtime.clone(),
+            self.executor.clone(),
+            self.timer.clone(),
             exchange_finder,
             request_admission.clone(),
         );
@@ -317,7 +372,7 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner {
                 event_listener_factory: self.event_listener_factory,
-                runtime: self.runtime,
+                timer: self.timer,
                 call_timeout: self.policy.call_timeout,
                 proxy_selector,
                 request_admission,
@@ -333,7 +388,8 @@ impl Default for ClientBuilder {
             application_interceptors: Vec::new(),
             network_interceptors: Vec::new(),
             event_listener_factory: Arc::new(NoopEventListenerFactory),
-            runtime: Arc::new(TokioRuntime),
+            executor: Arc::new(TokioExecutor::new()),
+            timer: SharedTimer::new(TokioTimer::new()),
             transport: TransportConfig {
                 connect_timeout: None,
                 pool_idle_timeout: Some(Duration::from_secs(90)),
@@ -353,20 +409,13 @@ impl Default for ClientBuilder {
                     proxy_authenticator: None,
                     max_auth_attempts: 3,
                 },
-                retry: RetryPolicyConfig {
-                    retry_on_connection_failure: true,
-                    max_retries: 1,
-                    retry_canceled_requests: false,
-                },
-                redirect: RedirectPolicyConfig {
-                    follow_redirects: true,
-                    max_redirects: 10,
-                    allow_insecure_redirects: false,
-                },
+                retry: RetryPolicyConfig::default(),
+                redirect: RedirectPolicyConfig::default(),
             },
             dns_resolver: Arc::new(SystemDnsResolver),
             tcp_connector: Arc::new(TokioTcpConnector),
             tls_connector: None,
+            route_planner: Arc::new(DefaultRoutePlanner::default()),
             proxies: Vec::new(),
             use_system_proxy: false,
         }
@@ -383,10 +432,6 @@ impl Client {
             client: self.clone(),
             request,
         }
-    }
-
-    pub fn runtime(&self) -> Arc<dyn Runtime> {
-        self.inner.runtime.clone()
     }
 
     pub async fn execute(
@@ -434,8 +479,7 @@ impl Call {
             };
 
             let result =
-                with_call_deadline(self.client.inner.runtime.clone(), ctx.deadline(), execute)
-                    .await;
+                with_call_deadline(self.client.inner.timer.clone(), ctx.deadline(), execute).await;
 
             match result {
                 Ok(response) => {
@@ -498,7 +542,7 @@ fn build_service_chain(
 }
 
 async fn with_call_deadline<F>(
-    runtime: Arc<dyn Runtime>,
+    timer: SharedTimer,
     deadline: Option<std::time::Instant>,
     future: F,
 ) -> Result<Response<ResponseBody>, WireError>
@@ -511,7 +555,7 @@ where
 
     let timeout = deadline.saturating_duration_since(std::time::Instant::now());
     let future = Box::pin(future);
-    let sleep = runtime.sleep(timeout);
+    let sleep = timer.sleep(timeout);
 
     match select(future, sleep).await {
         Either::Left((result, _sleep)) => result,

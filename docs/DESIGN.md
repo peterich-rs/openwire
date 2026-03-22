@@ -23,12 +23,17 @@ Primary goals:
 openwire/
 ├── crates/openwire          public API, policy layer, transport integration
 ├── crates/openwire-cache    application-layer cache interceptor
-├── crates/openwire-core     shared body, error, event, runtime, transport traits
+├── crates/openwire-core     shared body, error, event, executor/timer, transport, and policy traits
+├── crates/openwire-tokio    Tokio executor, timer, I/O, DNS, and TCP adapters
 ├── crates/openwire-rustls   optional Rustls TLS connector
 ├── crates/openwire-test     test support
 └── docs/
-    ├── DESIGN.md            canonical technical design
-    └── tasks.md             deferred follow-on tracker
+    ├── DESIGN.md                    canonical technical design
+    ├── core-review.md               completed review summary and doc index
+    ├── plans/
+    │   └── core-review-plan-spec.md historical core-review closure map
+    ├── trait-oriented-redesign.md   completed trait/crate-boundary redesign closure
+    └── tasks.md                     deferred follow-on tracker
 ```
 
 Layering rules:
@@ -37,6 +42,8 @@ Layering rules:
 - `openwire` owns public API, follow-up policy, and connection orchestration
 - `openwire-rustls` stays swappable behind `TlsConnector`
 - `openwire-cache` remains an application-layer crate, not transport logic
+- `docs/DESIGN.md` tracks the current implementation; plan docs must call out
+  any deliberate baseline deltas explicitly
 
 Source-file map for the main runtime path:
 
@@ -48,7 +55,8 @@ Source-file map for the main runtime path:
 | `crates/openwire/src/bridge.rs` | `BridgeInterceptor`, request normalization |
 | `crates/openwire/src/transport.rs` | `TransportService`, `ConnectorStack`, direct binding, response-body release |
 | `crates/openwire/src/connection/exchange_finder.rs` | `ExchangeFinder`, pool-hit / miss preparation |
-| `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner` |
+| `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner`, `DefaultRoutePlanner` |
+| `crates/openwire/src/connection/limits.rs` | `RequestAdmissionLimiter`, `ConnectionLimiter`, `ConnectionPermit` |
 | `crates/openwire/src/connection/fast_fallback.rs` | `FastFallbackDialer`, `ConnectPlan` |
 | `crates/openwire/src/connection/pool.rs` | `ConnectionPool` |
 | `crates/openwire/src/connection/real_connection.rs` | `RealConnection` |
@@ -60,8 +68,8 @@ Source-file map for the main runtime path:
 | HTTP protocol state | Adopt from `hyper` | `hyper` |
 | Request policy / follow-ups | OpenWire-owned | `openwire` |
 | Connection acquisition / pooling / route planning | OpenWire-owned | `openwire` |
-| Fast fallback for direct routes | OpenWire-owned | `FastFallbackDialer` |
-| Runtime integration | OpenWire-owned trait boundary | Tokio |
+| Fast fallback for route dialing | OpenWire-owned | `FastFallbackDialer` |
+| Task execution / timing | OpenWire-owned trait boundaries | Tokio executor + timer |
 | DNS | Trait boundary + default adapter | system resolver |
 | TCP | Trait boundary + default adapter | Tokio TCP |
 | TLS | Trait boundary + default adapter | Rustls |
@@ -88,16 +96,21 @@ Important extension traits:
 - `EventListener` / `EventListenerFactory`
 - `CookieJar`
 - `Authenticator`
+- `RetryPolicy`
+- `RedirectPolicy`
 - `DnsResolver`
 - `TcpConnector`
 - `TlsConnector`
-- `Runtime`
+- `RoutePlanner`
+- `WireExecutor`
+- `hyper::rt::Timer`
 
 `ClientBuilder::default()` currently resolves to these concrete defaults:
 
 | Setting | Default |
 |---|---|
-| runtime | `TokioRuntime` |
+| executor | `TokioExecutor` |
+| timer | `TokioTimer` |
 | DNS | `SystemDnsResolver` |
 | TCP | `TokioTcpConnector` |
 | TLS | `RustlsTlsConnector::builder().build()?` when `tls-rustls` is enabled |
@@ -124,23 +137,33 @@ Extension boundary contracts:
 
 | Trait | Method Contract | Current Owner |
 |---|---|---|
-| `CookieJar` | `set_cookies(&mut Iterator<Item=&HeaderValue>, &Url)` and `cookies(&Url) -> Option<HeaderValue>` | `crates/openwire/src/cookie.rs` |
-| `Authenticator` | `authenticate(AuthContext) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>>` | `crates/openwire/src/auth.rs` |
+| `CookieJar` | `set_cookies(&mut Iterator<Item=&HeaderValue>, &Url)` and `cookies(&Url) -> Option<HeaderValue>` | `crates/openwire-core/src/cookie.rs` |
+| `Authenticator` | `authenticate(AuthContext) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>>` | `crates/openwire-core/src/auth.rs` |
+| `RetryPolicy` | `should_retry(&RetryContext) -> Option<&'static str>` | `crates/openwire-core/src/policy.rs` |
+| `RedirectPolicy` | `should_redirect(&RedirectContext) -> RedirectDecision` | `crates/openwire-core/src/policy.rs` |
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
-| `Runtime` | `spawn(BoxFuture<()>) -> BoxTaskHandle` and `sleep(Duration)` | `crates/openwire-core` |
+| `RoutePlanner` | `dns_target(&Address) -> (String, u16)` and `plan(&Address, Vec<SocketAddr>) -> Result<RoutePlan, WireError>` | `crates/openwire/src/connection/planning.rs` |
+| `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
+| `hyper::rt::Timer` | `sleep`, `sleep_until`, `reset`, `now` | external trait configured through `ClientBuilder::timer(...)` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
+
+Connector interop helpers exported from `openwire-core`:
+
+- `DnsRequest`, `TcpConnectRequest`, `TlsConnectRequest`
+- `TowerDnsResolver`, `TowerTcpConnector`, `TowerTlsConnector`
+- `DnsResolverService`, `TcpConnectorService`, `TlsConnectorService`
 
 Current extension-point rules:
 
-- `CookieJar` and `Authenticator` are policy-layer integrations and must not
-  own transport decisions
+- `CookieJar` and `Authenticator` live in `openwire-core`, but remain
+  policy-layer integrations and must not own transport decisions
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- custom runtimes must return abort-capable `Runtime::spawn` handles for bound
-  connection background tasks
+- custom executors own bound-connection background-task spawning through `WireExecutor`
+- custom timers supply call deadlines, body deadlines, CONNECT/SOCKS timeouts, and HTTP/2 binding timers through `ClientBuilder::timer(...)`
 
 ## 5. Service Chain Construction
 
@@ -262,7 +285,7 @@ Key internal types:
 - `RealConnection`: owned live connection state
 - `ConnectionPool`: reusable connection storage and eviction policy
 - `ExchangeFinder`: pool lookup plus miss-path acquisition coordinator
-- `RoutePlanner`: direct and proxy route construction
+- `RoutePlanner`: replaceable direct and proxy route construction
 - `FastFallbackDialer`: staged TCP racing plus route-local finalization across
   direct and proxy candidates
 
@@ -312,14 +335,15 @@ TransportService::bind_fresh_connection(...)
     -> connect_via_socks_proxy(...) for `RouteKind::SocksProxy`
 ```
 
-Current `RoutePlanner::default()` uses a fixed fast-fallback stagger of
+Current `DefaultRoutePlanner::default()` uses a fixed fast-fallback stagger of
 `Duration::from_millis(250)`.
 
 Route ownership rules:
 
 - `RoutePlanner::dns_target()` resolves the proxy endpoint when a proxy is
   configured, otherwise resolves the origin authority
-- `RoutePlanner::plan_*()` always returns an ordered `RoutePlan`
+- `DefaultRoutePlanner::plan_*()` always returns an ordered `RoutePlan`
+- `RoutePlan` carries the fast-fallback stagger consumed by the shared dialer
 - proxy URL credentials are parsed once on `Proxy` construction and carried
   through `ProxyConfig` / `RouteKind` instead of being re-read from raw URLs in
   transport code
@@ -410,14 +434,17 @@ Protocol-specific rules:
   `fast_fallback_enabled`, `connect_race_id`, and `connect_winner` into
   `openwire.attempt`
 
-## 9. Runtime And Adapter Boundaries
+## 9. Execution And Adapter Boundaries
 
 Current default adapters:
 
-- Tokio runtime through `Runtime`
-- system DNS through `DnsResolver`
-- Tokio TCP through `TcpConnector`
-- Rustls through `TlsConnector`
+- Tokio executor through `openwire-tokio::TokioExecutor`
+- Tokio timer through `openwire-tokio::TokioTimer`
+- system DNS through `openwire-tokio::SystemDnsResolver`
+- Tokio TCP through `openwire-tokio::TokioTcpConnector`
+- Rustls through `openwire_rustls::RustlsTlsConnector`
+- Tokio adapter types are imported from `openwire-tokio` directly; `openwire`
+  no longer re-exports them
 
 Design constraints:
 
@@ -430,14 +457,19 @@ Adapter boundaries that are part of the current code shape:
 - DNS resolution happens only through `DnsResolver`
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
-- background protocol tasks are spawned only through `Runtime::spawn`
-- `Runtime::spawn` must return a handle that can abort tracked background
+- `openwire-core` exposes `TowerDnsResolver`, `TowerTcpConnector`,
+  `TowerTlsConnector`, `DnsResolverService`, `TcpConnectorService`, and
+  `TlsConnectorService` for tower interop without changing the core traits
+- HTTP/2 binding uses `HyperExecutor` over the configured `WireExecutor` plus
+  the configured `hyper::rt::Timer`
+- background protocol tasks are spawned only through `WireExecutor::spawn`
+- `WireExecutor::spawn` must return a handle that can abort tracked background
   protocol tasks during client shutdown
-- `call_timeout` uses the configured `Runtime` instead of directly calling
-  Tokio timers
+- `call_timeout`, response-body deadlines, and proxy tunnel timeouts use the
+  configured `hyper::rt::Timer`
 - response-body deadline enforcement uses the same logical call deadline as the
   request future, with a release/acquire timeout signal between the spawned
-  sleep task and body polling
+  timer task and body polling
 - request policy code does not depend on Tokio-specific networking primitives
 
 ## 10. Observability And Verification

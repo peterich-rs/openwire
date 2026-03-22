@@ -513,9 +513,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-io",
  "futures-macro",
  "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -1012,6 +1014,7 @@ dependencies = [
  "cookie",
  "cookie_store",
  "criterion",
+ "futures-channel",
  "futures-util",
  "http",
  "http-body",
@@ -1021,6 +1024,7 @@ dependencies = [
  "openwire-core",
  "openwire-rustls",
  "openwire-test",
+ "openwire-tokio",
  "pin-project-lite",
  "serde_json",
  "tokio",
@@ -1048,7 +1052,6 @@ dependencies = [
 name = "openwire-core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "futures-core",
  "futures-util",
@@ -1064,6 +1067,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1076,6 +1080,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "openwire-core",
+ "openwire-tokio",
  "pin-project-lite",
  "rustls",
  "rustls-native-certs",
@@ -1097,10 +1102,23 @@ dependencies = [
  "http-body-util",
  "hyper",
  "openwire-core",
+ "openwire-tokio",
  "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "openwire-tokio"
+version = "0.1.0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "openwire-core",
+ "pin-project-lite",
+ "tokio",
  "tracing",
 ]
 

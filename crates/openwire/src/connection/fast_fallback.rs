@@ -4,12 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_channel::{mpsc, oneshot};
+use futures_util::future::{AbortHandle, Abortable};
+use futures_util::stream::StreamExt;
+use hyper::rt::Timer;
 use hyper::Uri;
 use openwire_core::{
-    BoxConnection, CallContext, EstablishmentStage, TcpConnector, TlsConnector, WireError,
+    BoxConnection, CallContext, EstablishmentStage, SharedTimer, TcpConnector, TlsConnector,
+    WireError, WireExecutor,
 };
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::instrument::WithSubscriber;
 
 use super::{
@@ -30,12 +33,50 @@ pub(crate) struct FastFallbackOutcome {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FastFallbackDialer;
 
+#[derive(Clone)]
+pub(crate) struct FastFallbackRuntime {
+    pub(crate) executor: Arc<dyn WireExecutor>,
+    pub(crate) timer: SharedTimer,
+}
+
+impl FastFallbackRuntime {
+    pub(crate) fn new(executor: Arc<dyn WireExecutor>, timer: SharedTimer) -> Self {
+        Self { executor, timer }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DirectDialDeps {
+    pub(crate) runtime: FastFallbackRuntime,
+    pub(crate) tcp_connector: Arc<dyn TcpConnector>,
+    pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
+    pub(crate) connect_timeout: Option<Duration>,
+}
+
+impl DirectDialDeps {
+    pub(crate) fn new(
+        executor: Arc<dyn WireExecutor>,
+        timer: SharedTimer,
+        tcp_connector: Arc<dyn TcpConnector>,
+        tls_connector: Option<Arc<dyn TlsConnector>>,
+        connect_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            runtime: FastFallbackRuntime::new(executor, timer),
+            tcp_connector,
+            tls_connector,
+            connect_timeout,
+        }
+    }
+}
+
 impl FastFallbackDialer {
     pub(crate) async fn dial_route_plan<C, CFut, F, FFut>(
         &self,
         ctx: CallContext,
         uri: Uri,
         route_plan: RoutePlan,
+        runtime: FastFallbackRuntime,
         connect: C,
         finalize: F,
     ) -> Result<(BoxConnection, FastFallbackOutcome), WireError>
@@ -63,8 +104,8 @@ impl FastFallbackDialer {
         }
 
         let mut connect_plan = ConnectPlan::from_route_plan(&route_plan);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut handles = Vec::new();
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut tasks = Vec::new();
         for index in 0..route_count {
             let attempt = connect_plan
                 .attempt(index)
@@ -73,33 +114,51 @@ impl FastFallbackDialer {
             let ctx = ctx.clone();
             let tx = tx.clone();
             let connect = connect.clone();
-            handles.push(tokio::spawn(
-                async move {
-                    if attempt.scheduled_after() > Duration::ZERO {
-                        tokio::time::sleep(attempt.scheduled_after()).await;
-                    }
-                    let route_family = route_family_label(attempt.route().family());
-                    let _ = tx.send(FastFallbackMessage::Started {
-                        race_id,
-                        route_index: index,
-                        route_count,
-                        route_family,
-                    });
+            let timer = runtime.timer.clone();
+            let (abort, abort_registration) = AbortHandle::new_pair();
+            let (done_tx, done_rx) = oneshot::channel();
+            let future = async move {
+                let _ = Abortable::new(
+                    async move {
+                        if attempt.scheduled_after() > Duration::ZERO {
+                            timer.sleep(attempt.scheduled_after()).await;
+                        }
+                        let route_family = route_family_label(attempt.route().family());
+                        let _ = tx.unbounded_send(FastFallbackMessage::Started {
+                            race_id,
+                            route_index: index,
+                            route_count,
+                            route_family,
+                        });
 
-                    let result = connect(ctx, attempt.route().clone()).await;
-                    let _ = tx.send(FastFallbackMessage::Finished {
-                        route_index: index,
-                        result,
-                    });
-                }
-                .with_current_subscriber(),
-            ));
+                        let result = connect(ctx, attempt.route().clone()).await;
+                        let _ = tx.unbounded_send(FastFallbackMessage::Finished {
+                            route_index: index,
+                            result,
+                        });
+                    },
+                    abort_registration,
+                )
+                .await;
+                let _ = done_tx.send(());
+            };
+            if let Err(error) = runtime
+                .executor
+                .spawn(Box::pin(future.with_current_subscriber()))
+            {
+                abort_all(&mut tasks).await;
+                return Err(error);
+            }
+            tasks.push(RaceTask {
+                abort,
+                done: Some(done_rx),
+            });
         }
         drop(tx);
 
         let mut last_error = None;
 
-        while let Some(message) = rx.recv().await {
+        while let Some(message) = rx.next().await {
             match message {
                 FastFallbackMessage::Started {
                     race_id,
@@ -156,7 +215,7 @@ impl FastFallbackDialer {
                                     race_id,
                                     route_index,
                                     route_count,
-                                    &mut handles,
+                                    &mut tasks,
                                     &mut rx,
                                 )
                                 .await;
@@ -194,7 +253,7 @@ impl FastFallbackDialer {
                                     "fast fallback connect attempt lost after establishment failure",
                                 );
                                 if !error.is_retryable_establishment() {
-                                    abort_all(&mut handles).await;
+                                    abort_all(&mut tasks).await;
                                     return Err(error);
                                 }
                                 last_error = Some(error);
@@ -219,7 +278,7 @@ impl FastFallbackDialer {
                             "fast fallback connect attempt failed",
                         );
                         if !error.is_retryable_establishment() {
-                            abort_all(&mut handles).await;
+                            abort_all(&mut tasks).await;
                             return Err(error);
                         }
                         last_error = Some(error);
@@ -228,7 +287,7 @@ impl FastFallbackDialer {
             }
         }
 
-        abort_all(&mut handles).await;
+        abort_all(&mut tasks).await;
         Err(last_error.unwrap_or_else(|| {
             WireError::route_exhausted("no fast-fallback route could be connected")
         }))
@@ -239,16 +298,16 @@ impl FastFallbackDialer {
         ctx: CallContext,
         uri: Uri,
         route_plan: RoutePlan,
-        tcp_connector: Arc<dyn TcpConnector>,
-        tls_connector: Option<Arc<dyn TlsConnector>>,
-        connect_timeout: Option<Duration>,
+        deps: DirectDialDeps,
     ) -> Result<(BoxConnection, FastFallbackOutcome), WireError> {
         self.dial_route_plan(
             ctx,
             uri,
             route_plan,
+            deps.runtime.clone(),
             move |ctx, route| {
-                let tcp_connector = tcp_connector.clone();
+                let tcp_connector = deps.tcp_connector.clone();
+                let connect_timeout = deps.connect_timeout;
                 async move {
                     match route.kind() {
                         RouteKind::Direct { target } => {
@@ -262,7 +321,7 @@ impl FastFallbackDialer {
                 }
             },
             move |ctx, uri, _route, stream| {
-                let tls_connector = tls_connector.clone();
+                let tls_connector = deps.tls_connector.clone();
                 async move { finalize_direct_connection(ctx, uri, stream, tls_connector).await }
             },
         )
@@ -324,6 +383,11 @@ enum FastFallbackMessage {
     },
 }
 
+struct RaceTask {
+    abort: AbortHandle,
+    done: Option<oneshot::Receiver<()>>,
+}
+
 fn next_connect_race_id() -> u64 {
     NEXT_CONNECT_RACE_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -341,13 +405,13 @@ async fn cleanup_losers(
     race_id: u64,
     winner_index: usize,
     route_count: usize,
-    handles: &mut [JoinHandle<()>],
+    tasks: &mut [RaceTask],
     rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage>,
 ) {
     let mut canceled_routes = vec![false; route_count];
-    for (index, handle) in handles.iter_mut().enumerate() {
+    for (index, task) in tasks.iter_mut().enumerate() {
         if index != winner_index {
-            handle.abort();
+            task.abort.abort();
         }
     }
     for index in 0..route_count {
@@ -361,9 +425,9 @@ async fn cleanup_losers(
             &mut canceled_routes,
         );
     }
-    abort_all(handles).await;
+    abort_all(tasks).await;
 
-    while let Some(message) = rx.recv().await {
+    while let Some(message) = rx.next().await {
         if let FastFallbackMessage::Finished {
             route_index,
             result: Ok(stream),
@@ -417,12 +481,14 @@ fn emit_canceled_loss_if_needed(
     }
 }
 
-async fn abort_all(handles: &mut [JoinHandle<()>]) {
-    for handle in handles.iter_mut() {
-        handle.abort();
+async fn abort_all(tasks: &mut [RaceTask]) {
+    for task in tasks.iter_mut() {
+        task.abort.abort();
     }
-    for handle in handles.iter_mut() {
-        let _ = handle.await;
+    for task in tasks.iter_mut() {
+        if let Some(done) = task.done.take() {
+            let _ = done.await;
+        }
     }
 }
 
@@ -441,13 +507,15 @@ mod tests {
     use hyper_util::client::legacy::connect::{Connected, Connection};
     use openwire_core::{
         BoxConnection, CallContext, ConnectionInfo, NoopEventListenerFactory,
-        SharedEventListenerFactory, WireError, WireErrorKind,
+        SharedEventListenerFactory, SharedTimer, TlsConnector, WireError, WireErrorKind,
+        WireExecutor,
     };
     use tokio::sync::Notify;
 
     use super::FastFallbackDialer;
     use crate::connection::{
-        Address, AuthorityKey, DnsPolicy, ProtocolPolicy, RoutePlan, RoutePlanner, UriScheme,
+        Address, AuthorityKey, DefaultRoutePlanner, DirectDialDeps, DnsPolicy, ProtocolPolicy,
+        RoutePlan, RoutePlanner, UriScheme,
     };
 
     #[derive(Clone)]
@@ -611,7 +679,7 @@ mod tests {
     }
 
     struct TestConnection {
-        inner: openwire_core::TokioIo<tokio::io::DuplexStream>,
+        inner: openwire_tokio::TokioIo<tokio::io::DuplexStream>,
         info: ConnectionInfo,
         drops: Arc<AtomicUsize>,
     }
@@ -620,7 +688,7 @@ mod tests {
         fn new(info: ConnectionInfo, drops: Arc<AtomicUsize>) -> Self {
             let (stream, _peer) = tokio::io::duplex(64);
             Self {
-                inner: openwire_core::TokioIo::new(stream),
+                inner: openwire_tokio::TokioIo::new(stream),
                 info,
                 drops,
             }
@@ -680,7 +748,7 @@ mod tests {
     }
 
     fn route_plan_with_stagger(stagger: Duration, addrs: Vec<SocketAddr>) -> RoutePlan {
-        let planner = RoutePlanner::new(stagger);
+        let planner = DefaultRoutePlanner::new(stagger);
         let address = Address::new(
             UriScheme::Https,
             AuthorityKey::new("example.com", 443),
@@ -690,6 +758,19 @@ mod tests {
             DnsPolicy::System,
         );
         planner.plan_direct(address, addrs)
+    }
+
+    fn direct_dial_deps(
+        tcp: Arc<ScriptedTcpConnector>,
+        tls: Option<Arc<ScriptedTlsConnector>>,
+    ) -> DirectDialDeps {
+        DirectDialDeps::new(
+            Arc::new(openwire_tokio::TokioExecutor::new()) as Arc<dyn WireExecutor>,
+            SharedTimer::new(openwire_tokio::TokioTimer::new()),
+            tcp,
+            tls.map(|tls| tls as Arc<dyn TlsConnector>),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -725,9 +806,7 @@ mod tests {
                 ctx(),
                 "https://example.com/".parse().expect("uri"),
                 route_plan_with_stagger(Duration::from_millis(1), vec![addr1, addr2]),
-                tcp.clone(),
-                Some(tls.clone()),
-                None,
+                direct_dial_deps(tcp.clone(), Some(tls.clone())),
             )
             .await
             .expect("dial should recover after tls failure");
@@ -771,9 +850,7 @@ mod tests {
                 ctx(),
                 "https://example.com/".parse().expect("uri"),
                 route_plan_with_stagger(Duration::from_millis(1), vec![addr1, addr2]),
-                tcp.clone(),
-                Some(tls.clone()),
-                None,
+                direct_dial_deps(tcp.clone(), Some(tls.clone())),
             )
             .await
             .expect("dial should succeed");
@@ -816,9 +893,7 @@ mod tests {
                 ctx(),
                 "https://example.com/".parse().expect("uri"),
                 route_plan_with_stagger(Duration::from_millis(1), vec![addr1, addr2]),
-                tcp.clone(),
-                Some(tls.clone()),
-                None,
+                direct_dial_deps(tcp.clone(), Some(tls.clone())),
             )
             .await
         {

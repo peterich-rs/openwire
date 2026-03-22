@@ -9,6 +9,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_util::future::{select, Either};
+use futures_util::io::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
+};
 use futures_util::task::AtomicWaker;
 use http::header::{CONNECTION, HOST};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
@@ -16,176 +20,30 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
+use hyper::rt::Timer;
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, CoalescingInfo,
-    ConnectionId, ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime,
-    TcpConnector, TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
+    next_connection_id, AuthKind, BoxConnection, BoxFuture, BoxTaskHandle, CallContext,
+    CoalescingInfo, ConnectionId, ConnectionInfo, DnsResolver, Exchange, HyperExecutor,
+    RequestBody, ResponseBody, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use pin_project_lite::pin_project;
 use tower::Service;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
-    AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
-    SharedAuthenticator,
+    build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
-    ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, RequestAdmissionLimiter, Route,
-    RouteKind, RoutePlan, RoutePlanner, UriScheme,
+    DirectDialDeps, ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,
+    RequestAdmissionLimiter, Route, RouteKind, RoutePlan, RoutePlanner, UriScheme,
 };
 use crate::proxy::ProxyCredentials;
 use crate::sync_util::lock_mutex;
 use crate::trace::PolicyTraceContext;
-
-#[derive(Clone, Debug, Default)]
-pub struct SystemDnsResolver;
-
-impl DnsResolver for SystemDnsResolver {
-    fn resolve(
-        &self,
-        ctx: CallContext,
-        host: String,
-        port: u16,
-    ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
-        Box::pin(async move {
-            ctx.listener().dns_start(&ctx, &host, port);
-            match tokio::net::lookup_host((host.as_str(), port)).await {
-                Ok(addrs) => {
-                    let addrs: Vec<_> = addrs.collect();
-                    if addrs.is_empty() {
-                        let error = WireError::dns(
-                            "DNS resolution returned no socket addresses",
-                            io::Error::new(io::ErrorKind::NotFound, "empty DNS result"),
-                        );
-                        ctx.listener().dns_failed(&ctx, &host, &error);
-                        return Err(error);
-                    }
-                    ctx.listener().dns_end(&ctx, &host, &addrs);
-                    Ok(addrs)
-                }
-                Err(error) => {
-                    let error = WireError::dns("DNS resolution failed", error);
-                    ctx.listener().dns_failed(&ctx, &host, &error);
-                    Err(error)
-                }
-            }
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TokioTcpConnector;
-
-impl TcpConnector for TokioTcpConnector {
-    fn connect(
-        &self,
-        ctx: CallContext,
-        addr: SocketAddr,
-        timeout: Option<Duration>,
-    ) -> BoxFuture<Result<BoxConnection, WireError>> {
-        Box::pin(async move {
-            ctx.listener().connect_start(&ctx, addr);
-            let connect = tokio::net::TcpStream::connect(addr);
-            let stream = match timeout {
-                Some(timeout) => match tokio::time::timeout(timeout, connect).await {
-                    Ok(result) => {
-                        result.map_err(|error| WireError::tcp_connect("TCP connect failed", error))
-                    }
-                    Err(_error) => Err(WireError::connect_timeout(format!(
-                        "connection timed out after {timeout:?}"
-                    ))),
-                },
-                None => connect
-                    .await
-                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error)),
-            };
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(error) => {
-                    ctx.listener().connect_failed(&ctx, addr, &error);
-                    return Err(error);
-                }
-            };
-
-            stream
-                .set_nodelay(true)
-                .map_err(|error| WireError::tcp_connect("failed to configure TCP_NODELAY", error))
-                .inspect_err(|error| {
-                    ctx.listener().connect_failed(&ctx, addr, error);
-                })?;
-
-            let info = ConnectionInfo {
-                id: next_connection_id(),
-                remote_addr: stream.peer_addr().ok(),
-                local_addr: stream.local_addr().ok(),
-                tls: false,
-            };
-
-            ctx.mark_connection_established();
-            ctx.listener().connect_end(&ctx, info.id, addr);
-
-            Ok(Box::new(TcpConnection {
-                inner: TokioIo::new(stream),
-                info,
-            }) as BoxConnection)
-        })
-    }
-}
-
-struct TcpConnection {
-    inner: TokioIo<tokio::net::TcpStream>,
-    info: ConnectionInfo,
-}
-
-impl Connection for TcpConnection {
-    fn connected(&self) -> Connected {
-        Connected::new().extra(self.info.clone())
-    }
-}
-
-impl hyper::rt::Read for TcpConnection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl hyper::rt::Write for TcpConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct ConnectorStack {
@@ -193,7 +51,9 @@ pub(crate) struct ConnectorStack {
     pub(crate) tcp_connector: Arc<dyn TcpConnector>,
     pub(crate) tls_connector: Option<Arc<dyn TlsConnector>>,
     pub(crate) connect_timeout: Option<Duration>,
-    pub(crate) route_planner: RoutePlanner,
+    pub(crate) executor: Arc<dyn WireExecutor>,
+    pub(crate) timer: SharedTimer,
+    pub(crate) route_planner: Arc<dyn RoutePlanner>,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_proxy_auth_attempts: usize,
 }
@@ -205,6 +65,8 @@ struct ProxyConnectDeps {
     proxy_authenticator: Option<SharedAuthenticator>,
     max_proxy_auth_attempts: usize,
     connect_timeout: Option<Duration>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
 }
 
 struct ConnectTunnelParams<'a> {
@@ -216,6 +78,63 @@ struct ConnectTunnelParams<'a> {
     proxy_authenticator: Option<SharedAuthenticator>,
     max_proxy_auth_attempts: usize,
     connect_timeout: Option<Duration>,
+    timer: SharedTimer,
+}
+
+pin_project! {
+    struct IoCompat<T> {
+        #[pin]
+        inner: T,
+    }
+}
+
+impl<T> IoCompat<T> {
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T> futures_util::io::AsyncRead for IoCompat<T>
+where
+    T: hyper::rt::Read,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let mut read_buf = hyper::rt::ReadBuf::new(buf);
+        match hyper::rt::Read::poll_read(self.project().inner, cx, read_buf.unfilled()) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> futures_util::io::AsyncWrite for IoCompat<T>
+where
+    T: hyper::rt::Write,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        hyper::rt::Write::poll_write(self.project().inner, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        hyper::rt::Write::poll_flush(self.project().inner, cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        hyper::rt::Write::poll_shutdown(self.project().inner, cx)
+    }
 }
 
 impl ConnectorStack {
@@ -227,9 +146,9 @@ impl ConnectorStack {
         let (dns_host, dns_port) = self.route_planner.dns_target(address);
         let resolved_addrs = self
             .dns_resolver
-            .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
+            .resolve(ctx.clone(), dns_host, dns_port)
             .await?;
-        Ok(self.route_planner.plan(address.clone(), resolved_addrs))
+        self.route_planner.plan(address, resolved_addrs)
     }
 
     fn proxy_connect_deps(&self) -> ProxyConnectDeps {
@@ -239,6 +158,8 @@ impl ConnectorStack {
             proxy_authenticator: self.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
             connect_timeout: self.connect_timeout,
+            executor: self.executor.clone(),
+            timer: self.timer.clone(),
         }
     }
 }
@@ -255,21 +176,22 @@ async fn connect_route_plan(
 
     match first_route.kind() {
         RouteKind::Direct { .. } => {
-            connect_direct(
-                ctx,
-                uri,
-                route_plan,
+            let deps = DirectDialDeps::new(
+                deps.executor,
+                deps.timer,
                 deps.tcp_connector,
                 deps.tls_connector,
                 deps.connect_timeout,
-            )
-            .await
+            );
+            connect_direct(ctx, uri, route_plan, deps).await
         }
         RouteKind::HttpForwardProxy { .. } => {
             connect_via_http_forward_proxy(
                 ctx,
                 uri,
                 route_plan,
+                deps.executor,
+                deps.timer,
                 deps.tcp_connector,
                 deps.connect_timeout,
             )
@@ -284,20 +206,11 @@ async fn connect_direct(
     ctx: CallContext,
     uri: Uri,
     route_plan: RoutePlan,
-    tcp_connector: Arc<dyn TcpConnector>,
-    tls_connector: Option<Arc<dyn TlsConnector>>,
-    connect_timeout: Option<Duration>,
+    deps: DirectDialDeps,
 ) -> Result<BoxConnection, WireError> {
     let connect_span = tracing::Span::current();
     let (stream, outcome) = FastFallbackDialer
-        .dial_direct(
-            ctx.clone(),
-            uri,
-            route_plan,
-            tcp_connector,
-            tls_connector,
-            connect_timeout,
-        )
+        .dial_direct(ctx.clone(), uri, route_plan, deps)
         .instrument(connect_span)
         .with_current_subscriber()
         .await?;
@@ -317,6 +230,8 @@ async fn connect_via_http_forward_proxy(
     ctx: CallContext,
     target_uri: Uri,
     route_plan: RoutePlan,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     tcp_connector: Arc<dyn TcpConnector>,
     connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
@@ -326,6 +241,7 @@ async fn connect_via_http_forward_proxy(
             ctx,
             target_uri,
             route_plan,
+            FastFallbackRuntime::new(executor, timer),
             move |ctx, route| {
                 let tcp_connector = tcp_connector.clone();
                 async move {
@@ -374,6 +290,7 @@ async fn connect_via_http_proxy(
             ctx,
             target_uri,
             route_plan,
+            FastFallbackRuntime::new(deps.executor.clone(), deps.timer.clone()),
             {
                 let deps = deps.clone();
                 move |ctx, route| {
@@ -420,6 +337,7 @@ async fn connect_via_http_proxy(
                             proxy_authenticator: deps.proxy_authenticator.clone(),
                             max_proxy_auth_attempts: deps.max_proxy_auth_attempts,
                             connect_timeout: deps.connect_timeout,
+                            timer: deps.timer.clone(),
                         })
                         .await?;
                         connect_target_tls_if_needed(
@@ -453,6 +371,7 @@ async fn connect_via_socks_proxy(
             ctx,
             target_uri,
             route_plan,
+            FastFallbackRuntime::new(deps.executor.clone(), deps.timer.clone()),
             {
                 let deps = deps.clone();
                 move |ctx, route| {
@@ -498,6 +417,7 @@ async fn connect_via_socks_proxy(
                             proxy_addr,
                             stream,
                             deps.connect_timeout,
+                            deps.timer.clone(),
                             credentials.as_ref(),
                         )
                         .await?;
@@ -558,8 +478,14 @@ async fn establish_connect_tunnel(
     let mut connect_headers = HeaderMap::new();
 
     loop {
-        match send_connect_request(&authority, &connect_headers, stream, params.connect_timeout)
-            .await?
+        match send_connect_request(
+            &authority,
+            &connect_headers,
+            stream,
+            &params.timer,
+            params.connect_timeout,
+        )
+        .await?
         {
             ConnectTunnelOutcome::Established(stream) => return Ok(stream),
             ConnectTunnelOutcome::Response(head) => {
@@ -575,7 +501,7 @@ async fn establish_connect_tunnel(
                     return Err(proxy_connect_status_error(&head.status_line));
                 }
 
-                let auth_ctx = AuthContext::new(
+                let auth_ctx = build_auth_context(
                     AuthKind::Proxy,
                     AuthRequestState::new(
                         Method::CONNECT,
@@ -627,6 +553,7 @@ async fn establish_socks5_tunnel(
     proxy_addr: SocketAddr,
     stream: BoxConnection,
     timeout: Option<Duration>,
+    timer: SharedTimer,
     credentials: Option<&ProxyCredentials>,
 ) -> Result<BoxConnection, WireError> {
     let host = target_uri
@@ -639,10 +566,10 @@ async fn establish_socks5_tunnel(
             80
         }
     });
-    let mut stream = TokioIo::new(stream);
+    let mut stream = IoCompat::new(stream);
 
-    socks5_write_client_greeting(&mut stream, timeout, credentials.is_some()).await?;
-    match socks5_read_server_choice(&mut stream, timeout, credentials.is_some()).await? {
+    socks5_write_client_greeting(&mut stream, &timer, timeout, credentials.is_some()).await?;
+    match socks5_read_server_choice(&mut stream, &timer, timeout, credentials.is_some()).await? {
         Socks5AuthMethod::NoAuth => {}
         Socks5AuthMethod::UsernamePassword => {
             let credentials = credentials.ok_or_else(|| {
@@ -650,12 +577,12 @@ async fn establish_socks5_tunnel(
                     "SOCKS5 proxy requested username/password authentication but no credentials were configured",
                 )
             })?;
-            socks5_write_password_auth_request(&mut stream, timeout, credentials).await?;
-            socks5_read_password_auth_response(&mut stream, timeout).await?;
+            socks5_write_password_auth_request(&mut stream, &timer, timeout, credentials).await?;
+            socks5_read_password_auth_response(&mut stream, &timer, timeout).await?;
         }
     }
-    socks5_write_connect_request(&mut stream, host, port, timeout).await?;
-    socks5_read_connect_response(&mut stream, timeout).await?;
+    socks5_write_connect_request(&mut stream, &timer, host, port, timeout).await?;
+    socks5_read_connect_response(&mut stream, &timer, timeout).await?;
     tracing::debug!(
         call_id = ctx.call_id().as_u64(),
         proxy_addr = %proxy_addr,
@@ -758,11 +685,12 @@ async fn send_connect_request(
     authority: &str,
     headers: &HeaderMap,
     stream: BoxConnection,
+    timer: &SharedTimer,
     connect_timeout: Option<Duration>,
 ) -> Result<ConnectTunnelOutcome, WireError> {
     let connect_request = build_connect_request(authority, headers)?;
 
-    let mut stream = TokioIo::new(stream);
+    let mut stream = IoCompat::new(stream);
     stream
         .write_all(connect_request.as_bytes())
         .await
@@ -772,7 +700,7 @@ async fn send_connect_request(
         .await
         .map_err(|error| WireError::proxy_tunnel("failed to flush proxy CONNECT request", error))?;
 
-    let head = read_connect_response(&mut stream, connect_timeout).await?;
+    let head = read_connect_response(&mut stream, timer, connect_timeout).await?;
     if head.status == StatusCode::OK {
         let stream = PrefetchedTunnelBytes::new(stream.into_inner(), head.prefetched);
         return Ok(ConnectTunnelOutcome::Established(
@@ -806,22 +734,27 @@ fn build_connect_request(authority: &str, headers: &HeaderMap) -> Result<String,
 }
 
 async fn read_connect_response(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     connect_timeout: Option<Duration>,
 ) -> Result<ConnectResponseHead, WireError> {
     if let Some(timeout) = connect_timeout {
-        return tokio::time::timeout(timeout, read_connect_response_inner(stream))
-            .await
-            .map_err(|_| {
+        return timeout_future(
+            timer,
+            timeout,
+            read_connect_response_inner(stream),
+            |timeout| {
                 WireError::connect_timeout(format!("proxy CONNECT timed out after {timeout:?}"))
-            })?;
+            },
+        )
+        .await;
     }
 
     read_connect_response_inner(stream).await
 }
 
 async fn read_connect_response_inner(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
 ) -> Result<ConnectResponseHead, WireError> {
     let mut response = Vec::with_capacity(1024);
     let mut buf = [0u8; 512];
@@ -851,7 +784,8 @@ async fn read_connect_response_inner(
 }
 
 async fn socks5_write_client_greeting(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     timeout: Option<Duration>,
     allow_username_password: bool,
 ) -> Result<(), WireError> {
@@ -864,7 +798,7 @@ async fn socks5_write_client_greeting(
     greeting.push(0x05);
     greeting.push(methods.len() as u8);
     greeting.extend_from_slice(methods);
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream
             .write_all(&greeting)
             .await
@@ -884,12 +818,13 @@ enum Socks5AuthMethod {
 }
 
 async fn socks5_read_server_choice(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     timeout: Option<Duration>,
     offered_username_password: bool,
 ) -> Result<Socks5AuthMethod, WireError> {
     let mut response = [0u8; 2];
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream.read_exact(&mut response).await.map_err(|error| {
             WireError::proxy_tunnel("failed to read SOCKS5 greeting response", error)
         })
@@ -918,7 +853,8 @@ async fn socks5_read_server_choice(
 }
 
 async fn socks5_write_password_auth_request(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     timeout: Option<Duration>,
     credentials: &ProxyCredentials,
 ) -> Result<(), WireError> {
@@ -942,7 +878,7 @@ async fn socks5_write_password_auth_request(
     request.push(password.len() as u8);
     request.extend_from_slice(password);
 
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream.write_all(&request).await.map_err(|error| {
             WireError::proxy_tunnel("failed to write SOCKS5 username/password request", error)
         })?;
@@ -954,11 +890,12 @@ async fn socks5_write_password_auth_request(
 }
 
 async fn socks5_read_password_auth_response(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     timeout: Option<Duration>,
 ) -> Result<(), WireError> {
     let mut response = [0u8; 2];
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream.read_exact(&mut response).await.map_err(|error| {
             WireError::proxy_tunnel("failed to read SOCKS5 username/password response", error)
         })
@@ -981,7 +918,8 @@ async fn socks5_read_password_auth_response(
 }
 
 async fn socks5_write_connect_request(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     host: &str,
     port: u16,
     timeout: Option<Duration>,
@@ -1009,7 +947,7 @@ async fn socks5_write_connect_request(
     }
     request.extend_from_slice(&port.to_be_bytes());
 
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream.write_all(&request).await.map_err(|error| {
             WireError::proxy_tunnel("failed to write SOCKS5 connect request", error)
         })?;
@@ -1021,11 +959,12 @@ async fn socks5_write_connect_request(
 }
 
 async fn socks5_read_connect_response(
-    stream: &mut TokioIo<BoxConnection>,
+    stream: &mut IoCompat<BoxConnection>,
+    timer: &SharedTimer,
     timeout: Option<Duration>,
 ) -> Result<(), WireError> {
     let mut head = [0u8; 4];
-    socks5_timeout(timeout, async {
+    socks5_timeout(timer, timeout, async {
         stream.read_exact(&mut head).await.map_err(|error| {
             WireError::proxy_tunnel("failed to read SOCKS5 connect response", error)
         })
@@ -1048,7 +987,7 @@ async fn socks5_read_connect_response(
     match head[3] {
         0x01 => {
             let mut remainder = [0u8; 6];
-            socks5_timeout(timeout, async {
+            socks5_timeout(timer, timeout, async {
                 stream.read_exact(&mut remainder).await.map_err(|error| {
                     WireError::proxy_tunnel("failed to read SOCKS5 IPv4 bind address", error)
                 })
@@ -1057,14 +996,14 @@ async fn socks5_read_connect_response(
         }
         0x03 => {
             let mut len = [0u8; 1];
-            socks5_timeout(timeout, async {
+            socks5_timeout(timer, timeout, async {
                 stream.read_exact(&mut len).await.map_err(|error| {
                     WireError::proxy_tunnel("failed to read SOCKS5 bind host length", error)
                 })
             })
             .await?;
             let mut remainder = vec![0u8; len[0] as usize + 2];
-            socks5_timeout(timeout, async {
+            socks5_timeout(timer, timeout, async {
                 stream.read_exact(&mut remainder).await.map_err(|error| {
                     WireError::proxy_tunnel("failed to read SOCKS5 bind host", error)
                 })
@@ -1073,7 +1012,7 @@ async fn socks5_read_connect_response(
         }
         0x04 => {
             let mut remainder = [0u8; 18];
-            socks5_timeout(timeout, async {
+            socks5_timeout(timer, timeout, async {
                 stream.read_exact(&mut remainder).await.map_err(|error| {
                     WireError::proxy_tunnel("failed to read SOCKS5 IPv6 bind address", error)
                 })
@@ -1091,16 +1030,36 @@ async fn socks5_read_connect_response(
 }
 
 async fn socks5_timeout<T>(
+    timer: &SharedTimer,
     timeout: Option<Duration>,
     future: impl std::future::Future<Output = Result<T, WireError>>,
 ) -> Result<T, WireError> {
     if let Some(timeout) = timeout {
-        return tokio::time::timeout(timeout, future).await.map_err(|_| {
+        return timeout_future(timer, timeout, future, |timeout| {
             WireError::connect_timeout(format!("SOCKS5 handshake timed out after {timeout:?}"))
-        })?;
+        })
+        .await;
     }
 
     future.await
+}
+
+async fn timeout_future<T, F>(
+    timer: &SharedTimer,
+    timeout: Duration,
+    future: F,
+    on_timeout: impl FnOnce(Duration) -> WireError,
+) -> Result<T, WireError>
+where
+    F: std::future::Future<Output = Result<T, WireError>>,
+{
+    let future = Box::pin(future);
+    let sleep = timer.sleep(timeout);
+    futures_util::pin_mut!(sleep);
+    match select(future, sleep).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_, _)) => Err(on_timeout(timeout)),
+    }
 }
 
 fn socks5_reply_reason(code: u8) -> &'static str {
@@ -1675,7 +1634,8 @@ impl Drop for ResponseLease {
 pub(crate) struct TransportService {
     connector: ConnectorStack,
     config: crate::client::TransportConfig,
-    runtime: Arc<dyn Runtime>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     exchange_finder: Arc<ExchangeFinder>,
     request_admission: RequestAdmissionLimiter,
     connection_limiter: ConnectionLimiter,
@@ -1688,7 +1648,8 @@ impl TransportService {
     pub(crate) fn new(
         connector: ConnectorStack,
         config: crate::client::TransportConfig,
-        runtime: Arc<dyn Runtime>,
+        executor: Arc<dyn WireExecutor>,
+        timer: SharedTimer,
         exchange_finder: Arc<ExchangeFinder>,
         request_admission: RequestAdmissionLimiter,
     ) -> Self {
@@ -1701,7 +1662,8 @@ impl TransportService {
         Self {
             connector,
             config,
-            runtime,
+            executor,
+            timer,
             exchange_finder,
             request_admission,
             connection_limiter,
@@ -1758,7 +1720,8 @@ impl TransportService {
 
             ctx.listener().response_headers_start(&ctx);
             let (parts, body) = response.response.into_parts();
-            let deadline_expired = spawn_body_deadline_signal(self.runtime.clone(), &ctx)?;
+            let deadline_expired =
+                spawn_body_deadline_signal(self.executor.clone(), self.timer.clone(), &ctx)?;
             let body = ObservedIncomingBody::wrap(
                 body,
                 ctx.clone(),
@@ -1907,7 +1870,13 @@ impl TransportService {
                 binding
             }
             ConnectionProtocol::Http2 => {
-                let (sender, task) = bind_http2(stream, &self.config).await?;
+                let (sender, task) = bind_http2(
+                    stream,
+                    &self.config,
+                    HyperExecutor(self.executor.clone()),
+                    self.timer.clone(),
+                )
+                .await?;
                 self.bindings.insert_http2(info.id, info, sender);
                 let binding = match self.bindings.acquire(connection.id()) {
                     BindingAcquireResult::Acquired(binding) => binding,
@@ -2002,7 +1971,7 @@ impl TransportService {
             }
             .instrument(span),
         );
-        match self.runtime.spawn(future) {
+        match self.executor.spawn(future) {
             Ok(handle) => {
                 self.connection_tasks.attach(task_id, handle);
                 Ok(())
@@ -2017,7 +1986,7 @@ impl TransportService {
     fn spawn_http2_task(
         &self,
         connection: crate::connection::RealConnection,
-        task: http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        task: http2::Connection<BoxConnection, RequestBody, HyperExecutor>,
         span: tracing::Span,
     ) -> Result<(), WireError> {
         let connection_id = connection.id();
@@ -2042,7 +2011,7 @@ impl TransportService {
             }
             .instrument(span),
         );
-        match self.runtime.spawn(future) {
+        match self.executor.spawn(future) {
             Ok(handle) => {
                 self.connection_tasks.attach(task_id, handle);
                 Ok(())
@@ -2380,7 +2349,8 @@ fn abandon_response_lease_state(state: ResponseLeaseState) {
 }
 
 fn spawn_body_deadline_signal(
-    runtime: Arc<dyn Runtime>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     ctx: &CallContext,
 ) -> Result<Option<Arc<BodyDeadlineSignal>>, WireError> {
     let Some(deadline) = ctx.deadline() else {
@@ -2397,10 +2367,9 @@ fn spawn_body_deadline_signal(
         return Ok(Some(signal));
     }
 
-    let sleep_runtime = runtime.clone();
     let signal_task = signal.clone();
-    let _ = runtime.spawn(Box::pin(async move {
-        sleep_runtime.sleep(remaining).await;
+    let _ = executor.spawn(Box::pin(async move {
+        timer.sleep(remaining).await;
         signal_task.expired.store(true, Ordering::Release);
         signal_task.waker.wake();
     }))?;
@@ -2532,15 +2501,17 @@ async fn bind_http1(
 async fn bind_http2(
     stream: BoxConnection,
     config: &crate::client::TransportConfig,
+    executor: HyperExecutor,
+    timer: SharedTimer,
 ) -> Result<
     (
         http2::SendRequest<RequestBody>,
-        http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        http2::Connection<BoxConnection, RequestBody, HyperExecutor>,
     ),
     WireError,
 > {
-    let mut builder = http2::Builder::new(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
+    let mut builder = http2::Builder::new(executor);
+    builder.timer(timer);
     if let Some(interval) = config.http2_keep_alive_interval {
         builder.keep_alive_interval(interval);
         builder.keep_alive_while_idle(config.http2_keep_alive_while_idle);
@@ -2762,7 +2733,8 @@ mod tests {
     use tracing_subscriber::registry::LookupSpan;
 
     use openwire_core::{
-        BoxFuture, BoxTaskHandle, CallContext, NoopEventListener, Runtime, TaskHandle, WireError,
+        BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver, NoopEventListener,
+        SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
     };
 
     use super::{
@@ -2773,7 +2745,7 @@ mod tests {
     use crate::connection::ConnectionPool;
     use crate::connection::{
         Address, AuthorityKey, ConnectionProtocol, DnsPolicy, PoolSettings, ProtocolPolicy,
-        RealConnection, Route, UriScheme,
+        RealConnection, Route, RoutePlan, RoutePlanner, UriScheme,
     };
     use crate::proxy::ProxySelector;
 
@@ -3083,15 +3055,75 @@ mod tests {
         fn abort(&self) {}
     }
 
-    impl Runtime for CountingSpawnRuntime {
+    impl WireExecutor for CountingSpawnRuntime {
         fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
             self.spawns
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Box::new(NoopTaskHandle))
         }
+    }
 
-        fn sleep(&self, _duration: Duration) -> BoxFuture<()> {
-            Box::pin(async {})
+    #[derive(Clone)]
+    struct RecordingDnsResolver {
+        calls: Arc<Mutex<Vec<(String, u16)>>>,
+        resolved_addrs: Vec<std::net::SocketAddr>,
+    }
+
+    impl DnsResolver for RecordingDnsResolver {
+        fn resolve(
+            &self,
+            _ctx: CallContext,
+            host: String,
+            port: u16,
+        ) -> BoxFuture<Result<Vec<std::net::SocketAddr>, WireError>> {
+            self.calls
+                .lock()
+                .expect("dns calls lock")
+                .push((host, port));
+            let resolved_addrs = self.resolved_addrs.clone();
+            Box::pin(async move { Ok(resolved_addrs) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnusedTcpConnector;
+
+    impl TcpConnector for UnusedTcpConnector {
+        fn connect(
+            &self,
+            _ctx: CallContext,
+            _addr: std::net::SocketAddr,
+            _timeout: Option<Duration>,
+        ) -> BoxFuture<Result<BoxConnection, WireError>> {
+            Box::pin(async { panic!("tcp connector should not be used in route planner test") })
+        }
+    }
+
+    type PlannedRoutes = Arc<Mutex<Vec<(Address, Vec<std::net::SocketAddr>)>>>;
+
+    #[derive(Clone)]
+    struct RecordingRoutePlanner {
+        planned: PlannedRoutes,
+    }
+
+    impl RoutePlanner for RecordingRoutePlanner {
+        fn dns_target(&self, _address: &Address) -> (String, u16) {
+            ("planner.test".to_owned(), 8443)
+        }
+
+        fn plan(
+            &self,
+            address: &Address,
+            resolved_addrs: Vec<std::net::SocketAddr>,
+        ) -> Result<RoutePlan, WireError> {
+            self.planned
+                .lock()
+                .expect("route planner calls lock")
+                .push((address.clone(), resolved_addrs.clone()));
+            Ok(RoutePlan::new(
+                vec![Route::direct(address.clone(), resolved_addrs[0])],
+                Duration::from_millis(37),
+            ))
         }
     }
 
@@ -3201,14 +3233,56 @@ mod tests {
     #[test]
     fn spawn_body_deadline_signal_marks_expired_deadlines_without_spawning() {
         let runtime = Arc::new(CountingSpawnRuntime::default());
+        let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
         let ctx = CallContext::new(Arc::new(NoopEventListener), Some(Duration::ZERO));
 
-        let signal = super::spawn_body_deadline_signal(runtime.clone(), &ctx)
+        let signal = super::spawn_body_deadline_signal(runtime.clone(), timer, &ctx)
             .expect("deadline signal")
             .expect("signal");
 
         assert!(signal.expired.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(runtime.spawns(), 0);
+    }
+
+    #[tokio::test]
+    async fn connector_stack_uses_custom_route_planner() {
+        let dns_calls = Arc::new(Mutex::new(Vec::new()));
+        let planned = Arc::new(Mutex::new(Vec::new()));
+        let resolved = vec![std::net::SocketAddr::from(([203, 0, 113, 10], 443))];
+        let connector = super::ConnectorStack {
+            dns_resolver: Arc::new(RecordingDnsResolver {
+                calls: dns_calls.clone(),
+                resolved_addrs: resolved.clone(),
+            }),
+            tcp_connector: Arc::new(UnusedTcpConnector),
+            tls_connector: None,
+            connect_timeout: None,
+            executor: Arc::new(CountingSpawnRuntime::default()),
+            timer: SharedTimer::new(openwire_tokio::TokioTimer::new()),
+            route_planner: Arc::new(RecordingRoutePlanner {
+                planned: planned.clone(),
+            }),
+            proxy_authenticator: None,
+            max_proxy_auth_attempts: 0,
+        };
+
+        let route_plan = connector
+            .route_plan(make_call_context(), &make_address())
+            .await
+            .expect("route plan");
+
+        assert_eq!(
+            dns_calls.lock().expect("dns calls lock").as_slice(),
+            &[("planner.test".to_owned(), 8443)]
+        );
+        let planned = planned.lock().expect("route planner calls lock");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].0, make_address());
+        assert_eq!(planned[0].1, resolved);
+        assert_eq!(
+            route_plan.fast_fallback_stagger(),
+            Duration::from_millis(37)
+        );
     }
 
     #[test]

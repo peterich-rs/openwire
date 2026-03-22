@@ -4,30 +4,11 @@ use bytes::Bytes;
 use cookie as cookie_crate;
 use cookie_store::CookieStore;
 use http::header::HeaderValue;
+use openwire_core::CookieJar;
 
 use crate::sync_util::{read_rwlock, write_rwlock};
 
 pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
-
-/// Cookie loading and persistence for automatic request handling.
-pub trait CookieJar: Send + Sync + 'static {
-    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url);
-
-    fn cookies(&self, url: &url::Url) -> Option<HeaderValue>;
-}
-
-impl<T> CookieJar for Arc<T>
-where
-    T: CookieJar + ?Sized,
-{
-    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url) {
-        (**self).set_cookies(cookie_headers, url);
-    }
-
-    fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
-        (**self).cookies(url)
-    }
-}
 
 /// Default in-memory cookie jar backed by `cookie_store`.
 #[derive(Default)]

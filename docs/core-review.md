@@ -1,12 +1,39 @@
-# Core Review — 核心链路实现审查
+# Core Review — Completed Summary
 
-本文件只保留审查来源和实施规划入口，不再重复维护逐条问题正文。
+Date: 2026-03-22
+Review baseline: `main` at `9abcfc1`
+Closure status: merged into `main`
 
-- 审查范围：`Client::execute` 到 transport 层的完整请求链路，覆盖连接管理、协议绑定、策略执行与异步安全性。
-- 审查基线：main 分支 commit `9abcfc1`。
-- 实施规划：[`docs/plans/core-review-plan-spec.md`](plans/core-review-plan-spec.md)。
+The core review of the request execution path is complete. Its findings have
+already been absorbed into the implementation, tests, and current design docs.
+This file remains only as a compact index of what landed and where the lasting
+source of truth now lives.
 
-当前实现与验证结果应以代码、测试和对应设计文档为准：
+## Review Scope
 
-- [`README.md`](../README.md)
-- [`docs/DESIGN.md`](DESIGN.md)
+- `Client::execute` through `TransportService`
+- connection acquisition, pooling, protocol binding, and background-task ownership
+- retry / redirect / auth / cookie follow-up behavior
+- body framing, timeouts, and Tower readiness / backpressure
+- proxy routing, SOCKS / CONNECT tunnels, and fast fallback
+
+## Landed Outcomes
+
+- lifecycle ownership is now RAII-based across `SelectedConnection`,
+  `ResponseLease`, and response-body release
+- owned connection tasks are tracked and aborted on final client drop
+- request admission and fresh-connection admission are both explicit transport
+  concerns
+- request body semantics now distinguish `absent` from `explicit empty`
+- redirect downgrade rejection, readiness propagation, proxy fast fallback,
+  SOCKS5 auth, pool coalescing indexing, poison-safe locking, and protocol
+  correctness fixes are all part of the current baseline
+
+## Where To Look Now
+
+- Current architecture: [`docs/DESIGN.md`](DESIGN.md)
+- Completed trait/crate-boundary redesign:
+  [`docs/trait-oriented-redesign.md`](trait-oriented-redesign.md)
+- Historical workstream split and closure map:
+  [`docs/plans/core-review-plan-spec.md`](plans/core-review-plan-spec.md)
+- Executable verification: `cargo test --workspace --all-targets`
