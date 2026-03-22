@@ -285,6 +285,7 @@ async fn authenticate_response(
             snapshot.uri.clone(),
             snapshot.version,
             snapshot.headers.clone(),
+            snapshot.extensions.clone(),
             snapshot.body.as_ref().and_then(RequestBody::try_clone),
         ),
         AuthResponseState::new(response.status(), response.headers().clone()),
@@ -334,9 +335,7 @@ struct RequestSnapshot {
     uri: Uri,
     version: Version,
     headers: HeaderMap,
-    // Follow-up requests currently preserve protocol-visible request state plus
-    // internal tracing metadata. Arbitrary http::Extensions are intentionally
-    // not copied until those semantics are designed explicitly.
+    extensions: http::Extensions,
     body: Option<RequestBody>,
 }
 
@@ -353,6 +352,7 @@ impl RequestSnapshot {
             uri: request.uri().clone(),
             version: request.version(),
             headers: request.headers().clone(),
+            extensions: request.extensions().clone(),
             body: request.body().try_clone(),
         }
     }
@@ -376,6 +376,7 @@ impl RequestSnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = self.headers.clone();
+        *request.extensions_mut() = self.extensions.clone();
         request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
@@ -439,6 +440,7 @@ impl RequestSnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = headers;
+        *request.extensions_mut() = self.extensions;
         request.extensions_mut().insert(policy_trace);
         Ok(request)
     }

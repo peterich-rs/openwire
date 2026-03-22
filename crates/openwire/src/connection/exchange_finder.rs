@@ -111,9 +111,7 @@ impl ExchangeFinder {
             let _ = self.pool.remove(reserved.id());
         }
 
-        if let Some(existing) = self.pool.get_by_id(prepared.address(), info.id) {
-            let tracked = existing.try_acquire();
-            debug_assert!(tracked, "observed reused connection should be acquirable");
+        if let Some(existing) = self.pool.acquire_by_id(prepared.address(), info.id) {
             return ObservedConnection {
                 connection: existing,
                 reused: true,

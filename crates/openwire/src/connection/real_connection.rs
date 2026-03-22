@@ -5,8 +5,6 @@ use openwire_core::{next_connection_id, CoalescingInfo, ConnectionId};
 
 use super::{Address, Route};
 
-const DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS: usize = 100;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectionProtocol {
     Http1,
@@ -132,11 +130,6 @@ impl RealConnection {
 
         match self.inner.protocol {
             ConnectionProtocol::Http1 if state.allocations > 0 => return false,
-            ConnectionProtocol::Http2
-                if state.allocations >= DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS =>
-            {
-                return false;
-            }
             ConnectionProtocol::Http1 | ConnectionProtocol::Http2 => {}
         }
 
@@ -206,10 +199,7 @@ fn allocation_state(state: &RealConnectionState) -> ConnectionAllocationState {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use super::{
-        ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection,
-        DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS,
-    };
+    use super::{ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection};
     use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, Route, UriScheme};
 
     fn test_connection(protocol: ConnectionProtocol) -> RealConnection {
@@ -292,13 +282,16 @@ mod tests {
     }
 
     #[test]
-    fn http2_connection_enforces_conservative_stream_limit() {
+    fn http2_connection_does_not_apply_a_local_stream_cap() {
         let connection = test_connection(ConnectionProtocol::Http2);
 
-        for _ in 0..DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS {
+        for _ in 0..128 {
             assert!(connection.try_acquire());
         }
-        assert!(!connection.try_acquire());
+        assert_eq!(
+            connection.snapshot().allocation,
+            ConnectionAllocationState::InUse { allocations: 128 }
+        );
 
         assert!(connection.release());
         assert!(connection.try_acquire());

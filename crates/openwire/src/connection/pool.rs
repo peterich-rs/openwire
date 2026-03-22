@@ -75,6 +75,7 @@ impl ConnectionPool {
         let mut pool = self.connections.lock().expect("connection pool lock");
         let keys = pool.keys().cloned().collect::<Vec<_>>();
         let mut empty_keys = Vec::new();
+        let mut candidates = Vec::new();
 
         for key in keys {
             let Some(connections) = pool.get_mut(&key) else {
@@ -87,25 +88,23 @@ impl ConnectionPool {
                 continue;
             }
 
-            if let Some(connection) = connections
-                .iter()
-                .find(|connection| {
-                    can_coalesce(connection, address, route_plan) && connection.try_acquire()
-                })
-                .cloned()
-            {
-                for key in empty_keys {
-                    pool.remove(&key);
-                }
-                return Some(connection);
-            }
+            candidates.extend(
+                connections
+                    .iter()
+                    .filter(|connection| can_coalesce(connection, address, route_plan))
+                    .cloned(),
+            );
         }
 
         for key in empty_keys {
             pool.remove(&key);
         }
 
-        None
+        drop(pool);
+
+        candidates
+            .into_iter()
+            .find(|connection| connection.try_acquire())
     }
 
     pub(crate) fn release(&self, connection: &RealConnection) -> bool {
@@ -138,6 +137,24 @@ impl ConnectionPool {
                 .iter()
                 .find(|connection| connection.id() == connection_id)
                 .cloned()
+        })
+    }
+
+    pub(crate) fn acquire_by_id(
+        &self,
+        address: &Address,
+        connection_id: ConnectionId,
+    ) -> Option<RealConnection> {
+        let mut pool = self.connections.lock().expect("connection pool lock");
+        if !prune_address(&self.settings, &mut pool, address) {
+            pool.remove(address);
+            return None;
+        }
+
+        let connections = pool.get_mut(address)?;
+        connections.iter().find_map(|connection| {
+            (connection.id() == connection_id && connection.try_acquire())
+                .then(|| connection.clone())
         })
     }
 
@@ -256,12 +273,15 @@ fn can_coalesce(connection: &RealConnection, request: &Address, route_plan: &Rou
         return false;
     }
 
-    let host_matches = existing.authority().host() == request.authority().host()
-        || connection
-            .coalescing()
-            .verified_server_names
-            .iter()
-            .any(|name| verified_server_name_matches(name, request.authority().host()));
+    if existing.authority() == request.authority() {
+        return false;
+    }
+
+    let host_matches = connection
+        .coalescing()
+        .verified_server_names
+        .iter()
+        .any(|name| verified_server_name_matches(name, request.authority().host()));
     if !host_matches {
         return false;
     }
@@ -512,6 +532,37 @@ mod tests {
     }
 
     #[test]
+    fn pool_does_not_coalesce_same_authority_across_different_address_buckets() {
+        let pooled = address_for_host("example.com", None, ProtocolPolicy::Http1OrHttp2);
+        let alt_dns = Address::new(
+            UriScheme::Https,
+            AuthorityKey::new("example.com", 443),
+            None,
+            Some(crate::connection::TlsIdentity::new("example.com")),
+            ProtocolPolicy::Http1OrHttp2,
+            DnsPolicy::Custom("mobile".into()),
+        );
+        let pool = ConnectionPool::new(PoolSettings::default());
+        pool.insert(make_connection_with_protocol_and_coalescing(
+            pooled,
+            42,
+            ConnectionProtocol::Http2,
+            &["example.com"],
+        ));
+
+        let route_plan = RoutePlan::new(
+            vec![Route::direct(
+                alt_dns.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 443)),
+            )],
+            Duration::from_millis(250),
+        );
+
+        assert!(pool.acquire(&alt_dns).is_none());
+        assert!(pool.acquire_coalesced(&alt_dns, &route_plan).is_none());
+    }
+
+    #[test]
     fn pool_coalesces_direct_https_http2_connections_for_verified_authorities() {
         let first = address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2);
         let second = address_for_host("b.test", None, ProtocolPolicy::Http1OrHttp2);
@@ -731,18 +782,45 @@ mod tests {
     }
 
     #[test]
-    fn pool_refuses_http2_reuse_after_conservative_stream_limit_is_reached() {
+    fn pool_does_not_coalesce_same_authority_across_address_policy_boundaries() {
+        let direct = address_with_proxy(None);
+        let alt_dns = Address::new(
+            UriScheme::Https,
+            AuthorityKey::new("example.com", 443),
+            None,
+            Some(crate::connection::TlsIdentity::new("example.com")),
+            ProtocolPolicy::Http1OrHttp2,
+            DnsPolicy::Custom("mobile".into()),
+        );
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection =
+            make_connection_with_protocol(direct.clone(), 32, ConnectionProtocol::Http2);
+        pool.insert(connection);
+
+        let route_plan = RoutePlan::new(
+            vec![Route::direct(
+                alt_dns.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 32), 443)),
+            )],
+            Duration::from_millis(250),
+        );
+
+        assert!(pool.acquire_coalesced(&alt_dns, &route_plan).is_none());
+    }
+
+    #[test]
+    fn pool_reuses_http2_connections_without_a_local_stream_cap() {
         let address = address_with_proxy(None);
         let pool = ConnectionPool::new(PoolSettings::default());
         let connection =
             make_connection_with_protocol(address.clone(), 32, ConnectionProtocol::Http2);
         pool.insert(connection.clone());
 
-        for _ in 0..100 {
+        for _ in 0..128 {
             assert!(connection.try_acquire());
         }
 
-        assert!(pool.acquire(&address).is_none());
+        assert!(pool.acquire(&address).is_some());
         assert!(connection.release());
         assert!(pool.acquire(&address).is_some());
     }

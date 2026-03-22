@@ -28,10 +28,6 @@ openwire/
 ├── crates/openwire-test     test support
 └── docs/
     ├── DESIGN.md            canonical technical design
-    ├── REVIEW_REMEDIATION_DESIGN.md
-    │                        implementation design for 2026-03 review findings
-    ├── REVIEW_REMEDIATION_TASKS.md
-    │                        execution tracker for the 2026-03 remediation work
     └── tasks.md             deferred follow-on tracker
 ```
 
@@ -83,6 +79,7 @@ Stable external rules:
   `Client::new_call(request).execute()`
 - `ClientBuilder` owns transport and policy configuration
 - request-scoped metadata lives in `http::Extensions`
+- retries, redirects, and authenticator follow-ups preserve request extensions
 - custom integration points are traits, not convenience mini-frameworks
 
 Important extension traits:
@@ -251,14 +248,16 @@ Current connection-core rules:
 - direct HTTPS HTTP/2 may coalesce only when certificate SANs authorize the
   target authority and the resolved route plan overlaps the connected remote
   address
+- same-authority traffic still requires the exact-address reuse path; the
+  coalescing path is only for alternate verified authorities
 - direct routes race resolved target addresses
 - proxy routes resolve proxy endpoints into `RoutePlan`, but currently dial
   sequentially
 - target addresses behind forward proxies / CONNECT tunnels are not part of the
   current fast-fallback race
 - HTTP/1.1 reuse is single-exchange and body-lifecycle-driven
-- HTTP/2 reuse uses a conservative fixed stream cap until peer settings are
-  modeled directly
+- HTTP/2 reuse is admitted by bound-sender readiness instead of a separate fixed
+  local stream cap
 - HTTP/1.1 idle timeout and max-idle limits are enforced opportunistically on
   pool touch points; there is no background sweeper today
 
@@ -309,7 +308,8 @@ Operational invariants:
 
 - `RealConnection::try_acquire()` must fail for unhealthy or closed connections
 - HTTP/1.1 may have at most one active allocation per `RealConnection`
-- HTTP/2 allocation count is capped at the current fixed limit of `100`
+- HTTP/2 allocation count is bookkeeping for release and lifecycle handling;
+  sender readiness decides whether another exchange can be dispatched
 - `RealConnection::release()` increments `completed_exchanges` and restores
   `idle_since` only when the allocation count reaches zero
 - `ConnectionPool::remove()` always closes the removed connection
@@ -319,7 +319,8 @@ Operational invariants:
   past `idle_timeout`
 - HTTP/2 connections are not subject to HTTP/1.1 idle eviction rules
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
-  name authorization and route overlap
+  name authorization, route overlap, and a different authority than the pooled
+  connection
 
 ## 8. Protocol Binding
 

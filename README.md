@@ -31,8 +31,6 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
-- [docs/REVIEW_REMEDIATION_DESIGN.md](docs/REVIEW_REMEDIATION_DESIGN.md): implementation design for the 2026-03 review findings
-- [docs/REVIEW_REMEDIATION_TASKS.md](docs/REVIEW_REMEDIATION_TASKS.md): step-by-step execution tracker for the remediation work
 - [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start
@@ -64,8 +62,8 @@ Today the repository includes:
 - request normalization for `Host`, `User-Agent`, and body framing
 - route planning plus direct-route fast fallback
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
-- connection pooling for HTTP/1.1 and HTTP/2, including conservative HTTPS
-  HTTP/2 coalescing for verified authorities
+- connection pooling for HTTP/1.1 and HTTP/2, including verified-authority
+  HTTPS HTTP/2 coalescing
 - opt-in system proxy loading from standard environment variables
 - local performance tests and Criterion benchmarks for warm and cold paths
 

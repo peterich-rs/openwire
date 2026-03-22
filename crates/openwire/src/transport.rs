@@ -504,6 +504,7 @@ async fn establish_connect_tunnel(
                         params.target_uri.clone(),
                         Version::HTTP_11,
                         connect_request_headers(&authority, &connect_headers)?,
+                        http::Extensions::new(),
                         Some(RequestBody::empty()),
                     ),
                     AuthResponseState::new(head.status, head.headers.clone()),
@@ -1156,6 +1157,12 @@ enum AcquiredBinding {
     },
 }
 
+enum BindingAcquireResult {
+    Acquired(AcquiredBinding),
+    Busy,
+    Stale,
+}
+
 impl ConnectionBindings {
     fn insert_http1(
         &self,
@@ -1184,33 +1191,38 @@ impl ConnectionBindings {
         );
     }
 
-    fn acquire(&self, connection_id: ConnectionId) -> Option<AcquiredBinding> {
+    fn acquire(&self, connection_id: ConnectionId) -> BindingAcquireResult {
         let mut bindings = self.inner.lock().expect("connection bindings lock");
         let mut remove_stale = false;
-        let acquired = match bindings.get_mut(&connection_id)? {
-            ConnectionBinding::Http1(binding) => {
-                let sender = binding.sender.take()?;
+        let acquired = match bindings.get_mut(&connection_id) {
+            Some(ConnectionBinding::Http1(binding)) => {
+                let Some(sender) = binding.sender.take() else {
+                    return BindingAcquireResult::Busy;
+                };
                 if sender.is_closed() {
                     remove_stale = true;
-                    None
+                    BindingAcquireResult::Stale
                 } else {
-                    Some(AcquiredBinding::Http1 {
+                    BindingAcquireResult::Acquired(AcquiredBinding::Http1 {
                         info: binding.info.clone(),
                         sender,
                     })
                 }
             }
-            ConnectionBinding::Http2(binding) => {
+            Some(ConnectionBinding::Http2(binding)) => {
                 if binding.sender.is_closed() {
                     remove_stale = true;
-                    None
+                    BindingAcquireResult::Stale
+                } else if !binding.sender.is_ready() {
+                    BindingAcquireResult::Busy
                 } else {
-                    Some(AcquiredBinding::Http2 {
+                    BindingAcquireResult::Acquired(AcquiredBinding::Http2 {
                         info: binding.info.clone(),
                         sender: binding.sender.clone(),
                     })
                 }
             }
+            None => BindingAcquireResult::Stale,
         };
         if remove_stale {
             bindings.remove(&connection_id);
@@ -1370,15 +1382,21 @@ impl TransportService {
         span: tracing::Span,
     ) -> Result<SelectedConnection, WireError> {
         if let Some(connection) = prepared.reserved_connection() {
-            if let Some(binding) = self.bindings.acquire(connection.id()) {
-                return Ok(SelectedConnection {
-                    connection: connection.clone(),
-                    binding,
-                    reused: true,
-                });
+            match self.bindings.acquire(connection.id()) {
+                BindingAcquireResult::Acquired(binding) => {
+                    return Ok(SelectedConnection {
+                        connection: connection.clone(),
+                        binding,
+                        reused: true,
+                    });
+                }
+                BindingAcquireResult::Busy => {
+                    let _ = self.exchange_finder.release(connection);
+                }
+                BindingAcquireResult::Stale => {
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                }
             }
-
-            let _ = self.exchange_finder.pool().remove(connection.id());
         }
 
         self.bind_fresh_connection(prepared, request, ctx, span)
@@ -1424,15 +1442,18 @@ impl TransportService {
             ConnectionProtocol::Http1 => {
                 let (sender, task) = bind_http1(stream).await?;
                 self.bindings.insert_http1(info.id, info, sender);
-                let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
-                    self.bindings.remove(connection.id());
-                    WireError::internal(
-                        "freshly bound HTTP/1 connection was not available for request execution",
-                        io::Error::other(
-                            "bound HTTP/1 connection missing immediately after insert",
-                        ),
-                    )
-                })?;
+                let binding = match self.bindings.acquire(connection.id()) {
+                    BindingAcquireResult::Acquired(binding) => binding,
+                    BindingAcquireResult::Busy | BindingAcquireResult::Stale => {
+                        self.bindings.remove(connection.id());
+                        return Err(WireError::internal(
+                            "freshly bound HTTP/1 connection was not available for request execution",
+                            io::Error::other(
+                                "bound HTTP/1 connection missing immediately after insert",
+                            ),
+                        ));
+                    }
+                };
                 self.exchange_finder.pool().insert(connection.clone());
                 if let Err(error) = self.spawn_http1_task(connection.clone(), task, span) {
                     self.bindings.remove(connection.id());
@@ -1444,15 +1465,18 @@ impl TransportService {
             ConnectionProtocol::Http2 => {
                 let (sender, task) = bind_http2(stream, &self.config).await?;
                 self.bindings.insert_http2(info.id, info, sender);
-                let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
-                    self.bindings.remove(connection.id());
-                    WireError::internal(
-                        "freshly bound HTTP/2 connection was not available for request execution",
-                        io::Error::other(
-                            "bound HTTP/2 connection missing immediately after insert",
-                        ),
-                    )
-                })?;
+                let binding = match self.bindings.acquire(connection.id()) {
+                    BindingAcquireResult::Acquired(binding) => binding,
+                    BindingAcquireResult::Busy | BindingAcquireResult::Stale => {
+                        self.bindings.remove(connection.id());
+                        return Err(WireError::internal(
+                            "freshly bound HTTP/2 connection was not available for request execution",
+                            io::Error::other(
+                                "bound HTTP/2 connection missing immediately after insert",
+                            ),
+                        ));
+                    }
+                };
                 self.exchange_finder.pool().insert(connection.clone());
                 if let Err(error) = self.spawn_http2_task(connection.clone(), task, span) {
                     self.bindings.remove(connection.id());
@@ -1479,16 +1503,22 @@ impl TransportService {
             .exchange_finder
             .pool()
             .acquire_coalesced(address, route_plan)?;
-        let binding = self.bindings.acquire(connection.id());
-        if let Some(binding) = binding {
-            return Some(SelectedConnection {
-                connection,
-                binding,
-                reused: true,
-            });
+        match self.bindings.acquire(connection.id()) {
+            BindingAcquireResult::Acquired(binding) => {
+                return Some(SelectedConnection {
+                    connection,
+                    binding,
+                    reused: true,
+                });
+            }
+            BindingAcquireResult::Busy => {
+                let _ = self.exchange_finder.release(&connection);
+            }
+            BindingAcquireResult::Stale => {
+                let _ = self.exchange_finder.pool().remove(connection.id());
+            }
         }
 
-        let _ = self.exchange_finder.pool().remove(connection.id());
         None
     }
 

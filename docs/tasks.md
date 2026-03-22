@@ -7,7 +7,7 @@ real-network-validation baseline described in `docs/DESIGN.md`.
 
 Completed baseline:
 
-- `LNV-000` through `LNV-502` landed and were verified
+- baseline live-network validation work landed and was verified
 - the repository now has an opt-in live-network suite plus a separate manual /
   scheduled workflow outside the required CI gate
 - detailed completed phase tables were removed to keep this file focused on

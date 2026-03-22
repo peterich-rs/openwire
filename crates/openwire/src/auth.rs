@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use http::{HeaderMap, Method, Request, StatusCode, Uri, Version};
+use http::{Extensions, HeaderMap, Method, Request, StatusCode, Uri, Version};
 use openwire_core::{BoxFuture, WireError};
 
 use crate::RequestBody;
@@ -46,6 +46,7 @@ pub(crate) struct AuthRequestState {
     pub(crate) uri: Uri,
     pub(crate) version: Version,
     pub(crate) headers: HeaderMap,
+    pub(crate) extensions: Extensions,
     pub(crate) body: Option<RequestBody>,
 }
 
@@ -55,6 +56,7 @@ impl AuthRequestState {
         uri: Uri,
         version: Version,
         headers: HeaderMap,
+        extensions: Extensions,
         body: Option<RequestBody>,
     ) -> Self {
         Self {
@@ -62,6 +64,7 @@ impl AuthRequestState {
             uri,
             version,
             headers,
+            extensions,
             body,
         }
     }
@@ -85,6 +88,7 @@ pub struct AuthContext {
     request_uri: Uri,
     request_version: Version,
     request_headers: HeaderMap,
+    request_extensions: Extensions,
     request_body: Option<RequestBody>,
     response_status: StatusCode,
     response_headers: HeaderMap,
@@ -163,6 +167,7 @@ impl AuthContext {
             .body(body)
             .ok()?;
         *request.headers_mut() = self.request_headers.clone();
+        *request.extensions_mut() = self.request_extensions.clone();
         Some(request)
     }
 
@@ -178,6 +183,7 @@ impl AuthContext {
             request_uri: request.uri,
             request_version: request.version,
             request_headers: request.headers,
+            request_extensions: request.extensions,
             request_body: request.body,
             response_status: response.status,
             response_headers: response.headers,
