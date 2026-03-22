@@ -114,9 +114,8 @@ impl TcpConnector for TokioTcpConnector {
             stream
                 .set_nodelay(true)
                 .map_err(|error| WireError::tcp_connect("failed to configure TCP_NODELAY", error))
-                .map_err(|error| {
-                    ctx.listener().connect_failed(&ctx, addr, &error);
-                    error
+                .inspect_err(|error| {
+                    ctx.listener().connect_failed(&ctx, addr, error);
                 })?;
 
             let info = ConnectionInfo {
@@ -1589,24 +1588,41 @@ struct ResponseLease {
     state: Option<ResponseLeaseState>,
 }
 
+struct ResponseLeaseShared {
+    exchange_finder: Arc<ExchangeFinder>,
+    ctx: CallContext,
+    _tasks: ConnectionTaskRegistry,
+    availability: ConnectionAvailability,
+}
+
 enum ResponseLeaseState {
     Http1 {
         connection: crate::connection::RealConnection,
         bindings: Arc<ConnectionBindings>,
         sender: http1::SendRequest<RequestBody>,
         reusable: bool,
-        exchange_finder: Arc<ExchangeFinder>,
-        ctx: CallContext,
-        _tasks: ConnectionTaskRegistry,
-        availability: ConnectionAvailability,
+        shared: ResponseLeaseShared,
     },
     Http2 {
         connection: crate::connection::RealConnection,
+        shared: ResponseLeaseShared,
+    },
+}
+
+impl ResponseLeaseShared {
+    fn new(
         exchange_finder: Arc<ExchangeFinder>,
         ctx: CallContext,
-        _tasks: ConnectionTaskRegistry,
+        tasks: ConnectionTaskRegistry,
         availability: ConnectionAvailability,
-    },
+    ) -> Self {
+        Self {
+            exchange_finder,
+            ctx,
+            _tasks: tasks,
+            availability,
+        }
+    }
 }
 
 impl ResponseLease {
@@ -1615,10 +1631,7 @@ impl ResponseLease {
         bindings: Arc<ConnectionBindings>,
         sender: http1::SendRequest<RequestBody>,
         reusable: bool,
-        exchange_finder: Arc<ExchangeFinder>,
-        ctx: CallContext,
-        tasks: ConnectionTaskRegistry,
-        availability: ConnectionAvailability,
+        shared: ResponseLeaseShared,
     ) -> Self {
         Self {
             state: Some(ResponseLeaseState::Http1 {
@@ -1626,29 +1639,14 @@ impl ResponseLease {
                 bindings,
                 sender,
                 reusable,
-                exchange_finder,
-                ctx,
-                _tasks: tasks,
-                availability,
+                shared,
             }),
         }
     }
 
-    fn http2(
-        connection: crate::connection::RealConnection,
-        exchange_finder: Arc<ExchangeFinder>,
-        ctx: CallContext,
-        tasks: ConnectionTaskRegistry,
-        availability: ConnectionAvailability,
-    ) -> Self {
+    fn http2(connection: crate::connection::RealConnection, shared: ResponseLeaseShared) -> Self {
         Self {
-            state: Some(ResponseLeaseState::Http2 {
-                connection,
-                exchange_finder,
-                ctx,
-                _tasks: tasks,
-                availability,
-            }),
+            state: Some(ResponseLeaseState::Http2 { connection, shared }),
         }
     }
 
@@ -2266,9 +2264,13 @@ fn release_response_lease(state: ResponseLeaseState) {
             bindings,
             sender,
             reusable,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             if reusable
@@ -2286,9 +2288,13 @@ fn release_response_lease(state: ResponseLeaseState) {
         }
         ResponseLeaseState::Http2 {
             connection,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             let _ = exchange_finder.release(&connection);
@@ -2303,9 +2309,13 @@ fn discard_response_lease(state: ResponseLeaseState) {
         ResponseLeaseState::Http1 {
             connection,
             bindings,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             bindings.remove(connection.id());
@@ -2315,9 +2325,13 @@ fn discard_response_lease(state: ResponseLeaseState) {
         }
         ResponseLeaseState::Http2 {
             connection,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             connection.mark_unhealthy();
@@ -2333,9 +2347,13 @@ fn abandon_response_lease_state(state: ResponseLeaseState) {
         ResponseLeaseState::Http1 {
             connection,
             bindings,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             bindings.remove(connection.id());
@@ -2345,9 +2363,13 @@ fn abandon_response_lease_state(state: ResponseLeaseState) {
         }
         ResponseLeaseState::Http2 {
             connection,
-            exchange_finder,
-            ctx,
-            availability,
+            shared:
+                ResponseLeaseShared {
+                    exchange_finder,
+                    ctx,
+                    availability,
+                    ..
+                },
             ..
         } => {
             let _ = exchange_finder.release(&connection);
@@ -2465,10 +2487,7 @@ async fn send_bound_request(
                     bindings,
                     sender,
                     reusable,
-                    exchange_finder,
-                    ctx,
-                    tasks,
-                    availability,
+                    ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
                 ),
                 reused,
             })
@@ -2487,10 +2506,7 @@ async fn send_bound_request(
                 response,
                 release: ResponseLease::http2(
                     connection,
-                    exchange_finder,
-                    ctx,
-                    tasks,
-                    availability,
+                    ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
                 ),
                 reused,
             })
@@ -3163,10 +3179,12 @@ mod tests {
         ));
         abandon_response_lease(Some(super::ResponseLease::http2(
             connection.clone(),
-            exchange_finder.clone(),
-            make_call_context(),
-            super::ConnectionTaskRegistry::default(),
-            super::ConnectionAvailability::default(),
+            super::ResponseLeaseShared::new(
+                exchange_finder.clone(),
+                make_call_context(),
+                super::ConnectionTaskRegistry::default(),
+                super::ConnectionAvailability::default(),
+            ),
         )));
 
         let snapshot = connection.snapshot();
