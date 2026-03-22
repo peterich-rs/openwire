@@ -5,6 +5,7 @@ mod connection;
 mod cookie;
 mod policy;
 mod proxy;
+mod sync_util;
 mod trace;
 mod transport;
 

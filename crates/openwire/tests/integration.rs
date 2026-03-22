@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -113,6 +113,342 @@ async fn follows_redirects_for_get_requests() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "redirect complete");
+}
+
+#[tokio::test]
+async fn downgrade_redirects_are_rejected_by_default() {
+    let insecure_server = spawn_http1(|_request| async move { ok_text("downgraded") }).await;
+    let insecure_target = format!(
+        "http://localhost:{}/downgraded",
+        insecure_server.addr().port()
+    );
+    let secure_server = spawn_https_http1(move |_request| {
+        let insecure_target = insecure_target.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", insecure_target)
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response")
+        }
+    })
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(secure_server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let client = Client::builder()
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "https://localhost:{}/redirect",
+            secure_server.addr().port()
+        )))
+        .await
+        .expect_err("downgrade redirect should fail");
+
+    assert_eq!(error.kind(), WireErrorKind::Redirect);
+    assert!(
+        error
+            .to_string()
+            .contains("refusing insecure redirect from https://localhost:"),
+        "error = {error}",
+    );
+}
+
+#[tokio::test]
+async fn insecure_redirects_can_be_enabled_explicitly() {
+    let insecure_server = spawn_http1(|_request| async move { ok_text("downgraded") }).await;
+    let insecure_target = format!(
+        "http://localhost:{}/downgraded",
+        insecure_server.addr().port()
+    );
+    let secure_server = spawn_https_http1(move |_request| {
+        let insecure_target = insecure_target.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", insecure_target)
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response")
+        }
+    })
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(secure_server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let client = Client::builder()
+        .tls_connector(tls)
+        .allow_insecure_redirects(true)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://localhost:{}/redirect",
+            secure_server.addr().port()
+        )))
+        .await
+        .expect("redirect should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "downgraded");
+}
+
+#[tokio::test]
+async fn request_limit_total_blocks_parallel_calls_across_hosts() {
+    let first_server = spawn_http1(|_request| async move { ok_text("first") }).await;
+    let second_server = spawn_http1(|_request| async move { ok_text("second") }).await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("first.test".to_owned(), first_server.addr()),
+            ("second.test".to_owned(), second_server.addr()),
+        ]))
+        .max_requests_total(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://first.test:{}/resource",
+            first_server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request(format!(
+                "http://second.test:{}/resource",
+                second_server.addr().port()
+            )))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should remain blocked while the first response is still live",
+    );
+
+    drop(first);
+
+    let response = second.await.expect("second task");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_limit_per_host_blocks_parallel_calls_to_same_address() {
+    let server = spawn_http1(|_request| async move { ok_text("serialized") }).await;
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .max_requests_total(2)
+        .max_requests_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/resource",
+            server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/resource",
+                server.addr().port()
+            )))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should remain blocked while the first same-host response is still live",
+    );
+
+    drop(first);
+
+    let response = second.await.expect("second task");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn connection_limit_per_host_waits_for_existing_connection_to_become_reusable() {
+    let server = spawn_http1(|_request| async move { ok_text("reused") }).await;
+    let connector = AttemptCountingTcpConnector::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .max_requests_total(2)
+        .max_connections_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/resource",
+            server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    assert_eq!(connector.attempts(), 1);
+
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/resource",
+                server.addr().port()
+            )))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(connector.attempts(), 1);
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should wait instead of opening a second same-host connection",
+    );
+
+    let body = first.into_body().text().await.expect("first body");
+    assert_eq!(body, "reused");
+
+    let response = second.await.expect("second task");
+    let body = response.into_body().text().await.expect("second body");
+    assert_eq!(body, "reused");
+    assert_eq!(connector.attempts(), 1);
+}
+
+#[tokio::test]
+async fn connection_limit_total_waits_for_an_existing_connection_to_close() {
+    let first_server = spawn_http1(|_request| async move {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("connection", "close")
+            .body(http_body_util::Full::new(Bytes::from_static(b"first")))
+            .expect("response")
+    })
+    .await;
+    let second_server = spawn_http1(|_request| async move { ok_text("second") }).await;
+    let connector = AttemptCountingTcpConnector::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("first.test".to_owned(), first_server.addr()),
+            ("second.test".to_owned(), second_server.addr()),
+        ]))
+        .tcp_connector(connector.clone())
+        .max_requests_total(2)
+        .max_connections_total(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://first.test:{}/resource",
+            first_server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    assert_eq!(connector.attempts(), 1);
+
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request(format!(
+                "http://second.test:{}/resource",
+                second_server.addr().port()
+            )))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(connector.attempts(), 1);
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should wait while the only allowed connection slot is occupied",
+    );
+
+    let body = first.into_body().text().await.expect("first body");
+    assert_eq!(body, "first");
+
+    let response = second.await.expect("second task");
+    let body = response.into_body().text().await.expect("second body");
+    assert_eq!(body, "second");
+    assert_eq!(connector.attempts(), 2);
+}
+
+#[tokio::test]
+async fn tokio_tcp_connector_emits_single_connect_failed_event_for_connection_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let addr = listener.local_addr().expect("listener addr");
+    drop(listener);
+
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(addr))
+        .event_listener_factory(events.clone())
+        .retry_on_connection_failure(false)
+        .max_retries(0)
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/refused",
+            addr.port()
+        )))
+        .await
+        .expect_err("connect should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+
+    let events = events.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("connect_failed "))
+            .count(),
+        1,
+        "events = {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.starts_with("connect_end ")),
+        "events = {events:?}",
+    );
 }
 
 #[tokio::test]
@@ -469,6 +805,78 @@ async fn http_requests_can_route_through_socks5_proxy_without_origin_dns() {
 }
 
 #[tokio::test]
+async fn socks5_proxy_username_password_authentication_is_required_when_server_demands_it() {
+    let server = spawn_http1(|_request| async move { ok_text("proxied socks http") }).await;
+    let proxy = spawn_socks5_proxy_requiring_auth("alice", "secret").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://localhost:{}/socks-http-auth-required",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("missing proxy credentials should fail");
+
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert!(
+        error
+            .to_string()
+            .contains("SOCKS5 proxy does not support no-auth authentication"),
+        "error = {error}",
+    );
+}
+
+#[tokio::test]
+async fn http_requests_can_route_through_socks5_proxy_with_username_password() {
+    let server = spawn_http1(|_request| async move { ok_text("proxied socks http auth") }).await;
+    let proxy = spawn_socks5_proxy_requiring_auth("alice", "secret").await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::socks5(format!(
+                "socks5://alice:secret@proxy.test:{}",
+                proxy.addr().port()
+            ))
+            .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://localhost:{}/socks-http-auth",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied socks http auth");
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .any(|request| request == &format!("localhost:{}", server.addr().port())),
+        "requests = {:?}",
+        proxy.requests(),
+    );
+}
+
+#[tokio::test]
 async fn https_requests_can_tunnel_through_socks5_proxy_without_origin_dns() {
     let server = spawn_https_http1(|_request| async move { ok_text("proxied socks https") }).await;
     let proxy = spawn_socks5_proxy().await;
@@ -508,6 +916,175 @@ async fn https_requests_can_tunnel_through_socks5_proxy_without_origin_dns() {
             .any(|request| request == &format!("localhost:{}", server.addr().port())),
         "requests = {:?}",
         proxy.requests(),
+    );
+}
+
+#[tokio::test]
+async fn http_proxy_routes_fast_fallback_across_proxy_ipv4_and_ipv6_endpoints() {
+    let proxy = spawn_plain_http_proxy_response("proxied proxy race").await;
+    let fake_ipv6 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0], 9301));
+    let fake_ipv4 = SocketAddr::from(([192, 0, 2, 41], 9302));
+    let resolver = MultiAddrResolver::new([("proxy.test".to_owned(), vec![fake_ipv6, fake_ipv4])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_ipv6,
+            TcpAttemptScript {
+                actual_addr: proxy.addr(),
+                delay: Duration::from_millis(600),
+            },
+        ),
+        (
+            fake_ipv4,
+            TcpAttemptScript {
+                actual_addr: proxy.addr(),
+                delay: Duration::from_millis(10),
+            },
+        ),
+    ]);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .event_listener_factory(events.clone())
+        .proxy(
+            Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let start = std::time::Instant::now();
+    let response = client
+        .execute(empty_request(
+            "http://does-not-resolve.test/proxy-race?fast_fallback=1",
+        ))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    let elapsed = start.elapsed();
+
+    assert_eq!(body, "proxied proxy race");
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "elapsed = {elapsed:?} should be faster than sequential proxy fallback",
+    );
+    assert_eq!(connector.attempts(), 2);
+
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 1, "requests = {requests:?}");
+    assert!(
+        requests[0]
+            .starts_with("GET http://does-not-resolve.test/proxy-race?fast_fallback=1 HTTP/1.1"),
+        "requests = {requests:?}",
+    );
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "route_plan 2 fast_fallback=true",
+            "connect_race_start ",
+            "connect_race_start ",
+            "connect_race_won ",
+            "connect_race_lost ",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn connect_proxy_fast_fallback_continues_after_proxy_tunnel_failure() {
+    let server = spawn_http1(|_request| async move { ok_text("connect proxy fallback") }).await;
+    let failing_proxy = spawn_delayed_dropping_connect_proxy(Duration::from_millis(300)).await;
+    let working_proxy = spawn_connect_proxy().await;
+    let fake_ipv6 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1], 9303));
+    let fake_ipv4 = SocketAddr::from(([192, 0, 2, 42], 9304));
+    let resolver = MultiAddrResolver::new([("proxy.test".to_owned(), vec![fake_ipv6, fake_ipv4])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_ipv6,
+            TcpAttemptScript {
+                actual_addr: failing_proxy.addr(),
+                delay: Duration::ZERO,
+            },
+        ),
+        (
+            fake_ipv4,
+            TcpAttemptScript {
+                actual_addr: working_proxy.addr(),
+                delay: Duration::from_millis(200),
+            },
+        ),
+    ]);
+    let tls = ScriptedPassThroughTlsConnector::new(vec![TlsAttemptScript::Pass(
+        Duration::from_millis(1),
+    )]);
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .tls_connector(tls.clone())
+        .event_listener_factory(events.clone())
+        .proxy(
+            Proxy::https(format!("http://proxy.test:{}", failing_proxy.addr().port()))
+                .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://localhost:{}/proxy-connect-race",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "connect proxy fallback");
+    assert_eq!(connector.attempts(), 2);
+    assert_eq!(tls.calls(), 1);
+
+    let failing_requests = failing_proxy.requests();
+    assert_eq!(failing_requests.len(), 1, "requests = {failing_requests:?}");
+    assert!(
+        failing_requests[0].starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            server.addr().port()
+        )),
+        "requests = {failing_requests:?}",
+    );
+    let working_requests = working_proxy.requests();
+    assert_eq!(working_requests.len(), 1, "requests = {working_requests:?}");
+    assert!(
+        working_requests[0].starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            server.addr().port()
+        )),
+        "requests = {working_requests:?}",
+    );
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "route_plan 2 fast_fallback=true",
+            "connect_race_start ",
+            "connect_race_won ",
+        ],
+    );
+    let start_events = events
+        .iter()
+        .filter(|event| event.starts_with("connect_race_start "))
+        .collect::<Vec<_>>();
+    assert_eq!(start_events.len(), 2, "events = {events:?}");
+    let lost_events = events
+        .iter()
+        .filter(|event| event.starts_with("connect_race_lost "))
+        .collect::<Vec<_>>();
+    assert_eq!(lost_events.len(), 1, "events = {events:?}");
+    assert!(
+        lost_events[0].contains("reason=proxy_failed"),
+        "events = {events:?}",
     );
 }
 
@@ -1365,6 +1942,43 @@ async fn shared_client_does_not_reuse_http1_connections_marked_close_in_connecti
         Response::builder()
             .status(StatusCode::OK)
             .header("connection", "keep-alive, close")
+            .body(http_body_util::Full::new(Bytes::from_static(b"closed")))
+            .expect("response")
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+
+    let response_one = client
+        .execute(empty_request(server.http_url("/first")))
+        .await
+        .expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let response_two = client
+        .execute(empty_request(server.http_url("/second")))
+        .await
+        .expect("response");
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_two.into_body().text().await.expect("body");
+
+    assert_ne!(connection_one, connection_two);
+}
+
+#[tokio::test]
+async fn shared_client_does_not_reuse_http1_connections_with_malformed_connection_header() {
+    let server = spawn_http1(|_request| async move {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("connection", "keep-alive;timeout=5")
             .body(http_body_util::Full::new(Bytes::from_static(b"closed")))
             .expect("response")
     })
@@ -2494,6 +3108,59 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
 }
 
 #[tokio::test]
+async fn bridge_interceptor_omits_content_length_for_absent_requests_before_network_interceptors() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("request body should be utf-8"),
+            });
+            ok_text("normalized")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/absent",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "normalized");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some(default_user_agent().to_owned()),
+        content_length: None,
+        transfer_encoding: None,
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: String::new(),
+        }
+    );
+}
+
+#[tokio::test]
 async fn bridge_interceptor_normalizes_empty_requests_before_network_interceptors() {
     let observed_server_request = Arc::new(Mutex::new(None));
     let observed_server_request_clone = observed_server_request.clone();
@@ -2526,7 +3193,7 @@ async fn bridge_interceptor_normalizes_empty_requests_before_network_interceptor
             "http://openwire.test:{}/empty",
             server.addr().port()
         ))
-        .body(RequestBody::empty())
+        .body(RequestBody::explicit_empty())
         .expect("request");
 
     let response = client.execute(request).await.expect("response");
@@ -3269,12 +3936,40 @@ impl TcpConnector for FailingTcpConnector {
 
             if should_fail {
                 ctx.listener().connect_start(&ctx, addr);
-                return Err(WireError::connect(
+                let error = WireError::connect(
                     "scripted connect failure",
                     io::Error::new(io::ErrorKind::ConnectionRefused, "scripted connect failure"),
-                ));
+                );
+                ctx.listener().connect_failed(&ctx, addr, &error);
+                return Err(error);
             }
 
+            TokioTcpConnector.connect(ctx, addr, timeout).await
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct AttemptCountingTcpConnector {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl AttemptCountingTcpConnector {
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::Relaxed)
+    }
+}
+
+impl TcpConnector for AttemptCountingTcpConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        addr: SocketAddr,
+        timeout: Option<std::time::Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let attempts = self.attempts.clone();
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::Relaxed);
             TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }
@@ -3701,6 +4396,55 @@ async fn spawn_stalling_connect_proxy() -> ConnectProxyServer {
     }
 }
 
+async fn spawn_delayed_dropping_connect_proxy(delay: Duration) -> ConnectProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            let read = client.read(&mut buf).await.expect("read proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&head).to_string();
+                        requests.lock().expect("proxy requests").push(request);
+                        tokio::time::sleep(delay).await;
+                        let _ = client.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+
+    ConnectProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
 async fn spawn_connect_proxy_requiring_authorization(
     header_name: &'static str,
     expected_value: &'static str,
@@ -3878,6 +4622,179 @@ async fn spawn_socks5_proxy() -> Socks5ProxyServer {
                             return;
                         }
                         if client.write_all(&[0x05, 0x00]).await.is_err() {
+                            return;
+                        }
+
+                        let mut head = [0u8; 4];
+                        if client.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        if head[0] != 0x05 || head[1] != 0x01 {
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+
+                        let host = match head[3] {
+                            0x01 => {
+                                let mut addr = [0u8; 4];
+                                if client.read_exact(&mut addr).await.is_err() {
+                                    return;
+                                }
+                                std::net::Ipv4Addr::from(addr).to_string()
+                            }
+                            0x03 => {
+                                let mut len = [0u8; 1];
+                                if client.read_exact(&mut len).await.is_err() {
+                                    return;
+                                }
+                                let mut host = vec![0u8; len[0] as usize];
+                                if client.read_exact(&mut host).await.is_err() {
+                                    return;
+                                }
+                                match String::from_utf8(host) {
+                                    Ok(host) => host,
+                                    Err(_) => return,
+                                }
+                            }
+                            0x04 => {
+                                let mut addr = [0u8; 16];
+                                if client.read_exact(&mut addr).await.is_err() {
+                                    return;
+                                }
+                                std::net::Ipv6Addr::from(addr).to_string()
+                            }
+                            _ => {
+                                let _ = client.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                let _ = client.shutdown().await;
+                                return;
+                            }
+                        };
+
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        let port = u16::from_be_bytes(port);
+                        requests
+                            .lock()
+                            .expect("proxy requests")
+                            .push(format!("{host}:{port}"));
+
+                        let mut upstream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                            Ok(upstream) => upstream,
+                            Err(_) => {
+                                let _ = client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                let _ = client.shutdown().await;
+                                return;
+                            }
+                        };
+
+                        if client
+                            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    });
+                }
+            }
+        }
+    });
+
+    Socks5ProxyServer {
+        addr,
+        requests,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_socks5_proxy_requiring_auth(
+    expected_username: &'static str,
+    expected_password: &'static str,
+) -> Socks5ProxyServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind socks proxy listener");
+    let addr = listener.local_addr().expect("socks proxy listener addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = requests.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut client, _)) = accepted else {
+                        break;
+                    };
+                    let requests = requests_clone.clone();
+                    tokio::spawn(async move {
+                        let mut greeting = [0u8; 2];
+                        if client.read_exact(&mut greeting).await.is_err() {
+                            return;
+                        }
+                        if greeting[0] != 0x05 {
+                            return;
+                        }
+                        let mut methods = vec![0u8; greeting[1] as usize];
+                        if client.read_exact(&mut methods).await.is_err() {
+                            return;
+                        }
+                        if !methods.contains(&0x02) {
+                            let _ = client.write_all(&[0x05, 0xff]).await;
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+                        if client.write_all(&[0x05, 0x02]).await.is_err() {
+                            return;
+                        }
+
+                        let mut auth_version = [0u8; 1];
+                        if client.read_exact(&mut auth_version).await.is_err() {
+                            return;
+                        }
+                        if auth_version[0] != 0x01 {
+                            let _ = client.write_all(&[0x01, 0x01]).await;
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+
+                        let mut username_len = [0u8; 1];
+                        if client.read_exact(&mut username_len).await.is_err() {
+                            return;
+                        }
+                        let mut username = vec![0u8; username_len[0] as usize];
+                        if client.read_exact(&mut username).await.is_err() {
+                            return;
+                        }
+
+                        let mut password_len = [0u8; 1];
+                        if client.read_exact(&mut password_len).await.is_err() {
+                            return;
+                        }
+                        let mut password = vec![0u8; password_len[0] as usize];
+                        if client.read_exact(&mut password).await.is_err() {
+                            return;
+                        }
+
+                        let username = match String::from_utf8(username) {
+                            Ok(username) => username,
+                            Err(_) => return,
+                        };
+                        let password = match String::from_utf8(password) {
+                            Ok(password) => password,
+                            Err(_) => return,
+                        };
+                        if username != expected_username || password != expected_password {
+                            let _ = client.write_all(&[0x01, 0x01]).await;
+                            let _ = client.shutdown().await;
+                            return;
+                        }
+                        if client.write_all(&[0x01, 0x00]).await.is_err() {
                             return;
                         }
 

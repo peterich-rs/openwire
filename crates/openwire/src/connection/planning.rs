@@ -5,7 +5,7 @@ use std::time::Duration;
 use hyper::Uri;
 use openwire_core::WireError;
 
-use crate::proxy::Proxy;
+use crate::proxy::{Proxy, ProxyCredentials};
 
 const DEFAULT_FAST_FALLBACK_STAGGER: Duration = Duration::from_millis(250);
 
@@ -86,6 +86,7 @@ pub(crate) enum ProxyMode {
 pub(crate) struct ProxyEndpoint {
     scheme: ProxyScheme,
     authority: AuthorityKey,
+    credentials: Option<ProxyCredentials>,
 }
 
 impl ProxyEndpoint {
@@ -93,6 +94,7 @@ impl ProxyEndpoint {
         Self {
             scheme,
             authority: AuthorityKey::new(host, port),
+            credentials: None,
         }
     }
 
@@ -102,6 +104,15 @@ impl ProxyEndpoint {
 
     pub(crate) fn authority(&self) -> &AuthorityKey {
         &self.authority
+    }
+
+    pub(crate) fn with_credentials(mut self, credentials: ProxyCredentials) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    pub(crate) fn credentials(&self) -> Option<&ProxyCredentials> {
+        self.credentials.as_ref()
     }
 }
 
@@ -236,6 +247,10 @@ impl ProxyConfig {
                 WireError::invalid_request("proxy URL is missing a port and has no known default")
             })?,
         );
+        let endpoint = match proxy.credentials() {
+            Some(credentials) => endpoint.with_credentials(credentials.clone()),
+            None => endpoint,
+        };
 
         let mode = match (endpoint_scheme, scheme) {
             (ProxyScheme::Http, UriScheme::Http) if proxy.intercepts_http() => ProxyMode::Forward,
@@ -280,10 +295,21 @@ pub(crate) enum DnsResolution {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RouteKind {
-    Direct { target: SocketAddr },
-    HttpForwardProxy { proxy: SocketAddr },
-    ConnectProxy { proxy: SocketAddr },
-    SocksProxy { proxy: SocketAddr },
+    Direct {
+        target: SocketAddr,
+    },
+    HttpForwardProxy {
+        proxy: SocketAddr,
+        credentials: Option<ProxyCredentials>,
+    },
+    ConnectProxy {
+        proxy: SocketAddr,
+        credentials: Option<ProxyCredentials>,
+    },
+    SocksProxy {
+        proxy: SocketAddr,
+        credentials: Option<ProxyCredentials>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -307,15 +333,35 @@ impl Route {
     }
 
     pub(crate) fn http_forward(address: Address, proxy: SocketAddr) -> Self {
-        Self::proxy_route(address, proxy, RouteKind::HttpForwardProxy { proxy })
+        let credentials = address
+            .proxy()
+            .and_then(|proxy| proxy.endpoint().credentials())
+            .cloned();
+        Self::proxy_route(
+            address,
+            proxy,
+            RouteKind::HttpForwardProxy { proxy, credentials },
+        )
     }
 
     pub(crate) fn connect_proxy(address: Address, proxy: SocketAddr) -> Self {
-        Self::proxy_route(address, proxy, RouteKind::ConnectProxy { proxy })
+        let credentials = address
+            .proxy()
+            .and_then(|proxy| proxy.endpoint().credentials())
+            .cloned();
+        Self::proxy_route(
+            address,
+            proxy,
+            RouteKind::ConnectProxy { proxy, credentials },
+        )
     }
 
     pub(crate) fn socks_proxy(address: Address, proxy: SocketAddr) -> Self {
-        Self::proxy_route(address, proxy, RouteKind::SocksProxy { proxy })
+        let credentials = address
+            .proxy()
+            .and_then(|proxy| proxy.endpoint().credentials())
+            .cloned();
+        Self::proxy_route(address, proxy, RouteKind::SocksProxy { proxy, credentials })
     }
 
     pub(crate) fn from_observed(address: Address, remote_addr: Option<SocketAddr>) -> Self {
@@ -714,11 +760,14 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;
 
+    use hyper::Uri;
+
     use super::{
         Address, AuthorityKey, ConnectAttemptState, ConnectFailure, ConnectFailureStage,
         ConnectPlan, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig, ProxyEndpoint,
         ProxyMode, ProxyScheme, RouteFamily, RouteKind, RoutePlanner, TlsIdentity, UriScheme,
     };
+    use crate::Proxy;
 
     fn http_address() -> Address {
         Address::new(
@@ -827,6 +876,28 @@ mod tests {
         let socks =
             super::Route::socks_proxy(https_proxy_address(ProxyMode::SocksTunnel), socket_v4(40));
         assert!(matches!(socks.kind(), RouteKind::SocksProxy { .. }));
+    }
+
+    #[test]
+    fn socks_proxy_routes_preserve_proxy_credentials() {
+        let proxy =
+            Proxy::socks5("socks5://alice:secret@proxy.internal:1080").expect("proxy config");
+        let address = Address::from_uri(
+            &"http://example.com/".parse::<Uri>().expect("uri"),
+            Some(&proxy),
+        )
+        .expect("address");
+        let route = super::Route::socks_proxy(address, socket_v4(50));
+
+        let RouteKind::SocksProxy {
+            credentials: Some(credentials),
+            ..
+        } = route.kind()
+        else {
+            panic!("expected socks proxy credentials on route");
+        };
+        assert_eq!(credentials.username(), "alice");
+        assert_eq!(credentials.password(), "secret");
     }
 
     #[test]

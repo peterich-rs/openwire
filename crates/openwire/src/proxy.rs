@@ -11,6 +11,7 @@ pub struct Proxy {
     target: Url,
     intercept: ProxyIntercept,
     no_proxy: Option<NoProxy>,
+    credentials: Option<ProxyCredentials>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,37 +49,49 @@ struct CidrBlock {
     prefix: u8,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProxyCredentials {
+    username: String,
+    password: String,
+}
+
 impl Proxy {
-    fn from_target(target: Url, intercept: ProxyIntercept) -> Self {
-        Self {
+    fn from_target(mut target: Url, intercept: ProxyIntercept) -> Result<Self, WireError> {
+        let credentials = ProxyCredentials::from_url(&target)?;
+        if credentials.is_some() {
+            let _ = target.set_username("");
+            let _ = target.set_password(None);
+        }
+        Ok(Self {
             target,
             intercept,
             no_proxy: None,
-        }
+            credentials,
+        })
     }
 
     /// Routes HTTP requests through the given HTTP proxy endpoint.
     pub fn http(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self::from_target(target, ProxyIntercept::Http))
+        Self::from_target(target, ProxyIntercept::Http)
     }
 
     /// Routes HTTPS requests through the given HTTP proxy endpoint.
     pub fn https(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self::from_target(target, ProxyIntercept::Https))
+        Self::from_target(target, ProxyIntercept::Https)
     }
 
     /// Routes both HTTP and HTTPS requests through the given HTTP proxy endpoint.
     pub fn all(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_http_proxy_target(target.as_ref())?;
-        Ok(Self::from_target(target, ProxyIntercept::All))
+        Self::from_target(target, ProxyIntercept::All)
     }
 
     /// Routes both HTTP and HTTPS requests through the given SOCKS5 proxy endpoint.
     pub fn socks5(target: impl AsRef<str>) -> Result<Self, WireError> {
         let target = parse_socks5_proxy_target(target.as_ref())?;
-        Ok(Self::from_target(target, ProxyIntercept::All))
+        Self::from_target(target, ProxyIntercept::All)
     }
 
     /// Excludes requests matched by `no_proxy` from using this proxy rule.
@@ -115,6 +128,39 @@ impl Proxy {
 
     pub(crate) fn target(&self) -> &Url {
         &self.target
+    }
+
+    pub(crate) fn credentials(&self) -> Option<&ProxyCredentials> {
+        self.credentials.as_ref()
+    }
+}
+
+impl ProxyCredentials {
+    fn from_url(target: &Url) -> Result<Option<Self>, WireError> {
+        let username = target.username();
+        let password = target.password();
+        if username.is_empty() && password.is_none() {
+            return Ok(None);
+        }
+
+        if username.is_empty() {
+            return Err(WireError::invalid_request(
+                "proxy URL credentials must include a username",
+            ));
+        }
+
+        Ok(Some(Self {
+            username: username.to_owned(),
+            password: password.unwrap_or_default().to_owned(),
+        }))
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
     }
 }
 
@@ -309,7 +355,7 @@ fn proxy_from_env(target: &str, intercept: ProxyIntercept) -> Result<Proxy, Wire
         return Err(WireError::invalid_request("proxy URL is missing a host"));
     }
     match parsed.scheme() {
-        "http" | "socks5" => Ok(Proxy::from_target(parsed, intercept)),
+        "http" | "socks5" => Proxy::from_target(parsed, intercept),
         "https" => Err(WireError::invalid_request(
             "https proxy endpoints are not supported",
         )),
@@ -493,6 +539,18 @@ mod tests {
         assert!(error
             .to_string()
             .contains("only socks5 proxy endpoints are supported"));
+    }
+
+    #[test]
+    fn proxy_constructor_extracts_credentials_from_userinfo() {
+        let proxy = Proxy::socks5("socks5://alice:secret@proxy.test:1080").expect("socks proxy");
+
+        let credentials = proxy.credentials().expect("proxy credentials");
+        assert_eq!(credentials.username(), "alice");
+        assert_eq!(credentials.password(), "secret");
+        assert_eq!(proxy.target.host_str(), Some("proxy.test"));
+        assert_eq!(proxy.target.username(), "");
+        assert!(proxy.target.password().is_none());
     }
 
     #[test]

@@ -1,13 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::future::{select, Either};
 use http::{Request, Response};
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
 use openwire_core::{
     BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
     NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
     SharedInterceptor, TcpConnector, TlsConnector, TokioRuntime, WireError,
 };
+use pin_project_lite::pin_project;
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
 use tower::Service;
@@ -16,7 +20,10 @@ use tracing::Instrument;
 
 use crate::auth::{Authenticator, SharedAuthenticator};
 use crate::bridge::BridgeInterceptor;
-use crate::connection::{ConnectionPool, ExchangeFinder, PoolSettings, RoutePlanner};
+use crate::connection::{
+    Address, ConnectionPool, ExchangeFinder, PoolSettings, RequestAdmissionLimiter,
+    RequestAdmissionPermit, RoutePlanner,
+};
 use crate::cookie::{CookieJar, SharedCookieJar};
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
@@ -33,6 +40,8 @@ struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
     runtime: Arc<dyn Runtime>,
     call_timeout: Option<Duration>,
+    proxy_selector: ProxySelector,
+    request_admission: RequestAdmissionLimiter,
     service: BoxWireService,
 }
 
@@ -48,6 +57,10 @@ pub(crate) struct TransportConfig {
     pub(crate) pool_max_idle_per_host: usize,
     pub(crate) http2_keep_alive_interval: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: bool,
+    pub(crate) max_connections_total: usize,
+    pub(crate) max_connections_per_host: usize,
+    pub(crate) max_requests_total: usize,
+    pub(crate) max_requests_per_host: usize,
 }
 
 pub struct ClientBuilder {
@@ -188,6 +201,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn allow_insecure_redirects(mut self, enabled: bool) -> Self {
+        self.policy.redirect.allow_insecure_redirects = enabled;
+        self
+    }
+
     pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
         self.policy.retry.retry_on_connection_failure = enabled;
         self
@@ -215,6 +233,26 @@ impl ClientBuilder {
 
     pub fn http2_keep_alive_while_idle(mut self, enabled: bool) -> Self {
         self.transport.http2_keep_alive_while_idle = enabled;
+        self
+    }
+
+    pub fn max_connections_total(mut self, max_connections: usize) -> Self {
+        self.transport.max_connections_total = max_connections;
+        self
+    }
+
+    pub fn max_connections_per_host(mut self, max_connections: usize) -> Self {
+        self.transport.max_connections_per_host = max_connections;
+        self
+    }
+
+    pub fn max_requests_total(mut self, max_requests: usize) -> Self {
+        self.transport.max_requests_total = max_requests;
+        self
+    }
+
+    pub fn max_requests_per_host(mut self, max_requests: usize) -> Self {
+        self.transport.max_requests_per_host = max_requests;
         self
     }
 
@@ -246,6 +284,10 @@ impl ClientBuilder {
             max_idle_per_address: self.transport.pool_max_idle_per_host,
         }));
         let proxy_selector = ProxySelector::new(proxies);
+        let request_admission = RequestAdmissionLimiter::new(
+            self.transport.max_requests_total,
+            self.transport.max_requests_per_host,
+        );
         let exchange_finder = Arc::new(ExchangeFinder::new(pool, proxy_selector.clone()));
         let connector = ConnectorStack {
             dns_resolver: self.dns_resolver,
@@ -262,13 +304,14 @@ impl ClientBuilder {
             self.transport.clone(),
             self.runtime.clone(),
             exchange_finder,
+            request_admission.clone(),
         );
         let service = build_service_chain(
             transport,
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
-            proxy_selector,
+            proxy_selector.clone(),
         );
 
         Ok(Client {
@@ -276,6 +319,8 @@ impl ClientBuilder {
                 event_listener_factory: self.event_listener_factory,
                 runtime: self.runtime,
                 call_timeout: self.policy.call_timeout,
+                proxy_selector,
+                request_admission,
                 service,
             }),
         })
@@ -295,6 +340,10 @@ impl Default for ClientBuilder {
                 pool_max_idle_per_host: usize::MAX,
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
+                max_connections_total: usize::MAX,
+                max_connections_per_host: usize::MAX,
+                max_requests_total: usize::MAX,
+                max_requests_per_host: usize::MAX,
             },
             policy: PolicyConfig {
                 call_timeout: None,
@@ -312,6 +361,7 @@ impl Default for ClientBuilder {
                 redirect: RedirectPolicyConfig {
                     follow_redirects: true,
                     max_redirects: 10,
+                    allow_insecure_redirects: false,
                 },
             },
             dns_resolver: Arc::new(SystemDnsResolver),
@@ -349,6 +399,10 @@ impl Client {
 
 impl Call {
     pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
+        let request_address = Address::from_uri(
+            self.request.uri(),
+            self.client.inner.proxy_selector.select(self.request.uri()),
+        )?;
         let ctx = CallContext::from_factory(
             &self.client.inner.event_listener_factory,
             &self.request,
@@ -367,12 +421,16 @@ impl Call {
 
             let mut service = self.client.inner.service.clone();
             let execute_ctx = ctx.clone();
+            let request_admission = self.client.inner.request_admission.clone();
             let execute = async move {
                 tower::ServiceExt::ready(&mut service)
                     .await
-                    .map_err(|error| WireError::internal("service chain not ready", error))?
+                    .map_err(|error| WireError::internal("service chain not ready", error))?;
+                let permit = request_admission.acquire(request_address).await?;
+                let response = service
                     .call(Exchange::new(self.request, execute_ctx, 1))
-                    .await
+                    .await?;
+                Ok(attach_request_admission(response, permit))
             };
 
             let result =
@@ -394,6 +452,23 @@ impl Call {
         .with_current_subscriber()
         .await
     }
+}
+
+fn attach_request_admission(
+    response: Response<ResponseBody>,
+    permit: RequestAdmissionPermit,
+) -> Response<ResponseBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        ResponseBody::new(
+            RequestAdmissionBody {
+                inner: body,
+                _permit: Some(permit),
+            }
+            .boxed(),
+        ),
+    )
 }
 
 fn build_service_chain(
@@ -443,5 +518,33 @@ where
         Either::Right((_ready, _future)) => Err(WireError::timeout(format!(
             "call timed out after {timeout:?}"
         ))),
+    }
+}
+
+pin_project! {
+    struct RequestAdmissionBody {
+        #[pin]
+        inner: ResponseBody,
+        _permit: Option<RequestAdmissionPermit>,
+    }
+}
+
+impl Body for RequestAdmissionBody {
+    type Data = Bytes;
+    type Error = WireError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }

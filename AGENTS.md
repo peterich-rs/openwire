@@ -50,6 +50,9 @@ User API
 - For parallelizable and cleanly separated workstreams, use `git worktree`
 - Keep secondary worktrees under `../openwire-worktrees`
 - Use conventional branch prefixes such as `feature/`, `bugfix/`, `refactor/`, and `docs/` based on the change type
+- Prefer one reviewed workstream per secondary worktree branch so scope, verification, and doc sync stay isolated
+- Do not let two active worktrees edit the same write-heavy area unless the split and merge plan is explicit up front
+- Merge or retire a secondary worktree only after that workstream's code, tests, and docs are in sync
 - Do not split tightly coupled or short single-path tasks into separate worktrees
 
 ## 4. Autonomous Documentation Maintenance
