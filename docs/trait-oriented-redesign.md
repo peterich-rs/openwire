@@ -1,7 +1,69 @@
 # Trait-Oriented Redesign
 
 Date: 2026-03-22
-Status: Draft v3
+Status: Draft v4
+
+## Main Sync Notes
+
+This draft is still directionally valid after `main` commit `e820485` ("plan core
+review work and harden connection lifecycle cleanup"), but several baseline
+assumptions changed and need to stay in scope while refining the redesign:
+
+- `Runtime::spawn()` now returns an abort-capable `TaskHandle`, and
+  `TransportService` uses a `ConnectionTaskRegistry` to abort owned connection
+  tasks on final client drop. Any `Runtime -> WireExecutor + Timer` split must
+  replace that shutdown behavior explicitly; fire-and-forget spawn is no longer
+  sufficient.
+- request admission and fresh-connection admission are now explicit transport
+  lifecycle concerns (`RequestAdmissionLimiter`, `ConnectionLimiter`,
+  `ConnectionPermit`). Their leases live across response-body / connection
+  lifetime, so they should remain in `openwire` with the rest of transport
+  orchestration.
+- `FastFallbackDialer` now backs route-plan racing for direct, HTTP forward
+  proxy, CONNECT proxy, and SOCKS proxy paths. The de-tokio work in
+  `fast_fallback.rs` must target the shared route-plan dialer, not only the
+  direct-connect path.
+- proxy credentials are now parsed once in `Proxy` and propagated through
+  `ProxyConfig` / `RouteKind` into CONNECT and SOCKS establishment. Route
+  planning remains coupled to `openwire` proxy types for good reason.
+
+## Relationship To Completed Core Review
+
+The completed core review, summarized in [`docs/core-review.md`](core-review.md)
+and [`docs/plans/core-review-plan-spec.md`](plans/core-review-plan-spec.md), is
+now part of the baseline that this redesign must preserve, not replace:
+
+- `WS-01` established RAII connection ownership plus `ConnectionTaskRegistry`
+  shutdown semantics; the runtime split must keep abortable owned-task tracking.
+- `WS-02` established `RequestBody::absent()` vs `explicit_empty()`, downgrade
+  redirect validation, and real Tower readiness propagation; policy extraction
+  must preserve those semantics.
+- `WS-03` established request admission, fresh-connection admission, and
+  sharded `ConnectionBindings`; those stay in `openwire` transport orchestration.
+- `WS-04` established proxy credential propagation and proxy-path fast fallback;
+  route-planning and fast-fallback phases now target the shared route-plan
+  machinery rather than only direct-origin dialing.
+- `WS-05` established protocol-agnostic idle eviction, coalescing secondary
+  indexing, and poison-safe lock helpers; the redesign should treat those as
+  current implementation constraints.
+- `WS-06` established RFC 9110 `Connection` token parsing and acquire/release
+  deadline signaling; later runtime cleanup must not regress those guarantees.
+
+## Redesign Scope After The Core Review
+
+This redesign starts from the post-review codebase on `main`. It is not trying
+to reopen or re-solve the review backlog. Its job is to reorganize extension
+boundaries and runtime ownership without losing the semantics that the merged
+review work already established.
+
+That means the redesign must carry forward, even if code moves across crates:
+
+- RAII cleanup for selected connections, response leases, and response-body release
+- tracked owned-connection tasks with explicit shutdown on final client drop
+- request-admission and connection-admission behavior and their current lifetime rules
+- proxy credential propagation, proxy-path fast fallback, and retryability boundaries
+- pool coalescing secondary indexing, protocol-agnostic idle eviction, and poison-safe locks
+- the current body semantics, redirect downgrade policy, and Tower readiness guarantees
 
 ## Target Crate Layout
 
@@ -13,7 +75,7 @@ openwire-core  (keep name — contains types + traits)
 ├── event.rs           EventListener, EventListenerFactory
 ├── interceptor.rs     Interceptor, Exchange, Next
 ├── transport.rs       DnsResolver, TcpConnector, TlsConnector, ConnectionIo, BoxConnection
-├── runtime.rs         WireExecutor, HyperExecutor  (replaces Runtime)
+├── runtime.rs         TaskHandle, WireExecutor, HyperExecutor  (replaces Runtime)
 ├── auth.rs            Authenticator, AuthContext, AuthKind  (moved from openwire)
 ├── cookie.rs          CookieJar  (moved from openwire)
 ├── policy.rs          RetryPolicy, RedirectPolicy  (new)
@@ -38,6 +100,7 @@ openwire  (main crate — framework + policy, no direct tokio in framework paths
 │   └── redirect.rs    DefaultRedirectPolicy
 ├── connection/
 │   ├── planning.rs    RoutePlanner trait + DefaultRoutePlanner
+│   ├── limits.rs      RequestAdmissionLimiter, ConnectionLimiter, ConnectionPermit
 │   ├── pool.rs        ConnectionPool
 │   ├── exchange_finder.rs
 │   ├── fast_fallback.rs  — accept dyn WireExecutor + Timer
@@ -47,6 +110,11 @@ openwire  (main crate — framework + policy, no direct tokio in framework paths
 ├── proxy.rs           Proxy, NoProxy, ProxySelector
 └── bridge.rs          BridgeInterceptor
 ```
+
+Transport-private lifecycle guards introduced on `main` stay internal for now:
+`ConnectionTaskRegistry`, `SelectedConnection`, and `ResponseLease` remain in
+`transport.rs` until the runtime split is finished. The redesign should not
+force an extra module breakup before those ownership boundaries are stable.
 
 ## Dependency Graph
 
@@ -94,8 +162,8 @@ Extract all tokio-specific code into a new crate. Do NOT rename openwire-core.
 | From | To | Content |
 |------|----|---------|
 | `openwire-core/src/tokio_rt.rs` | `openwire-tokio/src/` | TokioExecutor, TokioTimer, TokioIo |
-| `openwire/src/transport.rs:41-77` | `openwire-tokio/src/dns.rs` | SystemDnsResolver |
-| `openwire/src/transport.rs:77-127` | `openwire-tokio/src/tcp.rs` | TokioTcpConnector, TcpConnection |
+| `openwire/src/transport.rs` | `openwire-tokio/src/dns.rs` | SystemDnsResolver |
+| `openwire/src/transport.rs` | `openwire-tokio/src/tcp.rs` | TokioTcpConnector, TcpConnection |
 
 SystemDnsResolver and TokioTcpConnector are tokio-specific concrete impls. Moving them
 to openwire-tokio makes the runtime boundary explicit: openwire (framework) has zero
@@ -130,12 +198,20 @@ first-class multi-runtime support.
 
 ```rust
 // openwire-core/src/runtime.rs
+pub trait TaskHandle: Send + Sync + 'static {
+    fn abort(&self);
+}
+
+pub type BoxTaskHandle = Box<dyn TaskHandle>;
+
 pub trait WireExecutor: Send + Sync + 'static {
-    fn spawn(&self, future: BoxFuture<()>);
+    fn spawn(&self, future: BoxFuture<()>) -> BoxTaskHandle;
 }
 ```
 
-`spawn` is infallible — tokio::spawn never fails in practice.
+`spawn` is modeled as infallible once the executor is constructed. Runtime setup
+and validation belong in the adapter crate / builder path, not in per-request
+transport code.
 
 `Runtime` is removed. `TokioRuntime` no longer exists as the old `spawn + sleep` trait impl.
 In openwire-tokio it may remain only as a convenience bundle around:
@@ -143,6 +219,8 @@ In openwire-tokio it may remain only as a convenience bundle around:
 - `TokioTimer` for `hyper::rt::Timer`
 
 The framework depends on the split executor/timer pair, not on a monolithic runtime object.
+`ConnectionTaskRegistry` in `openwire` continues to hold the returned task handles so
+owned HTTP connection tasks can still be aborted during final client shutdown.
 
 ### 2b. HyperExecutor adapter for HTTP/2
 
@@ -166,7 +244,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     fn execute(&self, future: Fut) {
-        self.0.spawn(Box::pin(future));
+        let _ = self.0.spawn(Box::pin(future));
     }
 }
 ```
@@ -235,12 +313,18 @@ that monomorphization happen before boxing into `BoxWireService`.
 
 ### 2c. Fix fast-fallback tokio leakage
 
-| Line | Current | After |
+Main-sync note: this is no longer only about direct-origin Happy Eyeballs.
+`main` now funnels direct, HTTP forward proxy, CONNECT proxy, and SOCKS proxy
+route plans through the shared `FastFallbackDialer::dial_route_plan()` path, so
+the runtime-neutral rewrite must cover the generic dialer API and its route
+finalization callbacks.
+
+| Current dependency | Current use | After |
 |------|---------|-------|
-| 8 | `tokio::sync::mpsc` | `futures_channel::mpsc` |
-| 9 | `tokio::task::JoinHandle` | `AbortHandle` + completion receiver |
-| 70 | `tokio::spawn(...)` | `executor.spawn(...)` |
-| 73 | `tokio::time::sleep(...)` | `timer.sleep(...)` |
+| `tokio::sync::mpsc` | route-race result channel | `futures_channel::mpsc` |
+| `tokio::task::JoinHandle` | spawned attempt ownership | `AbortHandle` + completion receiver |
+| `tokio::spawn(...)` | candidate task spawning | `executor.spawn(...)` |
+| `tokio::time::sleep(...)` | stagger delay | `timer.sleep(...)` |
 
 `FastFallbackDialer` gains `executor: Arc<dyn WireExecutor>` and
 `timer: Arc<dyn hyper::rt::Timer>`, passed from ConnectorStack.
@@ -272,7 +356,7 @@ behavior without requiring cancel-capable handles from `WireExecutor`.
 
 ### 2d. Fix proxy/SOCKS timeout tokio leakage
 
-Replace `tokio::time::timeout` (transport.rs:723, 922) with `timer.sleep()` +
+Replace `tokio::time::timeout` in the CONNECT / SOCKS helper paths with `timer.sleep()` +
 `futures_util::future::select`:
 
 ```rust
@@ -382,6 +466,9 @@ Eliminates: one spawn, one AtomicWaker, one background task per response body.
 Requires `ObservedIncomingBody::wrap()` to accept `Option<Pin<Box<dyn Sleep>>>`
 instead of `Option<(Arc<dyn WireExecutor>, Duration)>`.
 
+Until this lands, the current acquire/release memory-ordering guarantees in the
+deadline-signal path remain required behavior.
+
 ### 2h. Full tokio removal audit
 
 After Phase 2, verify zero direct tokio usage in framework paths:
@@ -442,6 +529,12 @@ convenience types that are never exposed.
 Both traits are **decision-only**. Request mutation (method rewriting, cross-origin
 header cleaning) stays in `FollowUpPolicyService::into_redirect_request`.
 
+Main-sync note: current body semantics now distinguish `RequestBody::absent()`
+from `RequestBody::explicit_empty()`. Redirect-policy extraction must preserve
+the existing downgrade guard and leave method/body rewriting, including
+absent-body preservation when switching to GET, in
+`FollowUpPolicyService::into_redirect_request`.
+
 ### RetryPolicy
 
 ```rust
@@ -457,7 +550,7 @@ pub struct RetryContext<'a> {
 }
 ```
 
-`DefaultRetryPolicy` preserves current `retry_reason()` logic (follow_up.rs:531-562),
+`DefaultRetryPolicy` preserves current `retry_reason()` logic,
 including establishment-stage awareness.
 
 ### RedirectPolicy
@@ -479,8 +572,9 @@ pub struct RedirectContext<'a> {
 pub enum RedirectDecision { Follow, Stop, Error(WireError) }
 ```
 
-`DefaultRedirectPolicy` preserves current behavior. Existing `ClientBuilder` convenience
-methods build Default* internally.
+`DefaultRedirectPolicy` preserves current behavior, including default HTTPS to
+HTTP downgrade rejection behind `allow_insecure_redirects`. Existing
+`ClientBuilder` convenience methods build Default* internally.
 
 ---
 
@@ -501,7 +595,9 @@ pub trait RoutePlanner: Send + Sync + 'static {
 ```
 
 `DefaultRoutePlanner` preserves current logic: proxy-aware DNS target selection,
-ProxyMode-based route kind, alternating IPv4/IPv6 for Happy Eyeballs, 250ms stagger.
+ProxyMode-based route kind, proxy-credential propagation into route kinds,
+alternating IPv4/IPv6 for Happy Eyeballs, and a route plan that remains usable
+by the shared fast-fallback dialer across direct and proxy candidates.
 
 `Address` and `RoutePlan` become `pub` (currently `pub(crate)`).
 `ConnectorStack` changes from:

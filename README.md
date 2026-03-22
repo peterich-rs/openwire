@@ -35,7 +35,9 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
-- [docs/plans/core-review-plan-spec.md](docs/plans/core-review-plan-spec.md): implementation split for the current core review backlog
+- [docs/core-review.md](docs/core-review.md): completed core-review summary and doc index
+- [docs/plans/core-review-plan-spec.md](docs/plans/core-review-plan-spec.md): historical closure map for the landed core-review workstreams
+- [docs/trait-oriented-redesign.md](docs/trait-oriented-redesign.md): forward-looking trait and crate-boundary redesign plan
 - [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start

@@ -27,8 +27,12 @@ openwire/
 ├── crates/openwire-rustls   optional Rustls TLS connector
 ├── crates/openwire-test     test support
 └── docs/
-    ├── DESIGN.md            canonical technical design
-    └── tasks.md             deferred follow-on tracker
+    ├── DESIGN.md                    canonical technical design
+    ├── core-review.md               completed review summary and doc index
+    ├── plans/
+    │   └── core-review-plan-spec.md historical core-review closure map
+    ├── trait-oriented-redesign.md   trait-oriented restructuring proposal
+    └── tasks.md                     deferred follow-on tracker
 ```
 
 Layering rules:
@@ -37,6 +41,8 @@ Layering rules:
 - `openwire` owns public API, follow-up policy, and connection orchestration
 - `openwire-rustls` stays swappable behind `TlsConnector`
 - `openwire-cache` remains an application-layer crate, not transport logic
+- `docs/DESIGN.md` tracks the current implementation; plan docs must call out
+  any deliberate baseline deltas explicitly
 
 Source-file map for the main runtime path:
 
@@ -49,6 +55,7 @@ Source-file map for the main runtime path:
 | `crates/openwire/src/transport.rs` | `TransportService`, `ConnectorStack`, direct binding, response-body release |
 | `crates/openwire/src/connection/exchange_finder.rs` | `ExchangeFinder`, pool-hit / miss preparation |
 | `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner` |
+| `crates/openwire/src/connection/limits.rs` | `RequestAdmissionLimiter`, `ConnectionLimiter`, `ConnectionPermit` |
 | `crates/openwire/src/connection/fast_fallback.rs` | `FastFallbackDialer`, `ConnectPlan` |
 | `crates/openwire/src/connection/pool.rs` | `ConnectionPool` |
 | `crates/openwire/src/connection/real_connection.rs` | `RealConnection` |
@@ -60,7 +67,7 @@ Source-file map for the main runtime path:
 | HTTP protocol state | Adopt from `hyper` | `hyper` |
 | Request policy / follow-ups | OpenWire-owned | `openwire` |
 | Connection acquisition / pooling / route planning | OpenWire-owned | `openwire` |
-| Fast fallback for direct routes | OpenWire-owned | `FastFallbackDialer` |
+| Fast fallback for route dialing | OpenWire-owned | `FastFallbackDialer` |
 | Runtime integration | OpenWire-owned trait boundary | Tokio |
 | DNS | Trait boundary + default adapter | system resolver |
 | TCP | Trait boundary + default adapter | Tokio TCP |
