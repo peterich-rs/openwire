@@ -1,7 +1,7 @@
 # Trait-Oriented Redesign
 
 Date: 2026-03-22
-Status: Draft v4
+Status: Draft v5
 
 ## Main Sync Notes
 
@@ -152,6 +152,75 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 `hyper` + `hyper-util` as trait-only deps is low and the interop value is high.
 
 ---
+
+## Current-To-Target Gap Map
+
+| Area | Current `main` baseline | Target end-state | Migration note |
+|------|--------------------------|------------------|----------------|
+| Runtime surface | `openwire-core` still exports `Runtime`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, `TokioIo`; `transport.rs` hardcodes Tokio executor/timer for HTTP/2 binding | `openwire-core` exports only runtime-neutral traits and adapters; Tokio implementations live in `openwire-tokio` | introduce the new executor surface additively before deleting `Runtime` |
+| Tokio adapters | `SystemDnsResolver` and `TokioTcpConnector` still live in `crates/openwire/src/transport.rs` | both move to `openwire-tokio`, with `openwire` using feature-gated defaults | preserve current DNS/connect event behavior exactly |
+| Transport Tokio leakage | fast fallback, CONNECT/SOCKS timeouts, tunnel I/O, and call/body deadlines still depend on Tokio-specific APIs or Tokio-owned helpers | framework path uses only `WireExecutor`, `hyper::rt::Timer`, and runtime-neutral I/O adapters | this is the critical-path de-Tokio work |
+| Policy traits | `CookieJar`, `Authenticator`, retry logic, and redirect decisions are still centered in `openwire` | traits and contexts move to `openwire-core`; orchestration and request mutation stay in `openwire` | preserve current body and redirect semantics byte-for-byte |
+| Planning surface | `ConnectorStack` stores a concrete `RoutePlanner` struct | route planning becomes a replaceable `Arc<dyn RoutePlanner>` boundary in `openwire` | keep proxy credential propagation and shared route-plan fast fallback intact |
+
+## Delivery Milestones
+
+| Milestone | Covers | Goal | Exit criteria |
+|------|--------|------|---------------|
+| `M1` | Phase 1 | create `openwire-tokio` and move Tokio-only adapters without behavior changes | defaults still work, workspace tests stay green, and callers can start importing Tokio adapters from the new crate |
+| `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | `bind_http2` no longer hardcodes `TokioExecutor::new()` / `TokioTimer::new()` and owned connection tasks can be tracked through executor-returned task handles |
+| `M3` | Phase 2c-2h | remove the remaining framework Tokio leakage | non-test framework paths stop depending directly on `tokio::`; fast fallback, tunnels, call deadlines, and body deadlines all use runtime-neutral abstractions |
+| `M4` | Phases 3-4 | move policy traits into `openwire-core` | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps default policy impls and orchestration |
+| `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | `ConnectorStack` depends on `Arc<dyn RoutePlanner>` and public planning types are stable enough for custom planners |
+| `M6` | Phase 6 + cleanup | finish adapter interop and remove compatibility shims | `Runtime` and `openwire-core` Tokio re-exports are gone; docs and examples reflect the final crate boundaries |
+
+Updated recommended delivery order: `M1 -> M2 -> M3 -> M4 -> M5 -> M6`.
+`M2` and `M3` are the critical path because every later cleanup depends on the
+runtime split being real rather than just crate reshuffling.
+
+### Milestone Checklists
+
+#### `M1` Checklist
+
+- create `crates/openwire-tokio` and move the current `tokio_rt.rs` contents there
+- move `SystemDnsResolver` and `TokioTcpConnector` out of `crates/openwire/src/transport.rs`
+- wire `openwire` defaults through a feature-gated `openwire-tokio` dependency
+- keep old import paths working temporarily via compatibility re-exports while the migration is in flight
+
+#### `M2` Checklist
+
+- introduce `TaskHandle`, `WireExecutor`, and `HyperExecutor` in `openwire-core`
+- make Tokio adapters implement the new executor surface in `openwire-tokio`
+- thread executor/timer inputs through `TransportService` construction and `bind_http2`
+- switch owned connection-task tracking to the executor-returned handle type before removing `Runtime`
+
+#### `M3` Checklist
+
+- rewrite `FastFallbackDialer` around runtime-neutral executor/timer primitives
+- replace CONNECT/SOCKS timeout helpers and tunnel I/O with runtime-neutral building blocks
+- move `with_call_deadline` and response-body deadline enforcement off `Runtime::sleep`
+- prove the de-Tokio result with a non-test `rg -n 'tokio::' crates/openwire/src/` audit
+
+#### `M4` Checklist
+
+- move `CookieJar` and `Authenticator` traits plus their public contexts into `openwire-core`
+- extract decision-only `RetryPolicy` and `RedirectPolicy` traits into `openwire-core`
+- leave redirect request mutation, cookie application, and follow-up orchestration in `openwire`
+- preserve `RequestBody::absent()` / `explicit_empty()` semantics and downgrade redirect behavior exactly
+
+#### `M5` Checklist
+
+- replace the concrete `RoutePlanner` field in `ConnectorStack` with `Arc<dyn RoutePlanner>`
+- decide the minimum public surface for `Address`, `RoutePlan`, and related planning types
+- keep proxy credential propagation and the shared route-plan fast-fallback contract unchanged
+- verify that custom planners still cannot bypass `TransportService` ownership boundaries
+
+#### `M6` Checklist
+
+- add tower adapters only after the core runtime/planning surfaces are stable
+- remove temporary re-exports and compatibility shims left from `M1` and `M2`
+- delete `Runtime` once no framework path depends on it
+- update `README.md`, examples, and crate re-exports to match the final crate split
 
 ## Phase 1 — Split openwire-tokio Out of openwire-core
 
