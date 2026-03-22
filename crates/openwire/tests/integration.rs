@@ -12,10 +12,10 @@ use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODIN
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use openwire::{
-    AuthContext, Authenticator, BoxFuture, CallContext, Client, DnsResolver, EstablishmentStage,
-    Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody, ResponseBody, Runtime,
-    RustlsTlsConnector, TcpConnector, TlsConnector, TokioTcpConnector, Url, WireError,
-    WireErrorKind,
+    AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DnsResolver,
+    EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
+    ResponseBody, Runtime, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector,
+    TokioTcpConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_test::{
@@ -1464,6 +1464,36 @@ async fn http2_publication_failure_does_not_leave_pool_entry() {
         !events.iter().any(|event| event.starts_with("pool_hit")),
         "events = {events:?}",
     );
+}
+
+#[tokio::test]
+async fn dropping_client_aborts_owned_connection_tasks() {
+    let server = spawn_http1(|_request| async move { ok_text("keep-alive") }).await;
+    let runtime = AbortCountingRuntime::default();
+    let client = Client::builder()
+        .runtime(runtime.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/abort-on-drop")))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "keep-alive");
+    assert_eq!(runtime.aborts(), 0);
+
+    drop(client);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.aborts() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client drop should abort idle connection tasks");
+
+    assert_eq!(runtime.aborts(), 1);
 }
 
 #[tokio::test]
@@ -3088,10 +3118,17 @@ impl CountingRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct NoopTaskHandle;
+
+impl TaskHandle for NoopTaskHandle {
+    fn abort(&self) {}
+}
+
 impl Runtime for CountingRuntime {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<(), WireError> {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         tokio::spawn(future);
-        Ok(())
+        Ok(Box::new(NoopTaskHandle))
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
@@ -3108,11 +3145,47 @@ impl Runtime for CountingRuntime {
 struct SpawnFailingRuntime;
 
 impl Runtime for SpawnFailingRuntime {
-    fn spawn(&self, _future: BoxFuture<()>) -> Result<(), WireError> {
+    fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         Err(WireError::internal(
             "scripted spawn failure",
             io::Error::other("scripted spawn failure"),
         ))
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+#[derive(Clone, Default)]
+struct AbortCountingRuntime {
+    aborts: Arc<AtomicUsize>,
+}
+
+impl AbortCountingRuntime {
+    fn aborts(&self) -> usize {
+        self.aborts.load(Ordering::Relaxed)
+    }
+}
+
+struct AbortCountingTaskHandle {
+    handle: tokio::task::JoinHandle<()>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl TaskHandle for AbortCountingTaskHandle {
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::Relaxed);
+        self.handle.abort();
+    }
+}
+
+impl Runtime for AbortCountingRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Ok(Box::new(AbortCountingTaskHandle {
+            handle: tokio::spawn(future),
+            aborts: self.aborts.clone(),
+        }))
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {

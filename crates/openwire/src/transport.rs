@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,9 +19,9 @@ use hyper::client::conn::{http1, http2};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, CallContext, CoalescingInfo, ConnectionId,
-    ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime, TcpConnector,
-    TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
+    next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, CoalescingInfo,
+    ConnectionId, ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime,
+    TcpConnector, TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
@@ -1260,10 +1260,137 @@ impl ConnectionBindings {
     }
 }
 
+#[derive(Clone, Default)]
+struct ConnectionTaskRegistry {
+    inner: Arc<ConnectionTaskRegistryInner>,
+}
+
+#[derive(Default)]
+struct ConnectionTaskRegistryInner {
+    next_id: AtomicU64,
+    handles: Mutex<HashMap<u64, Option<BoxTaskHandle>>>,
+}
+
+impl ConnectionTaskRegistry {
+    fn reserve(&self) -> (u64, Weak<ConnectionTaskRegistryInner>) {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner
+            .handles
+            .lock()
+            .expect("connection task registry lock")
+            .insert(id, None);
+        (id, Arc::downgrade(&self.inner))
+    }
+
+    fn attach(&self, task_id: u64, handle: BoxTaskHandle) {
+        let mut handles = self
+            .inner
+            .handles
+            .lock()
+            .expect("connection task registry lock");
+        if let Some(slot) = handles.get_mut(&task_id) {
+            *slot = Some(handle);
+            return;
+        }
+        drop(handles);
+        handle.abort();
+    }
+
+    fn cancel(&self, task_id: u64) {
+        self.inner
+            .handles
+            .lock()
+            .expect("connection task registry lock")
+            .remove(&task_id);
+    }
+
+    fn complete_weak(inner: &Weak<ConnectionTaskRegistryInner>, task_id: u64) {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        inner
+            .handles
+            .lock()
+            .expect("connection task registry lock")
+            .remove(&task_id);
+    }
+}
+
+impl Drop for ConnectionTaskRegistryInner {
+    fn drop(&mut self) {
+        let handles = self
+            .handles
+            .lock()
+            .expect("connection task registry lock");
+        for handle in handles.values().filter_map(Option::as_ref) {
+            handle.abort();
+        }
+    }
+}
+
 struct SelectedConnection {
-    connection: crate::connection::RealConnection,
-    binding: AcquiredBinding,
+    connection: Option<crate::connection::RealConnection>,
+    binding: Option<AcquiredBinding>,
     reused: bool,
+    exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
+}
+
+impl SelectedConnection {
+    fn new(
+        connection: crate::connection::RealConnection,
+        binding: AcquiredBinding,
+        reused: bool,
+        exchange_finder: Arc<ExchangeFinder>,
+        bindings: Arc<ConnectionBindings>,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
+            binding: Some(binding),
+            reused,
+            exchange_finder,
+            bindings,
+        }
+    }
+
+    fn into_send_parts(
+        mut self,
+    ) -> (
+        crate::connection::RealConnection,
+        AcquiredBinding,
+        bool,
+        Arc<ExchangeFinder>,
+        Arc<ConnectionBindings>,
+    ) {
+        let connection = self
+            .connection
+            .take()
+            .expect("selected connection should contain a connection");
+        let binding = self
+            .binding
+            .take()
+            .expect("selected connection should contain a binding");
+        (
+            connection,
+            binding,
+            self.reused,
+            self.exchange_finder.clone(),
+            self.bindings.clone(),
+        )
+    }
+}
+
+impl Drop for SelectedConnection {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let Some(binding) = self.binding.take() else {
+            return;
+        };
+
+        release_acquired_connection(&self.exchange_finder, &self.bindings, connection, binding);
+    }
 }
 
 struct BoundResponse {
@@ -1272,16 +1399,86 @@ struct BoundResponse {
     reused: bool,
 }
 
-enum ResponseLease {
+struct ResponseLease {
+    state: Option<ResponseLeaseState>,
+}
+
+enum ResponseLeaseState {
     Http1 {
         connection: crate::connection::RealConnection,
         bindings: Arc<ConnectionBindings>,
         sender: http1::SendRequest<RequestBody>,
         reusable: bool,
+        exchange_finder: Arc<ExchangeFinder>,
+        ctx: CallContext,
+        _tasks: ConnectionTaskRegistry,
     },
     Http2 {
         connection: crate::connection::RealConnection,
+        exchange_finder: Arc<ExchangeFinder>,
+        ctx: CallContext,
+        _tasks: ConnectionTaskRegistry,
     },
+}
+
+impl ResponseLease {
+    fn http1(
+        connection: crate::connection::RealConnection,
+        bindings: Arc<ConnectionBindings>,
+        sender: http1::SendRequest<RequestBody>,
+        reusable: bool,
+        exchange_finder: Arc<ExchangeFinder>,
+        ctx: CallContext,
+        tasks: ConnectionTaskRegistry,
+    ) -> Self {
+        Self {
+            state: Some(ResponseLeaseState::Http1 {
+                connection,
+                bindings,
+                sender,
+                reusable,
+                exchange_finder,
+                ctx,
+                _tasks: tasks,
+            }),
+        }
+    }
+
+    fn http2(
+        connection: crate::connection::RealConnection,
+        exchange_finder: Arc<ExchangeFinder>,
+        ctx: CallContext,
+        tasks: ConnectionTaskRegistry,
+    ) -> Self {
+        Self {
+            state: Some(ResponseLeaseState::Http2 {
+                connection,
+                exchange_finder,
+                ctx,
+                _tasks: tasks,
+            }),
+        }
+    }
+
+    fn release(mut self) {
+        if let Some(state) = self.state.take() {
+            release_response_lease(state);
+        }
+    }
+
+    fn discard(mut self) {
+        if let Some(state) = self.state.take() {
+            discard_response_lease(state);
+        }
+    }
+}
+
+impl Drop for ResponseLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            abandon_response_lease_state(state);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1291,6 +1488,7 @@ pub(crate) struct TransportService {
     runtime: Arc<dyn Runtime>,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
+    connection_tasks: ConnectionTaskRegistry,
 }
 
 impl TransportService {
@@ -1306,6 +1504,7 @@ impl TransportService {
             runtime,
             exchange_finder,
             bindings: Arc::new(ConnectionBindings::default()),
+            connection_tasks: ConnectionTaskRegistry::default(),
         }
     }
 
@@ -1333,8 +1532,8 @@ impl TransportService {
             let response = send_bound_request(
                 request,
                 selected,
-                self.exchange_finder.clone(),
-                self.bindings.clone(),
+                ctx.clone(),
+                self.connection_tasks.clone(),
             )
             .await?;
 
@@ -1363,7 +1562,6 @@ impl TransportService {
                 attempt,
                 Some(response.release),
                 deadline_expired,
-                self.exchange_finder.clone(),
                 tracing::Span::current(),
             );
             let response = Response::from_parts(parts, body);
@@ -1384,11 +1582,13 @@ impl TransportService {
         if let Some(connection) = prepared.reserved_connection() {
             match self.bindings.acquire(connection.id()) {
                 BindingAcquireResult::Acquired(binding) => {
-                    return Ok(SelectedConnection {
-                        connection: connection.clone(),
+                    return Ok(SelectedConnection::new(
+                        connection.clone(),
                         binding,
-                        reused: true,
-                    });
+                        true,
+                        self.exchange_finder.clone(),
+                        self.bindings.clone(),
+                    ));
                 }
                 BindingAcquireResult::Busy => {
                     let _ = self.exchange_finder.release(connection);
@@ -1487,11 +1687,13 @@ impl TransportService {
             }
         };
 
-        Ok(SelectedConnection {
+        Ok(SelectedConnection::new(
             connection,
             binding,
-            reused: false,
-        })
+            false,
+            self.exchange_finder.clone(),
+            self.bindings.clone(),
+        ))
     }
 
     fn try_acquire_coalesced(
@@ -1505,11 +1707,13 @@ impl TransportService {
             .acquire_coalesced(address, route_plan)?;
         match self.bindings.acquire(connection.id()) {
             BindingAcquireResult::Acquired(binding) => {
-                return Some(SelectedConnection {
+                return Some(SelectedConnection::new(
                     connection,
                     binding,
-                    reused: true,
-                });
+                    true,
+                    self.exchange_finder.clone(),
+                    self.bindings.clone(),
+                ));
             }
             BindingAcquireResult::Busy => {
                 let _ = self.exchange_finder.release(&connection);
@@ -1531,7 +1735,8 @@ impl TransportService {
         let connection_id = connection.id();
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
-        self.runtime.spawn(Box::pin(
+        let (task_id, registry) = self.connection_tasks.reserve();
+        let future = Box::pin(
             async move {
                 let result = task.await;
                 bindings.remove(connection_id);
@@ -1543,9 +1748,20 @@ impl TransportService {
                         "owned HTTP/1 connection task failed",
                     );
                 }
+                ConnectionTaskRegistry::complete_weak(&registry, task_id);
             }
             .instrument(span),
-        ))
+        );
+        match self.runtime.spawn(future) {
+            Ok(handle) => {
+                self.connection_tasks.attach(task_id, handle);
+                Ok(())
+            }
+            Err(error) => {
+                self.connection_tasks.cancel(task_id);
+                Err(error)
+            }
+        }
     }
 
     fn spawn_http2_task(
@@ -1557,7 +1773,8 @@ impl TransportService {
         let connection_id = connection.id();
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
-        self.runtime.spawn(Box::pin(
+        let (task_id, registry) = self.connection_tasks.reserve();
+        let future = Box::pin(
             async move {
                 let result = task.await;
                 bindings.remove(connection_id);
@@ -1569,9 +1786,20 @@ impl TransportService {
                         "owned HTTP/2 connection task failed",
                     );
                 }
+                ConnectionTaskRegistry::complete_weak(&registry, task_id);
             }
             .instrument(span),
-        ))
+        );
+        match self.runtime.spawn(future) {
+            Ok(handle) => {
+                self.connection_tasks.attach(task_id, handle);
+                Ok(())
+            }
+            Err(error) => {
+                self.connection_tasks.cancel(task_id);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1635,7 +1863,6 @@ struct ObservedIncomingBody {
     bytes_read: u64,
     release: Option<ResponseLease>,
     deadline_signal: Option<Arc<BodyDeadlineSignal>>,
-    exchange_finder: Arc<ExchangeFinder>,
     span: tracing::Span,
     finished: bool,
 }
@@ -1647,7 +1874,6 @@ impl ObservedIncomingBody {
         attempt: u32,
         release: Option<ResponseLease>,
         deadline_signal: Option<Arc<BodyDeadlineSignal>>,
-        exchange_finder: Arc<ExchangeFinder>,
         span: tracing::Span,
     ) -> ResponseBody {
         ResponseBody::new(
@@ -1658,7 +1884,6 @@ impl ObservedIncomingBody {
                 bytes_read: 0,
                 release,
                 deadline_signal,
-                exchange_finder,
                 span,
                 finished: false,
             }
@@ -1701,7 +1926,7 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
-        abandon_response_lease(self.release.take(), &self.ctx, &self.exchange_finder);
+        abandon_response_lease(self.release.take());
     }
 
     fn poll_deadline(
@@ -1730,61 +1955,13 @@ impl ObservedIncomingBody {
 
     fn release_connection(&mut self) {
         if let Some(release) = self.release.take() {
-            match release {
-                ResponseLease::Http1 {
-                    connection,
-                    bindings,
-                    sender,
-                    reusable,
-                } => {
-                    if reusable
-                        && bindings.release_http1(connection.id(), sender)
-                        && self.exchange_finder.release(&connection)
-                    {
-                        self.ctx
-                            .listener()
-                            .connection_released(&self.ctx, connection.id());
-                        return;
-                    }
-
-                    bindings.remove(connection.id());
-                    let _ = self.exchange_finder.pool().remove(connection.id());
-                    self.ctx
-                        .listener()
-                        .connection_released(&self.ctx, connection.id());
-                }
-                ResponseLease::Http2 { connection } => {
-                    let _ = self.exchange_finder.release(&connection);
-                    self.ctx
-                        .listener()
-                        .connection_released(&self.ctx, connection.id());
-                }
-            }
+            release.release();
         }
     }
 
     fn discard_connection(&mut self) {
         if let Some(release) = self.release.take() {
-            match release {
-                ResponseLease::Http1 {
-                    connection,
-                    bindings,
-                    ..
-                } => {
-                    bindings.remove(connection.id());
-                    let _ = self.exchange_finder.pool().remove(connection.id());
-                    self.ctx
-                        .listener()
-                        .connection_released(&self.ctx, connection.id());
-                }
-                ResponseLease::Http2 { connection } => {
-                    connection.mark_unhealthy();
-                    let _ = self.exchange_finder.release(&connection);
-                    self.ctx
-                        .listener()
-                        .connection_released(&self.ctx, connection.id());
-                }
-            }
+            release.discard();
         }
     }
 }
@@ -1794,26 +1971,116 @@ struct BodyDeadlineSignal {
     waker: AtomicWaker,
 }
 
-fn abandon_response_lease(
-    release: Option<ResponseLease>,
-    ctx: &CallContext,
+fn abandon_response_lease(release: Option<ResponseLease>) {
+    drop(release);
+}
+
+fn release_acquired_connection(
     exchange_finder: &Arc<ExchangeFinder>,
+    bindings: &Arc<ConnectionBindings>,
+    connection: crate::connection::RealConnection,
+    binding: AcquiredBinding,
 ) {
-    if let Some(release) = release {
-        match release {
-            ResponseLease::Http1 {
-                connection,
-                bindings,
-                ..
-            } => {
-                bindings.remove(connection.id());
-                let _ = exchange_finder.pool().remove(connection.id());
-                ctx.listener().connection_released(ctx, connection.id());
+    match binding {
+        AcquiredBinding::Http1 { sender, .. } => {
+            if bindings.release_http1(connection.id(), sender)
+                && exchange_finder.release(&connection)
+            {
+                return;
             }
-            ResponseLease::Http2 { connection } => {
-                let _ = exchange_finder.release(&connection);
-                ctx.listener().connection_released(ctx, connection.id());
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
+        }
+        AcquiredBinding::Http2 { .. } => {
+            if exchange_finder.release(&connection) {
+                return;
             }
+            let _ = exchange_finder.pool().remove(connection.id());
+        }
+    }
+}
+
+fn release_response_lease(state: ResponseLeaseState) {
+    match state {
+        ResponseLeaseState::Http1 {
+            connection,
+            bindings,
+            sender,
+            reusable,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            if reusable
+                && bindings.release_http1(connection.id(), sender)
+                && exchange_finder.release(&connection)
+            {
+                ctx.listener().connection_released(&ctx, connection.id());
+                return;
+            }
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
+            ctx.listener().connection_released(&ctx, connection.id());
+        }
+        ResponseLeaseState::Http2 {
+            connection,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            let _ = exchange_finder.release(&connection);
+            ctx.listener().connection_released(&ctx, connection.id());
+        }
+    }
+}
+
+fn discard_response_lease(state: ResponseLeaseState) {
+    match state {
+        ResponseLeaseState::Http1 {
+            connection,
+            bindings,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
+            ctx.listener().connection_released(&ctx, connection.id());
+        }
+        ResponseLeaseState::Http2 {
+            connection,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            connection.mark_unhealthy();
+            let _ = exchange_finder.release(&connection);
+            ctx.listener().connection_released(&ctx, connection.id());
+        }
+    }
+}
+
+fn abandon_response_lease_state(state: ResponseLeaseState) {
+    match state {
+        ResponseLeaseState::Http1 {
+            connection,
+            bindings,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            bindings.remove(connection.id());
+            let _ = exchange_finder.pool().remove(connection.id());
+            ctx.listener().connection_released(&ctx, connection.id());
+        }
+        ResponseLeaseState::Http2 {
+            connection,
+            exchange_finder,
+            ctx,
+            ..
+        } => {
+            let _ = exchange_finder.release(&connection);
+            ctx.listener().connection_released(&ctx, connection.id());
         }
     }
 }
@@ -1838,7 +2105,7 @@ fn spawn_body_deadline_signal(
 
     let sleep_runtime = runtime.clone();
     let signal_task = signal.clone();
-    runtime.spawn(Box::pin(async move {
+    let _ = runtime.spawn(Box::pin(async move {
         sleep_runtime.sleep(remaining).await;
         signal_task.expired.store(true, Ordering::Relaxed);
         signal_task.waker.wake();
@@ -1900,14 +2167,13 @@ impl Body for ObservedIncomingBody {
 async fn send_bound_request(
     request: Request<RequestBody>,
     selected: SelectedConnection,
-    exchange_finder: Arc<ExchangeFinder>,
-    bindings: Arc<ConnectionBindings>,
+    ctx: CallContext,
+    tasks: ConnectionTaskRegistry,
 ) -> Result<BoundResponse, WireError> {
-    let connection = selected.connection;
-    let reused = selected.reused;
+    let (connection, binding, reused, exchange_finder, bindings) = selected.into_send_parts();
     let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
 
-    match selected.binding {
+    match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
             sender.ready().await.map_err(|error| {
                 cleanup_failed_request(&connection, &exchange_finder, &bindings);
@@ -1921,12 +2187,15 @@ async fn send_bound_request(
             response.extensions_mut().insert(info);
             Ok(BoundResponse {
                 response,
-                release: ResponseLease::Http1 {
+                release: ResponseLease::http1(
                     connection,
                     bindings,
                     sender,
                     reusable,
-                },
+                    exchange_finder,
+                    ctx,
+                    tasks,
+                ),
                 reused,
             })
         }
@@ -1942,7 +2211,7 @@ async fn send_bound_request(
             response.extensions_mut().insert(info);
             Ok(BoundResponse {
                 response,
-                release: ResponseLease::Http2 { connection },
+                release: ResponseLease::http2(connection, exchange_finder, ctx, tasks),
                 reused,
             })
         }
@@ -2455,13 +2724,12 @@ mod tests {
             Arc::new(ConnectionPool::new(PoolSettings::default())),
             ProxySelector::new(Vec::new()),
         ));
-        abandon_response_lease(
-            Some(super::ResponseLease::Http2 {
-                connection: connection.clone(),
-            }),
-            &make_call_context(),
-            &exchange_finder,
-        );
+        abandon_response_lease(Some(super::ResponseLease::http2(
+            connection.clone(),
+            exchange_finder.clone(),
+            make_call_context(),
+            super::ConnectionTaskRegistry::default(),
+        )));
 
         let snapshot = connection.snapshot();
         assert_eq!(

@@ -124,7 +124,7 @@ Extension boundary contracts:
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
-| `Runtime` | `spawn(BoxFuture<()>)` and `sleep(Duration)` | `crates/openwire-core` |
+| `Runtime` | `spawn(BoxFuture<()>) -> BoxTaskHandle` and `sleep(Duration)` | `crates/openwire-core` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
 
 Current extension-point rules:
@@ -134,7 +134,7 @@ Current extension-point rules:
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- custom runtimes must preserve `Runtime::spawn` semantics expected by bound
+- custom runtimes must return abort-capable `Runtime::spawn` handles for bound
   connection background tasks
 
 ## 5. Service Chain Construction
@@ -226,6 +226,7 @@ No feature should bypass this chain.
 - connection acquisition
 - protocol binding on miss path
 - request execution on bound connection
+- pre-response-body RAII cleanup for acquired connections and leases
 - response-body release wrapping
 
 ## 7. Connection Core
@@ -299,8 +300,12 @@ Pool and reuse rules:
 - `TransportService::try_acquire_coalesced()` performs the secondary HTTPS
   HTTP/2 coalesced lookup after route planning on miss path
 - `ObservedIncomingBody` drives `ConnectionPool::release()` on body completion
+- `SelectedConnection` uses RAII cleanup so call timeout / cancellation before
+  request publication does not leak allocations
 - abandoning an HTTP/2 response body releases only the stream allocation; it
   does not poison the whole session
+- `ResponseLease` uses RAII cleanup so call timeout / cancellation after
+  response publication but before body wrapping does not leak allocations
 - broken HTTP/1.1 exchanges remove the connection instead of returning it to
   idle reuse
 
@@ -357,8 +362,8 @@ Protocol-specific rules:
 - HTTP/2 reuses a bound sender for multiple exchanges
 - CONNECT tunnel setup preserves any bytes already read past the proxy response
   header block before handing the stream to TLS or HTTP
-- spawned background connection tasks remove bindings and pool entries on
-  termination
+- spawned background connection tasks are tracked per client lifetime, abort on
+  final owner drop, and remove bindings and pool entries on termination
 - `record_fast_fallback_trace()` writes `route_count`,
   `fast_fallback_enabled`, `connect_race_id`, and `connect_winner` into
   `openwire.attempt`
@@ -384,6 +389,8 @@ Adapter boundaries that are part of the current code shape:
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
 - background protocol tasks are spawned only through `Runtime::spawn`
+- `Runtime::spawn` must return a handle that can abort tracked background
+  protocol tasks during client shutdown
 - `call_timeout` uses the configured `Runtime` instead of directly calling
   Tokio timers
 - response-body deadline enforcement uses the same logical call deadline as the

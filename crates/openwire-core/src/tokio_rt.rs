@@ -7,15 +7,25 @@ use hyper::rt::{Executor, Sleep, Timer};
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
 
-use crate::{BoxFuture, Runtime, WireError};
+use crate::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle, WireError};
 
 #[derive(Clone, Debug, Default)]
 pub struct TokioRuntime;
 
+#[derive(Debug)]
+struct TokioTaskHandle(tokio::task::JoinHandle<()>);
+
+impl TaskHandle for TokioTaskHandle {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
 impl Runtime for TokioRuntime {
-    fn spawn(&self, future: BoxFuture<()>) -> Result<(), WireError> {
-        tokio::spawn(future.with_current_subscriber());
-        Ok(())
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Ok(Box::new(TokioTaskHandle(tokio::spawn(
+            future.with_current_subscriber(),
+        ))))
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
