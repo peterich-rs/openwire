@@ -33,16 +33,16 @@ live in the codebase and docs.
 
 ## Ongoing Relevance
 
-The redesign work should treat the following as established baseline behavior,
+Subsequent refactors should treat the following as established baseline behavior,
 not as open backlog:
 
 - RAII ownership from connection acquisition through response-body release
-- abort-capable runtime task handles for owned connection tasks
+- abort-capable task handles for owned connection tasks
 - request / connection admission and real Tower backpressure propagation
 - proxy credential propagation and proxy-path fast fallback
 - protocol-agnostic pool eviction and poison-safe lock recovery
 - RFC-compliant HTTP/1.1 reuse checks and deadline memory ordering
 
 For current behavior, prefer [`docs/DESIGN.md`](../DESIGN.md).
-For future crate / trait restructuring, prefer
+For the final trait / crate boundary closure, prefer
 [`docs/trait-oriented-redesign.md`](../trait-oriented-redesign.md).

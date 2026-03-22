@@ -21,7 +21,7 @@ source of truth now lives.
 
 - lifecycle ownership is now RAII-based across `SelectedConnection`,
   `ResponseLease`, and response-body release
-- runtime-backed connection tasks are tracked and aborted on final client drop
+- owned connection tasks are tracked and aborted on final client drop
 - request admission and fresh-connection admission are both explicit transport
   concerns
 - request body semantics now distinguish `absent` from `explicit empty`
@@ -32,7 +32,8 @@ source of truth now lives.
 ## Where To Look Now
 
 - Current architecture: [`docs/DESIGN.md`](DESIGN.md)
-- Forward-looking redesign: [`docs/trait-oriented-redesign.md`](trait-oriented-redesign.md)
+- Completed trait/crate-boundary redesign:
+  [`docs/trait-oriented-redesign.md`](trait-oriented-redesign.md)
 - Historical workstream split and closure map:
   [`docs/plans/core-review-plan-spec.md`](plans/core-review-plan-spec.md)
 - Executable verification: `cargo test --workspace --all-targets`

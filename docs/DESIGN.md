@@ -23,8 +23,8 @@ Primary goals:
 openwire/
 ├── crates/openwire          public API, policy layer, transport integration
 ├── crates/openwire-cache    application-layer cache interceptor
-├── crates/openwire-core     shared body, error, event, runtime, transport, and policy traits
-├── crates/openwire-tokio    Tokio runtime, I/O, DNS, and TCP adapters
+├── crates/openwire-core     shared body, error, event, executor/timer, transport, and policy traits
+├── crates/openwire-tokio    Tokio executor, timer, I/O, DNS, and TCP adapters
 ├── crates/openwire-rustls   optional Rustls TLS connector
 ├── crates/openwire-test     test support
 └── docs/
@@ -32,7 +32,7 @@ openwire/
     ├── core-review.md               completed review summary and doc index
     ├── plans/
     │   └── core-review-plan-spec.md historical core-review closure map
-    ├── trait-oriented-redesign.md   trait-oriented restructuring proposal
+    ├── trait-oriented-redesign.md   completed trait/crate-boundary redesign closure
     └── tasks.md                     deferred follow-on tracker
 ```
 
@@ -148,6 +148,12 @@ Extension boundary contracts:
 | `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
 | `hyper::rt::Timer` | `sleep`, `sleep_until`, `reset`, `now` | external trait configured through `ClientBuilder::timer(...)` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
+
+Connector interop helpers exported from `openwire-core`:
+
+- `DnsRequest`, `TcpConnectRequest`, `TlsConnectRequest`
+- `TowerDnsResolver`, `TowerTcpConnector`, `TowerTlsConnector`
+- `DnsResolverService`, `TcpConnectorService`, `TlsConnectorService`
 
 Current extension-point rules:
 
@@ -428,15 +434,15 @@ Protocol-specific rules:
   `fast_fallback_enabled`, `connect_race_id`, and `connect_winner` into
   `openwire.attempt`
 
-## 9. Runtime And Adapter Boundaries
+## 9. Execution And Adapter Boundaries
 
 Current default adapters:
 
 - Tokio executor through `openwire-tokio::TokioExecutor`
 - Tokio timer through `openwire-tokio::TokioTimer`
-- system DNS through `DnsResolver`
-- Tokio TCP through `TcpConnector`
-- Rustls through `TlsConnector`
+- system DNS through `openwire-tokio::SystemDnsResolver`
+- Tokio TCP through `openwire-tokio::TokioTcpConnector`
+- Rustls through `openwire_rustls::RustlsTlsConnector`
 - Tokio adapter types are imported from `openwire-tokio` directly; `openwire`
   no longer re-exports them
 
