@@ -7,15 +7,15 @@ use http::header::{
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
-    BoxFuture, BoxWireService, EstablishmentStage, Exchange, RequestBody, ResponseBody, WireError,
-    WireErrorKind,
+    AuthKind, BoxFuture, BoxWireService, CookieJar, Exchange, RedirectContext, RedirectDecision,
+    RequestBody, ResponseBody, RetryContext, WireError,
 };
 use tower::Service;
 use url::Url;
 
+use super::{RedirectPolicyConfig, RetryPolicyConfig};
 use crate::auth::{
-    AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
-    SharedAuthenticator,
+    build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
 use crate::cookie::SharedCookieJar;
 use crate::proxy::ProxySelector;
@@ -35,20 +35,6 @@ pub(crate) struct AuthPolicyConfig {
     pub(crate) authenticator: Option<SharedAuthenticator>,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_auth_attempts: usize,
-}
-
-#[derive(Clone)]
-pub(crate) struct RetryPolicyConfig {
-    pub(crate) retry_on_connection_failure: bool,
-    pub(crate) max_retries: usize,
-    pub(crate) retry_canceled_requests: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct RedirectPolicyConfig {
-    pub(crate) follow_redirects: bool,
-    pub(crate) max_redirects: usize,
-    pub(crate) allow_insecure_redirects: bool,
 }
 
 #[derive(Clone)]
@@ -157,7 +143,13 @@ impl Service<Exchange> for FollowUpPolicyService {
                             continue;
                         }
 
-                        if !config.redirect.follow_redirects {
+                        if let Some(policy) = config.redirect.default_policy() {
+                            if !policy.follow_redirects() {
+                                return Ok(response);
+                            }
+                        }
+
+                        if !is_redirect_status(response.status()) {
                             return Ok(response);
                         }
 
@@ -169,19 +161,25 @@ impl Service<Exchange> for FollowUpPolicyService {
                             return Ok(response);
                         };
 
-                        if !is_redirect_status(response.status()) {
-                            return Ok(response);
-                        }
-
-                        if redirects as usize >= config.redirect.max_redirects {
-                            return Err(WireError::redirect(format!(
-                                "too many redirects (max {})",
-                                config.redirect.max_redirects
-                            )));
-                        }
-
                         let next_uri = resolve_redirect_uri(&snapshot.uri, location)?;
-                        validate_redirect_target(&snapshot.uri, &next_uri, &config.redirect)?;
+                        validate_request_uri(&next_uri)?;
+
+                        match config
+                            .redirect
+                            .policy()
+                            .should_redirect(&RedirectContext::new(
+                                &snapshot.method,
+                                &snapshot.uri,
+                                response.status(),
+                                &next_uri,
+                                redirects,
+                                snapshot.is_replayable(),
+                            )) {
+                            RedirectDecision::Follow => {}
+                            RedirectDecision::Stop => return Ok(response),
+                            RedirectDecision::Error(error) => return Err(error),
+                        }
+
                         ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
 
                         let next_attempt = attempt + 1;
@@ -208,16 +206,11 @@ impl Service<Exchange> for FollowUpPolicyService {
                         attempt = next_attempt;
                     }
                     Err(error) => {
-                        let Some(reason) = retry_reason(&error, &config.retry) else {
+                        let retry_ctx =
+                            RetryContext::new(&error, retries, snapshot.is_replayable());
+                        let Some(reason) = config.retry.policy().should_retry(&retry_ctx) else {
                             return Err(error);
                         };
-
-                        if (reason != "canceled" && !config.retry.retry_on_connection_failure)
-                            || retries as usize >= config.retry.max_retries
-                            || !snapshot.is_replayable()
-                        {
-                            return Err(error);
-                        }
 
                         retries += 1;
                         attempt += 1;
@@ -245,7 +238,7 @@ impl Service<Exchange> for FollowUpPolicyService {
 
 fn apply_request_cookies(
     request: &mut Request<RequestBody>,
-    jar: Option<&dyn crate::cookie::CookieJar>,
+    jar: Option<&dyn CookieJar>,
 ) -> Result<(), WireError> {
     let Some(jar) = jar else {
         return Ok(());
@@ -271,7 +264,7 @@ async fn authenticate_response(
     auths: u32,
     config: &AuthPolicyConfig,
 ) -> Result<Option<(Request<RequestBody>, u32)>, WireError> {
-    let (kind, authenticator) = match response.status() {
+    let (kind, authenticator): (AuthKind, Option<&SharedAuthenticator>) = match response.status() {
         StatusCode::UNAUTHORIZED => (AuthKind::Origin, config.authenticator.as_ref()),
         StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
             (AuthKind::Proxy, config.proxy_authenticator.as_ref())
@@ -287,7 +280,7 @@ async fn authenticate_response(
         return Ok(None);
     }
 
-    let ctx = AuthContext::new(
+    let ctx = build_auth_context(
         kind,
         AuthRequestState::new(
             snapshot.method.clone(),
@@ -322,7 +315,7 @@ async fn authenticate_response(
 fn store_response_cookies(
     response: &Response<ResponseBody>,
     request_uri: &Uri,
-    jar: Option<&dyn crate::cookie::CookieJar>,
+    jar: Option<&dyn CookieJar>,
 ) -> Result<(), WireError> {
     let Some(jar) = jar else {
         return Ok(());
@@ -477,26 +470,6 @@ fn validate_request_uri(uri: &Uri) -> Result<(), WireError> {
     Ok(())
 }
 
-fn validate_redirect_target(
-    current_uri: &Uri,
-    next_uri: &Uri,
-    config: &RedirectPolicyConfig,
-) -> Result<(), WireError> {
-    validate_request_uri(next_uri)?;
-
-    if !config.allow_insecure_redirects
-        && current_uri.scheme_str() == Some("https")
-        && next_uri.scheme_str() == Some("http")
-    {
-        return Err(WireError::redirect(format!(
-            "refusing insecure redirect from {} to {}",
-            current_uri, next_uri
-        )));
-    }
-
-    Ok(())
-}
-
 fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -560,39 +533,6 @@ fn same_origin(left: &Uri, right: &Uri) -> Result<bool, WireError> {
     Ok(OriginKey::from_uri(left)? == OriginKey::from_uri(right)?)
 }
 
-fn retry_reason(error: &WireError, config: &RetryPolicyConfig) -> Option<&'static str> {
-    match error.establishment_stage() {
-        Some(EstablishmentStage::Dns) if error.is_retryable_establishment() => return Some("dns"),
-        Some(EstablishmentStage::Tcp) if error.is_connect_timeout() => {
-            return Some("connect_timeout")
-        }
-        Some(EstablishmentStage::Tcp | EstablishmentStage::ProtocolBinding)
-            if error.is_retryable_establishment() =>
-        {
-            return Some("connect");
-        }
-        Some(EstablishmentStage::Tls) if error.is_retryable_establishment() => {
-            return Some("tls");
-        }
-        Some(EstablishmentStage::RouteExhausted | EstablishmentStage::ProxyTunnel)
-            if error.is_retryable_establishment() =>
-        {
-            return Some("connect");
-        }
-        Some(_) => return None,
-        None => {}
-    }
-
-    match error.kind() {
-        WireErrorKind::Canceled if config.retry_canceled_requests => Some("canceled"),
-        WireErrorKind::Dns => Some("dns"),
-        WireErrorKind::Connect if !error.is_non_retryable_connect() => Some("connect"),
-        WireErrorKind::Tls => Some("tls"),
-        WireErrorKind::Timeout if error.is_connect_timeout() => Some("connect_timeout"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::task::{Context, Poll};
@@ -601,15 +541,16 @@ mod tests {
     use http::{HeaderValue, Request, Response, StatusCode};
     use openwire_core::{
         BoxFuture, BoxWireService, CallContext, Exchange, NoopEventListenerFactory, ResponseBody,
-        WireError, WireErrorKind,
+        WireError,
     };
     use tower::util::BoxCloneSyncService;
     use tower::{Service, ServiceExt};
 
     use super::{
-        same_origin, validate_redirect_target, AuthPolicyConfig, FollowUpPolicyService,
-        PolicyConfig, PolicyTraceContext, RedirectPolicyConfig, RequestSnapshot, RetryPolicyConfig,
+        same_origin, AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, PolicyTraceContext,
+        RequestSnapshot,
     };
+    use crate::policy::{RedirectPolicyConfig, RetryPolicyConfig};
     use crate::proxy::{NoProxy, Proxy, ProxySelector};
     use crate::RequestBody;
 
@@ -727,39 +668,6 @@ mod tests {
         assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
     }
 
-    #[test]
-    fn downgrade_redirects_are_rejected_by_default() {
-        let error = validate_redirect_target(
-            &"https://secure.test/start".parse().expect("current uri"),
-            &"http://secure.test/next".parse().expect("redirect uri"),
-            &RedirectPolicyConfig {
-                follow_redirects: true,
-                max_redirects: 10,
-                allow_insecure_redirects: false,
-            },
-        )
-        .expect_err("downgrade redirect should fail");
-
-        assert_eq!(error.kind(), WireErrorKind::Redirect);
-        assert!(error.to_string().contains(
-            "refusing insecure redirect from https://secure.test/start to http://secure.test/next"
-        ));
-    }
-
-    #[test]
-    fn downgrade_redirects_can_be_enabled_explicitly() {
-        validate_redirect_target(
-            &"https://secure.test/start".parse().expect("current uri"),
-            &"http://secure.test/next".parse().expect("redirect uri"),
-            &RedirectPolicyConfig {
-                follow_redirects: true,
-                max_redirects: 10,
-                allow_insecure_redirects: true,
-            },
-        )
-        .expect("downgrade redirect should be allowed");
-    }
-
     struct ReadinessTrackingService {
         was_polled: bool,
         is_clone: bool,
@@ -809,16 +717,8 @@ mod tests {
                 proxy_authenticator: None,
                 max_auth_attempts: 3,
             },
-            retry: RetryPolicyConfig {
-                retry_on_connection_failure: true,
-                max_retries: 1,
-                retry_canceled_requests: false,
-            },
-            redirect: RedirectPolicyConfig {
-                follow_redirects: true,
-                max_redirects: 10,
-                allow_insecure_redirects: false,
-            },
+            retry: RetryPolicyConfig::default(),
+            redirect: RedirectPolicyConfig::default(),
         }
     }
 

@@ -478,7 +478,8 @@ mod tests {
 
     use super::FastFallbackDialer;
     use crate::connection::{
-        Address, AuthorityKey, DnsPolicy, ProtocolPolicy, RoutePlan, RoutePlanner, UriScheme,
+        Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, RoutePlan,
+        RoutePlanner, UriScheme,
     };
 
     #[derive(Clone)]
@@ -711,7 +712,7 @@ mod tests {
     }
 
     fn route_plan_with_stagger(stagger: Duration, addrs: Vec<SocketAddr>) -> RoutePlan {
-        let planner = RoutePlanner::new(stagger);
+        let planner = DefaultRoutePlanner::new(stagger);
         let address = Address::new(
             UriScheme::Https,
             AuthorityKey::new("example.com", 443),

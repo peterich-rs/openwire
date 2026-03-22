@@ -24,9 +24,9 @@ use hyper::rt::Timer;
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, CoalescingInfo,
-    ConnectionId, ConnectionInfo, DnsResolver, Exchange, HyperExecutor, RequestBody, ResponseBody,
-    SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
+    next_connection_id, AuthKind, BoxConnection, BoxFuture, BoxTaskHandle, CallContext,
+    CoalescingInfo, ConnectionId, ConnectionInfo, DnsResolver, Exchange, HyperExecutor,
+    RequestBody, ResponseBody, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tower::Service;
@@ -34,8 +34,7 @@ use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::auth::{
-    AuthAttemptState, AuthContext, AuthKind, AuthRequestState, AuthResponseState,
-    SharedAuthenticator,
+    build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
@@ -54,7 +53,7 @@ pub(crate) struct ConnectorStack {
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) executor: Arc<dyn WireExecutor>,
     pub(crate) timer: SharedTimer,
-    pub(crate) route_planner: RoutePlanner,
+    pub(crate) route_planner: Arc<dyn RoutePlanner>,
     pub(crate) proxy_authenticator: Option<SharedAuthenticator>,
     pub(crate) max_proxy_auth_attempts: usize,
 }
@@ -147,9 +146,9 @@ impl ConnectorStack {
         let (dns_host, dns_port) = self.route_planner.dns_target(address);
         let resolved_addrs = self
             .dns_resolver
-            .resolve(ctx.clone(), dns_host.to_owned(), dns_port)
+            .resolve(ctx.clone(), dns_host, dns_port)
             .await?;
-        Ok(self.route_planner.plan(address.clone(), resolved_addrs))
+        self.route_planner.plan(address, resolved_addrs)
     }
 
     fn proxy_connect_deps(&self) -> ProxyConnectDeps {
@@ -521,7 +520,7 @@ async fn establish_connect_tunnel(
                     return Err(proxy_connect_status_error(&head.status_line));
                 }
 
-                let auth_ctx = AuthContext::new(
+                let auth_ctx = build_auth_context(
                     AuthKind::Proxy,
                     AuthRequestState::new(
                         Method::CONNECT,
@@ -2753,8 +2752,8 @@ mod tests {
     use tracing_subscriber::registry::LookupSpan;
 
     use openwire_core::{
-        BoxFuture, BoxTaskHandle, CallContext, NoopEventListener, Runtime, SharedTimer, TaskHandle,
-        WireError, WireExecutor,
+        BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver, NoopEventListener,
+        Runtime, SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
     };
 
     use super::{
@@ -2765,7 +2764,7 @@ mod tests {
     use crate::connection::ConnectionPool;
     use crate::connection::{
         Address, AuthorityKey, ConnectionProtocol, DnsPolicy, PoolSettings, ProtocolPolicy,
-        RealConnection, Route, UriScheme,
+        RealConnection, Route, RoutePlan, RoutePlanner, UriScheme,
     };
     use crate::proxy::ProxySelector;
 
@@ -3093,6 +3092,68 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingDnsResolver {
+        calls: Arc<Mutex<Vec<(String, u16)>>>,
+        resolved_addrs: Vec<std::net::SocketAddr>,
+    }
+
+    impl DnsResolver for RecordingDnsResolver {
+        fn resolve(
+            &self,
+            _ctx: CallContext,
+            host: String,
+            port: u16,
+        ) -> BoxFuture<Result<Vec<std::net::SocketAddr>, WireError>> {
+            self.calls
+                .lock()
+                .expect("dns calls lock")
+                .push((host, port));
+            let resolved_addrs = self.resolved_addrs.clone();
+            Box::pin(async move { Ok(resolved_addrs) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnusedTcpConnector;
+
+    impl TcpConnector for UnusedTcpConnector {
+        fn connect(
+            &self,
+            _ctx: CallContext,
+            _addr: std::net::SocketAddr,
+            _timeout: Option<Duration>,
+        ) -> BoxFuture<Result<BoxConnection, WireError>> {
+            Box::pin(async { panic!("tcp connector should not be used in route planner test") })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingRoutePlanner {
+        planned: Arc<Mutex<Vec<(Address, Vec<std::net::SocketAddr>)>>>,
+    }
+
+    impl RoutePlanner for RecordingRoutePlanner {
+        fn dns_target(&self, _address: &Address) -> (String, u16) {
+            ("planner.test".to_owned(), 8443)
+        }
+
+        fn plan(
+            &self,
+            address: &Address,
+            resolved_addrs: Vec<std::net::SocketAddr>,
+        ) -> Result<RoutePlan, WireError> {
+            self.planned
+                .lock()
+                .expect("route planner calls lock")
+                .push((address.clone(), resolved_addrs.clone()));
+            Ok(RoutePlan::new(
+                vec![Route::direct(address.clone(), resolved_addrs[0])],
+                Duration::from_millis(37),
+            ))
+        }
+    }
+
     fn poll_read_exact<T>(io: &mut T, out: &mut [u8])
     where
         T: Read + Unpin,
@@ -3208,6 +3269,47 @@ mod tests {
 
         assert!(signal.expired.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(runtime.spawns(), 0);
+    }
+
+    #[tokio::test]
+    async fn connector_stack_uses_custom_route_planner() {
+        let dns_calls = Arc::new(Mutex::new(Vec::new()));
+        let planned = Arc::new(Mutex::new(Vec::new()));
+        let resolved = vec![std::net::SocketAddr::from(([203, 0, 113, 10], 443))];
+        let connector = super::ConnectorStack {
+            dns_resolver: Arc::new(RecordingDnsResolver {
+                calls: dns_calls.clone(),
+                resolved_addrs: resolved.clone(),
+            }),
+            tcp_connector: Arc::new(UnusedTcpConnector),
+            tls_connector: None,
+            connect_timeout: None,
+            executor: Arc::new(CountingSpawnRuntime::default()),
+            timer: SharedTimer::new(openwire_tokio::TokioTimer::new()),
+            route_planner: Arc::new(RecordingRoutePlanner {
+                planned: planned.clone(),
+            }),
+            proxy_authenticator: None,
+            max_proxy_auth_attempts: 0,
+        };
+
+        let route_plan = connector
+            .route_plan(make_call_context(), &make_address())
+            .await
+            .expect("route plan");
+
+        assert_eq!(
+            dns_calls.lock().expect("dns calls lock").as_slice(),
+            &[("planner.test".to_owned(), 8443)]
+        );
+        let planned = planned.lock().expect("route planner calls lock");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].0, make_address());
+        assert_eq!(planned[0].1, resolved);
+        assert_eq!(
+            route_plan.fast_fallback_stagger(),
+            Duration::from_millis(37)
+        );
     }
 
     #[test]

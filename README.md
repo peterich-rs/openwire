@@ -28,7 +28,7 @@ Rustls.
 
 - `crates/openwire`: public client API, policy layer, transport integration
 - `crates/openwire-cache`: cache interceptor and in-memory cache store
-- `crates/openwire-core`: shared body, error, event, runtime, and transport traits
+- `crates/openwire-core`: shared body, error, event, runtime, transport, and policy traits
 - `crates/openwire-tokio`: Tokio runtime, I/O, DNS, and TCP adapters
 - `crates/openwire-rustls`: default Rustls TLS connector
 - `crates/openwire-test`: local test support

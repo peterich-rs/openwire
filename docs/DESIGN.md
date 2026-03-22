@@ -23,7 +23,7 @@ Primary goals:
 openwire/
 ├── crates/openwire          public API, policy layer, transport integration
 ├── crates/openwire-cache    application-layer cache interceptor
-├── crates/openwire-core     shared body, error, event, runtime, transport traits
+├── crates/openwire-core     shared body, error, event, runtime, transport, and policy traits
 ├── crates/openwire-tokio    Tokio runtime, I/O, DNS, and TCP adapters
 ├── crates/openwire-rustls   optional Rustls TLS connector
 ├── crates/openwire-test     test support
@@ -136,8 +136,8 @@ Extension boundary contracts:
 
 | Trait | Method Contract | Current Owner |
 |---|---|---|
-| `CookieJar` | `set_cookies(&mut Iterator<Item=&HeaderValue>, &Url)` and `cookies(&Url) -> Option<HeaderValue>` | `crates/openwire/src/cookie.rs` |
-| `Authenticator` | `authenticate(AuthContext) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>>` | `crates/openwire/src/auth.rs` |
+| `CookieJar` | `set_cookies(&mut Iterator<Item=&HeaderValue>, &Url)` and `cookies(&Url) -> Option<HeaderValue>` | `crates/openwire-core/src/cookie.rs` |
+| `Authenticator` | `authenticate(AuthContext) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>>` | `crates/openwire-core/src/auth.rs` |
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
@@ -148,8 +148,8 @@ Extension boundary contracts:
 
 Current extension-point rules:
 
-- `CookieJar` and `Authenticator` are policy-layer integrations and must not
-  own transport decisions
+- `CookieJar` and `Authenticator` live in `openwire-core`, but remain
+  policy-layer integrations and must not own transport decisions
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution

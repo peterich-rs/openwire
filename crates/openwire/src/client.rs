@@ -8,9 +8,10 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::rt::Timer;
 use openwire_core::{
-    BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
-    NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
-    SharedInterceptor, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
+    Authenticator, BoxWireService, CallContext, CookieJar, DnsResolver, EventListenerFactory,
+    Exchange, InterceptorLayer, NoopEventListenerFactory, RedirectPolicy, RequestBody,
+    ResponseBody, RetryPolicy, Runtime, SharedEventListenerFactory, SharedInterceptor, SharedTimer,
+    TcpConnector, TlsConnector, WireError, WireExecutor,
 };
 use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector, TokioTimer};
 use pin_project_lite::pin_project;
@@ -20,13 +21,13 @@ use tower::Service;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
-use crate::auth::{Authenticator, SharedAuthenticator};
+use crate::auth::SharedAuthenticator;
 use crate::bridge::BridgeInterceptor;
 use crate::connection::{
-    Address, ConnectionPool, ExchangeFinder, PoolSettings, RequestAdmissionLimiter,
-    RequestAdmissionPermit, RoutePlanner,
+    Address, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
+    RequestAdmissionLimiter, RequestAdmissionPermit, RoutePlanner,
 };
-use crate::cookie::{CookieJar, SharedCookieJar};
+use crate::cookie::SharedCookieJar;
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
@@ -78,6 +79,7 @@ pub struct ClientBuilder {
     dns_resolver: Arc<dyn DnsResolver>,
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
+    route_planner: Arc<dyn RoutePlanner>,
     proxies: Vec<Proxy>,
     use_system_proxy: bool,
 }
@@ -161,6 +163,14 @@ impl ClientBuilder {
         self
     }
 
+    pub fn route_planner<P>(mut self, planner: P) -> Self
+    where
+        P: RoutePlanner,
+    {
+        self.route_planner = Arc::new(planner);
+        self
+    }
+
     /// Configures a cookie jar for automatic cookie loading and persistence.
     pub fn cookie_jar<J>(mut self, jar: J) -> Self
     where
@@ -215,27 +225,39 @@ impl ClientBuilder {
     }
 
     pub fn follow_redirects(mut self, enabled: bool) -> Self {
-        self.policy.redirect.follow_redirects = enabled;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_follow_redirects(enabled);
         self
     }
 
     pub fn max_redirects(mut self, max_redirects: usize) -> Self {
-        self.policy.redirect.max_redirects = max_redirects;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_max_redirects(max_redirects);
         self
     }
 
     pub fn allow_insecure_redirects(mut self, enabled: bool) -> Self {
-        self.policy.redirect.allow_insecure_redirects = enabled;
+        self.policy
+            .redirect
+            .default_mut()
+            .set_allow_insecure_redirects(enabled);
         self
     }
 
     pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
-        self.policy.retry.retry_on_connection_failure = enabled;
+        self.policy
+            .retry
+            .default_mut()
+            .set_retry_on_connection_failure(enabled);
         self
     }
 
     pub fn max_retries(mut self, max_retries: usize) -> Self {
-        self.policy.retry.max_retries = max_retries;
+        self.policy.retry.default_mut().set_max_retries(max_retries);
         self
     }
 
@@ -280,7 +302,26 @@ impl ClientBuilder {
     }
 
     pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
-        self.policy.retry.retry_canceled_requests = enabled;
+        self.policy
+            .retry
+            .default_mut()
+            .set_retry_canceled_requests(enabled);
+        self
+    }
+
+    pub fn retry_policy<P>(mut self, policy: P) -> Self
+    where
+        P: RetryPolicy,
+    {
+        self.policy.retry.set_custom(policy);
+        self
+    }
+
+    pub fn redirect_policy<P>(mut self, policy: P) -> Self
+    where
+        P: RedirectPolicy,
+    {
+        self.policy.redirect.set_custom(policy);
         self
     }
 
@@ -319,7 +360,7 @@ impl ClientBuilder {
             connect_timeout: self.transport.connect_timeout,
             executor: self.executor.clone(),
             timer: self.timer.clone(),
-            route_planner: RoutePlanner::default(),
+            route_planner: self.route_planner,
             proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
         };
@@ -383,20 +424,13 @@ impl Default for ClientBuilder {
                     proxy_authenticator: None,
                     max_auth_attempts: 3,
                 },
-                retry: RetryPolicyConfig {
-                    retry_on_connection_failure: true,
-                    max_retries: 1,
-                    retry_canceled_requests: false,
-                },
-                redirect: RedirectPolicyConfig {
-                    follow_redirects: true,
-                    max_redirects: 10,
-                    allow_insecure_redirects: false,
-                },
+                retry: RetryPolicyConfig::default(),
+                redirect: RedirectPolicyConfig::default(),
             },
             dns_resolver: Arc::new(SystemDnsResolver),
             tcp_connector: Arc::new(TokioTcpConnector),
             tls_connector: None,
+            route_planner: Arc::new(DefaultRoutePlanner::default()),
             proxies: Vec::new(),
             use_system_proxy: false,
         }

@@ -10,87 +10,87 @@ use crate::proxy::{Proxy, ProxyCredentials};
 const DEFAULT_FAST_FALLBACK_STAGGER: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum UriScheme {
+pub enum UriScheme {
     Http,
     Https,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct AuthorityKey {
+pub struct AuthorityKey {
     host: String,
     port: u16,
 }
 
 impl AuthorityKey {
-    pub(crate) fn new(host: impl Into<String>, port: u16) -> Self {
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
             host: normalize_host(host.into()),
             port,
         }
     }
 
-    pub(crate) fn host(&self) -> &str {
+    pub fn host(&self) -> &str {
         &self.host
     }
 
-    pub(crate) fn port(&self) -> u16 {
+    pub fn port(&self) -> u16 {
         self.port
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct TlsIdentity {
+pub struct TlsIdentity {
     server_name: String,
 }
 
 impl TlsIdentity {
-    pub(crate) fn new(server_name: impl Into<String>) -> Self {
+    pub fn new(server_name: impl Into<String>) -> Self {
         Self {
             server_name: normalize_host(server_name.into()),
         }
     }
 
-    pub(crate) fn server_name(&self) -> &str {
+    pub fn server_name(&self) -> &str {
         &self.server_name
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ProtocolPolicy {
+pub enum ProtocolPolicy {
     Http1Only,
     Http2Only,
     Http1OrHttp2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum DnsPolicy {
+pub enum DnsPolicy {
     System,
     Custom(String),
     Deferred,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ProxyScheme {
+pub enum ProxyScheme {
     Http,
     Socks5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ProxyMode {
+pub enum ProxyMode {
     Forward,
     Connect,
     SocksTunnel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ProxyEndpoint {
+pub struct ProxyEndpoint {
     scheme: ProxyScheme,
     authority: AuthorityKey,
     credentials: Option<ProxyCredentials>,
 }
 
 impl ProxyEndpoint {
-    pub(crate) fn new(scheme: ProxyScheme, host: impl Into<String>, port: u16) -> Self {
+    pub fn new(scheme: ProxyScheme, host: impl Into<String>, port: u16) -> Self {
         Self {
             scheme,
             authority: AuthorityKey::new(host, port),
@@ -98,11 +98,11 @@ impl ProxyEndpoint {
         }
     }
 
-    pub(crate) fn scheme(&self) -> ProxyScheme {
+    pub fn scheme(&self) -> ProxyScheme {
         self.scheme
     }
 
-    pub(crate) fn authority(&self) -> &AuthorityKey {
+    pub fn authority(&self) -> &AuthorityKey {
         &self.authority
     }
 
@@ -117,27 +117,27 @@ impl ProxyEndpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ProxyConfig {
+pub struct ProxyConfig {
     mode: ProxyMode,
     endpoint: ProxyEndpoint,
 }
 
 impl ProxyConfig {
-    pub(crate) fn new(mode: ProxyMode, endpoint: ProxyEndpoint) -> Self {
+    pub fn new(mode: ProxyMode, endpoint: ProxyEndpoint) -> Self {
         Self { mode, endpoint }
     }
 
-    pub(crate) fn mode(&self) -> ProxyMode {
+    pub fn mode(&self) -> ProxyMode {
         self.mode
     }
 
-    pub(crate) fn endpoint(&self) -> &ProxyEndpoint {
+    pub fn endpoint(&self) -> &ProxyEndpoint {
         &self.endpoint
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Address {
+pub struct Address {
     scheme: UriScheme,
     authority: AuthorityKey,
     proxy: Option<ProxyConfig>,
@@ -147,7 +147,7 @@ pub(crate) struct Address {
 }
 
 impl Address {
-    pub(crate) fn new(
+    pub fn new(
         scheme: UriScheme,
         authority: AuthorityKey,
         proxy: Option<ProxyConfig>,
@@ -165,7 +165,7 @@ impl Address {
         }
     }
 
-    pub(crate) fn from_uri(uri: &Uri, proxy: Option<&Proxy>) -> Result<Self, WireError> {
+    pub fn from_uri(uri: &Uri, proxy: Option<&Proxy>) -> Result<Self, WireError> {
         let scheme = match uri.scheme_str() {
             Some(scheme) if scheme.eq_ignore_ascii_case("https") => UriScheme::Https,
             Some(scheme) if scheme.eq_ignore_ascii_case("http") => UriScheme::Http,
@@ -201,27 +201,27 @@ impl Address {
         ))
     }
 
-    pub(crate) fn scheme(&self) -> UriScheme {
+    pub fn scheme(&self) -> UriScheme {
         self.scheme
     }
 
-    pub(crate) fn authority(&self) -> &AuthorityKey {
+    pub fn authority(&self) -> &AuthorityKey {
         &self.authority
     }
 
-    pub(crate) fn proxy(&self) -> Option<&ProxyConfig> {
+    pub fn proxy(&self) -> Option<&ProxyConfig> {
         self.proxy.as_ref()
     }
 
-    pub(crate) fn tls_identity(&self) -> Option<&TlsIdentity> {
+    pub fn tls_identity(&self) -> Option<&TlsIdentity> {
         self.tls_identity.as_ref()
     }
 
-    pub(crate) fn protocol_policy(&self) -> ProtocolPolicy {
+    pub fn protocol_policy(&self) -> ProtocolPolicy {
         self.protocol_policy
     }
 
-    pub(crate) fn dns_policy(&self) -> &DnsPolicy {
+    pub fn dns_policy(&self) -> &DnsPolicy {
         &self.dns_policy
     }
 }
@@ -273,7 +273,7 @@ impl ProxyConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RouteFamily {
+pub enum RouteFamily {
     Ipv4,
     Ipv6,
 }
@@ -288,7 +288,7 @@ impl RouteFamily {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum DnsResolution {
+pub enum DnsResolution {
     Local(SocketAddr),
     Deferred { host: String, port: u16 },
 }
@@ -313,7 +313,7 @@ pub(crate) enum RouteKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Route {
+pub struct Route {
     address: Address,
     family: RouteFamily,
     kind: RouteKind,
@@ -322,7 +322,7 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    pub(crate) fn direct(address: Address, target: SocketAddr) -> Self {
+    pub fn direct(address: Address, target: SocketAddr) -> Self {
         Self {
             family: RouteFamily::from_socket_addr(target),
             kind: RouteKind::Direct { target },
@@ -332,7 +332,7 @@ impl Route {
         }
     }
 
-    pub(crate) fn http_forward(address: Address, proxy: SocketAddr) -> Self {
+    pub fn http_forward(address: Address, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
@@ -344,7 +344,7 @@ impl Route {
         )
     }
 
-    pub(crate) fn connect_proxy(address: Address, proxy: SocketAddr) -> Self {
+    pub fn connect_proxy(address: Address, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
@@ -356,7 +356,7 @@ impl Route {
         )
     }
 
-    pub(crate) fn socks_proxy(address: Address, proxy: SocketAddr) -> Self {
+    pub fn socks_proxy(address: Address, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
@@ -396,11 +396,11 @@ impl Route {
         }
     }
 
-    pub(crate) fn address(&self) -> &Address {
+    pub fn address(&self) -> &Address {
         &self.address
     }
 
-    pub(crate) fn family(&self) -> RouteFamily {
+    pub fn family(&self) -> RouteFamily {
         self.family
     }
 
@@ -418,36 +418,36 @@ impl Route {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RoutePlan {
+pub struct RoutePlan {
     routes: Vec<Route>,
     fast_fallback_stagger: Duration,
 }
 
 impl RoutePlan {
-    pub(crate) fn new(routes: Vec<Route>, fast_fallback_stagger: Duration) -> Self {
+    pub fn new(routes: Vec<Route>, fast_fallback_stagger: Duration) -> Self {
         Self {
             routes,
             fast_fallback_stagger,
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.routes.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
 
-    pub(crate) fn route(&self, index: usize) -> Option<&Route> {
+    pub fn route(&self, index: usize) -> Option<&Route> {
         self.routes.get(index)
     }
 
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &Route> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Route> {
         self.routes.iter()
     }
 
-    pub(crate) fn fast_fallback_stagger(&self) -> Duration {
+    pub fn fast_fallback_stagger(&self) -> Duration {
         self.fast_fallback_stagger
     }
 }
@@ -592,50 +592,36 @@ impl ConnectPlan {
     }
 }
 
+pub trait RoutePlanner: Send + Sync + 'static {
+    fn dns_target(&self, address: &Address) -> (String, u16);
+
+    fn plan(
+        &self,
+        address: &Address,
+        resolved_addrs: Vec<SocketAddr>,
+    ) -> Result<RoutePlan, WireError>;
+}
+
 #[derive(Clone, Debug)]
-pub(crate) struct RoutePlanner {
+pub struct DefaultRoutePlanner {
     fast_fallback_stagger: Duration,
 }
 
-impl Default for RoutePlanner {
+impl Default for DefaultRoutePlanner {
     fn default() -> Self {
         Self::new(DEFAULT_FAST_FALLBACK_STAGGER)
     }
 }
 
-impl RoutePlanner {
-    pub(crate) fn new(fast_fallback_stagger: Duration) -> Self {
+impl DefaultRoutePlanner {
+    pub fn new(fast_fallback_stagger: Duration) -> Self {
         Self {
             fast_fallback_stagger,
         }
     }
 
-    pub(crate) fn fast_fallback_stagger(&self) -> Duration {
+    pub fn fast_fallback_stagger(&self) -> Duration {
         self.fast_fallback_stagger
-    }
-
-    pub(crate) fn dns_target<'a>(&self, address: &'a Address) -> (&'a str, u16) {
-        if let Some(proxy) = address.proxy() {
-            (
-                proxy.endpoint().authority().host(),
-                proxy.endpoint().authority().port(),
-            )
-        } else {
-            (address.authority().host(), address.authority().port())
-        }
-    }
-
-    pub(crate) fn plan(
-        &self,
-        address: Address,
-        resolved_addrs: impl IntoIterator<Item = SocketAddr>,
-    ) -> RoutePlan {
-        match address.proxy().map(ProxyConfig::mode) {
-            Some(ProxyMode::Forward) => self.plan_http_forward(address, resolved_addrs),
-            Some(ProxyMode::Connect) => self.plan_connect_proxy(address, resolved_addrs),
-            Some(ProxyMode::SocksTunnel) => self.plan_socks_proxy(address, resolved_addrs),
-            None => self.plan_direct(address, resolved_addrs),
-        }
     }
 
     pub(crate) fn plan_direct(
@@ -696,6 +682,36 @@ impl RoutePlanner {
                 .collect(),
             self.fast_fallback_stagger,
         )
+    }
+}
+
+impl RoutePlanner for DefaultRoutePlanner {
+    fn dns_target(&self, address: &Address) -> (String, u16) {
+        if let Some(proxy) = address.proxy() {
+            (
+                proxy.endpoint().authority().host().to_owned(),
+                proxy.endpoint().authority().port(),
+            )
+        } else {
+            (
+                address.authority().host().to_owned(),
+                address.authority().port(),
+            )
+        }
+    }
+
+    fn plan(
+        &self,
+        address: &Address,
+        resolved_addrs: Vec<SocketAddr>,
+    ) -> Result<RoutePlan, WireError> {
+        let route_plan = match address.proxy().map(ProxyConfig::mode) {
+            Some(ProxyMode::Forward) => self.plan_http_forward(address.clone(), resolved_addrs),
+            Some(ProxyMode::Connect) => self.plan_connect_proxy(address.clone(), resolved_addrs),
+            Some(ProxyMode::SocksTunnel) => self.plan_socks_proxy(address.clone(), resolved_addrs),
+            None => self.plan_direct(address.clone(), resolved_addrs),
+        };
+        Ok(route_plan)
     }
 }
 
@@ -764,8 +780,9 @@ mod tests {
 
     use super::{
         Address, AuthorityKey, ConnectAttemptState, ConnectFailure, ConnectFailureStage,
-        ConnectPlan, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig, ProxyEndpoint,
-        ProxyMode, ProxyScheme, RouteFamily, RouteKind, RoutePlanner, TlsIdentity, UriScheme,
+        ConnectPlan, DefaultRoutePlanner, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig,
+        ProxyEndpoint, ProxyMode, ProxyScheme, RouteFamily, RouteKind, RoutePlanner, TlsIdentity,
+        UriScheme,
     };
     use crate::Proxy;
 
@@ -902,7 +919,7 @@ mod tests {
 
     #[test]
     fn planner_alternates_families_for_dual_stack_routes() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
         let plan = planner.plan_direct(
             http_address(),
             [
@@ -937,7 +954,7 @@ mod tests {
 
     #[test]
     fn planner_preserves_resolver_order_for_single_family_results() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
         let plan = planner.plan_direct(
             http_address(),
             [socket_v4(11), socket_v4(12), socket_v4(13)],
@@ -956,7 +973,7 @@ mod tests {
 
     #[test]
     fn planner_builds_proxy_route_variants_with_deferred_target_dns() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
         let forward =
             planner.plan_http_forward(https_proxy_address(ProxyMode::Forward), [socket_v4(21)]);
         let connect =
@@ -975,32 +992,47 @@ mod tests {
 
     #[test]
     fn planner_selects_dns_target_from_address() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
 
-        assert_eq!(planner.dns_target(&http_address()), ("example.com", 80));
+        assert_eq!(
+            planner.dns_target(&http_address()),
+            ("example.com".to_owned(), 80)
+        );
         assert_eq!(
             planner.dns_target(&https_proxy_address(ProxyMode::Connect)),
-            ("proxy.internal", 8080)
+            ("proxy.internal".to_owned(), 8080)
         );
     }
 
     #[test]
     fn planner_selects_route_kind_from_address_proxy_mode() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
 
-        let direct = planner.plan(http_address(), [socket_v4(51)]);
+        let direct = planner
+            .plan(&http_address(), vec![socket_v4(51)])
+            .expect("direct plan");
         assert!(matches!(
             direct.route(0).expect("direct route").kind(),
             RouteKind::Direct { .. }
         ));
 
-        let forward = planner.plan(https_proxy_address(ProxyMode::Forward), [socket_v4(52)]);
+        let forward = planner
+            .plan(
+                &https_proxy_address(ProxyMode::Forward),
+                vec![socket_v4(52)],
+            )
+            .expect("forward plan");
         assert!(matches!(
             forward.route(0).expect("forward route").kind(),
             RouteKind::HttpForwardProxy { .. }
         ));
 
-        let connect = planner.plan(https_proxy_address(ProxyMode::Connect), [socket_v4(53)]);
+        let connect = planner
+            .plan(
+                &https_proxy_address(ProxyMode::Connect),
+                vec![socket_v4(53)],
+            )
+            .expect("connect plan");
         assert!(matches!(
             connect.route(0).expect("connect route").kind(),
             RouteKind::ConnectProxy { .. }
@@ -1009,7 +1041,7 @@ mod tests {
 
     #[test]
     fn connect_plan_tracks_attempt_state_transitions() {
-        let planner = RoutePlanner::default();
+        let planner = DefaultRoutePlanner::default();
         let route_plan = planner.plan_direct(http_address(), [socket_v6(1), socket_v4(2)]);
         let mut connect_plan = ConnectPlan::from_route_plan(&route_plan);
 

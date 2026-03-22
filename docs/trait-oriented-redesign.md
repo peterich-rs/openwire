@@ -160,7 +160,7 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 | Runtime surface | `openwire-core` now exports `Runtime`, `TaskHandle`, `WireExecutor`, `HyperExecutor`, and `SharedTimer`; `TransportService` and `ClientBuilder` now carry executor/timer inputs explicitly | `openwire-core` exports only the runtime-neutral surfaces needed by the framework; `Runtime` becomes optional compatibility API or disappears entirely | `M2` and `M3` landed additively; `M6` decides whether `Runtime` survives as a compatibility shim |
 | Tokio adapters | `SystemDnsResolver`, `TokioTcpConnector`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, and `TokioIo` already live in `openwire-tokio` | the same adapters remain in `openwire-tokio`, but the framework path stops depending on Tokio-specific APIs directly | `M1` landed without final feature-gating; preserve current DNS/connect event behavior exactly |
 | Transport Tokio leakage | non-test framework paths now avoid direct `tokio::` usage; fast fallback, CONNECT/SOCKS timeouts, tunnel I/O, call deadlines, body deadlines, and admission control all use framework-owned abstractions or external traits | keep direct Tokio references confined to `openwire-tokio` and tests | `M3` landed; remaining cleanup is about compatibility surfaces, not runtime leakage |
-| Policy traits | `CookieJar`, `Authenticator`, retry logic, and redirect decisions are still centered in `openwire` | traits and contexts move to `openwire-core`; orchestration and request mutation stay in `openwire` | preserve current body and redirect semantics byte-for-byte |
+| Policy traits | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` now live in `openwire-core`; `openwire` keeps `Jar`, default retry/redirect implementations, and follow-up orchestration | keep policy traits in core while request mutation and follow-up orchestration stay in `openwire` | `M4` landed additively; next work is route-planning extraction |
 | Planning surface | `ConnectorStack` stores a concrete `RoutePlanner` struct | route planning becomes a replaceable `Arc<dyn RoutePlanner>` boundary in `openwire` | keep proxy credential propagation and shared route-plan fast fallback intact |
 
 ## Delivery Milestones
@@ -170,11 +170,11 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 | `M1` | Phase 1 | create `openwire-tokio` and move Tokio-only adapters without behavior changes | completed on this branch: adapters live in `openwire-tokio`, defaults still work, and workspace callers import Tokio adapters from the new crate |
 | `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | completed on this branch: `WireExecutor`, `HyperExecutor`, and `SharedTimer` exist; `bind_http2` no longer hardcodes Tokio executor/timer construction; connection-task tracking uses the configured executor |
 | `M3` | Phase 2c-2h | remove the remaining framework Tokio leakage | completed on this branch: non-test framework paths no longer depend directly on `tokio::`; fast fallback, tunnels, call deadlines, body deadlines, and admission control all use runtime-neutral abstractions |
-| `M4` | Phases 3-4 | move policy traits into `openwire-core` | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps default policy impls and orchestration |
+| `M4` | Phases 3-4 | move policy traits into `openwire-core` | completed on this branch: `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps `Jar`, default policy impls, and orchestration |
 | `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | `ConnectorStack` depends on `Arc<dyn RoutePlanner>` and public planning types are stable enough for custom planners |
 | `M6` | Phase 6 + cleanup | finish adapter interop and remove compatibility shims | `Runtime` and `openwire-core` Tokio re-exports are gone; docs and examples reflect the final crate boundaries |
 
-Updated recommended delivery order from the new baseline: `M4 -> M5 -> M6`.
+Updated recommended delivery order from the new baseline: `M5 -> M6`.
 The remaining work is now architectural cleanup and trait-boundary extraction,
 not framework-path Tokio removal.
 
@@ -214,6 +214,11 @@ is now limited to test code and `openwire_tokio` adapter references.
 - extract decision-only `RetryPolicy` and `RedirectPolicy` traits into `openwire-core`
 - leave redirect request mutation, cookie application, and follow-up orchestration in `openwire`
 - preserve `RequestBody::absent()` / `explicit_empty()` semantics and downgrade redirect behavior exactly
+
+Current status: landed on this branch. `openwire-core` now owns the policy
+traits and contexts, `openwire` re-exports them, default retry/redirect
+behavior lives in `crates/openwire/src/policy/defaults.rs`, and the existing
+redirect/body semantics remain covered by unit and integration tests.
 
 #### `M5` Checklist
 
