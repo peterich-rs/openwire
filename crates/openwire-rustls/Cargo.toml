@@ -18,6 +18,7 @@ http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
+openwire-tokio = { path = "../openwire-tokio" }
 pin-project-lite.workspace = true
 rustls.workspace = true
 rustls-webpki.workspace = true

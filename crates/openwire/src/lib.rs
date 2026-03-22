@@ -16,10 +16,10 @@ pub use openwire_core::{
     BoxFuture, BoxTaskHandle, CallContext, CallId, ConnectionId, ConnectionInfo, DnsResolver,
     EstablishmentStage, EventListener, EventListenerFactory, Exchange, Interceptor, Next,
     NoopEventListener, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, TaskHandle,
-    TcpConnector, TlsConnector, TokioRuntime, WireError, WireErrorKind,
+    TcpConnector, TlsConnector, WireError, WireErrorKind,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};
+pub use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector};
 pub use proxy::{NoProxy, Proxy};
-pub use transport::{SystemDnsResolver, TokioTcpConnector};
 pub use url::Url;

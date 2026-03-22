@@ -24,6 +24,7 @@ openwire/
 ├── crates/openwire          public API, policy layer, transport integration
 ├── crates/openwire-cache    application-layer cache interceptor
 ├── crates/openwire-core     shared body, error, event, runtime, transport traits
+├── crates/openwire-tokio    Tokio runtime, I/O, DNS, and TCP adapters
 ├── crates/openwire-rustls   optional Rustls TLS connector
 ├── crates/openwire-test     test support
 └── docs/
@@ -421,7 +422,7 @@ Protocol-specific rules:
 
 Current default adapters:
 
-- Tokio runtime through `Runtime`
+- Tokio runtime through `openwire-tokio` implementing `Runtime`
 - system DNS through `DnsResolver`
 - Tokio TCP through `TcpConnector`
 - Rustls through `TlsConnector`

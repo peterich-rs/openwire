@@ -3,6 +3,7 @@ members = [
     "crates/openwire",
     "crates/openwire-cache",
     "crates/openwire-core",
+    "crates/openwire-tokio",
     "crates/openwire-rustls",
     "crates/openwire-test",
 ]

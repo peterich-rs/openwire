@@ -25,6 +25,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
+openwire-tokio = { path = "../openwire-tokio" }
 openwire-rustls = { path = "../openwire-rustls", optional = true, default-features = false }
 pin-project-lite.workspace = true
 tokio.workspace = true

@@ -24,6 +24,8 @@ pin-project-lite.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

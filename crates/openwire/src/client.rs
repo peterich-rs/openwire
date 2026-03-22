@@ -9,8 +9,9 @@ use http_body_util::BodyExt;
 use openwire_core::{
     BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
     NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
-    SharedInterceptor, TcpConnector, TlsConnector, TokioRuntime, WireError,
+    SharedInterceptor, TcpConnector, TlsConnector, WireError,
 };
+use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector};
 use pin_project_lite::pin_project;
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -29,7 +30,7 @@ use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
 use crate::proxy::{system_proxies_from_env, Proxy, ProxySelector};
-use crate::transport::{ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService};
+use crate::transport::{ConnectorStack, TransportService};
 
 #[derive(Clone)]
 pub struct Client {

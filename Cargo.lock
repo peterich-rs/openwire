@@ -1021,6 +1021,7 @@ dependencies = [
  "openwire-core",
  "openwire-rustls",
  "openwire-test",
+ "openwire-tokio",
  "pin-project-lite",
  "serde_json",
  "tokio",
@@ -1076,6 +1077,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "openwire-core",
+ "openwire-tokio",
  "pin-project-lite",
  "rustls",
  "rustls-native-certs",
@@ -1097,10 +1099,23 @@ dependencies = [
  "http-body-util",
  "hyper",
  "openwire-core",
+ "openwire-tokio",
  "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "openwire-tokio"
+version = "0.1.0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "openwire-core",
+ "pin-project-lite",
+ "tokio",
  "tracing",
 ]
 

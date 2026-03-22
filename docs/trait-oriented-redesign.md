@@ -1,7 +1,7 @@
 # Trait-Oriented Redesign
 
 Date: 2026-03-22
-Status: Draft v5
+Status: Draft v6
 
 ## Main Sync Notes
 
@@ -157,8 +157,8 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 
 | Area | Current `main` baseline | Target end-state | Migration note |
 |------|--------------------------|------------------|----------------|
-| Runtime surface | `openwire-core` still exports `Runtime`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, `TokioIo`; `transport.rs` hardcodes Tokio executor/timer for HTTP/2 binding | `openwire-core` exports only runtime-neutral traits and adapters; Tokio implementations live in `openwire-tokio` | introduce the new executor surface additively before deleting `Runtime` |
-| Tokio adapters | `SystemDnsResolver` and `TokioTcpConnector` still live in `crates/openwire/src/transport.rs` | both move to `openwire-tokio`, with `openwire` using feature-gated defaults | preserve current DNS/connect event behavior exactly |
+| Runtime surface | `openwire-core` now exports only `Runtime` / `TaskHandle`; Tokio implementations already live in `openwire-tokio`, but `transport.rs` still hardcodes Tokio executor/timer for HTTP/2 binding | `openwire-core` exports only runtime-neutral traits and adapters; Tokio implementations stay in `openwire-tokio` | `M1` landed; `M2` replaces `Runtime` with the new executor surface |
+| Tokio adapters | `SystemDnsResolver`, `TokioTcpConnector`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, and `TokioIo` already live in `openwire-tokio` | the same adapters remain in `openwire-tokio`, but the framework path stops depending on Tokio-specific APIs directly | `M1` landed without final feature-gating; preserve current DNS/connect event behavior exactly |
 | Transport Tokio leakage | fast fallback, CONNECT/SOCKS timeouts, tunnel I/O, and call/body deadlines still depend on Tokio-specific APIs or Tokio-owned helpers | framework path uses only `WireExecutor`, `hyper::rt::Timer`, and runtime-neutral I/O adapters | this is the critical-path de-Tokio work |
 | Policy traits | `CookieJar`, `Authenticator`, retry logic, and redirect decisions are still centered in `openwire` | traits and contexts move to `openwire-core`; orchestration and request mutation stay in `openwire` | preserve current body and redirect semantics byte-for-byte |
 | Planning surface | `ConnectorStack` stores a concrete `RoutePlanner` struct | route planning becomes a replaceable `Arc<dyn RoutePlanner>` boundary in `openwire` | keep proxy credential propagation and shared route-plan fast fallback intact |
@@ -167,14 +167,14 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 
 | Milestone | Covers | Goal | Exit criteria |
 |------|--------|------|---------------|
-| `M1` | Phase 1 | create `openwire-tokio` and move Tokio-only adapters without behavior changes | defaults still work, workspace tests stay green, and callers can start importing Tokio adapters from the new crate |
+| `M1` | Phase 1 | create `openwire-tokio` and move Tokio-only adapters without behavior changes | completed on this branch: adapters live in `openwire-tokio`, defaults still work, and workspace callers import Tokio adapters from the new crate |
 | `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | `bind_http2` no longer hardcodes `TokioExecutor::new()` / `TokioTimer::new()` and owned connection tasks can be tracked through executor-returned task handles |
 | `M3` | Phase 2c-2h | remove the remaining framework Tokio leakage | non-test framework paths stop depending directly on `tokio::`; fast fallback, tunnels, call deadlines, and body deadlines all use runtime-neutral abstractions |
 | `M4` | Phases 3-4 | move policy traits into `openwire-core` | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps default policy impls and orchestration |
 | `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | `ConnectorStack` depends on `Arc<dyn RoutePlanner>` and public planning types are stable enough for custom planners |
 | `M6` | Phase 6 + cleanup | finish adapter interop and remove compatibility shims | `Runtime` and `openwire-core` Tokio re-exports are gone; docs and examples reflect the final crate boundaries |
 
-Updated recommended delivery order: `M1 -> M2 -> M3 -> M4 -> M5 -> M6`.
+Updated recommended delivery order from the new baseline: `M2 -> M3 -> M4 -> M5 -> M6`.
 `M2` and `M3` are the critical path because every later cleanup depends on the
 runtime split being real rather than just crate reshuffling.
 
@@ -184,8 +184,8 @@ runtime split being real rather than just crate reshuffling.
 
 - create `crates/openwire-tokio` and move the current `tokio_rt.rs` contents there
 - move `SystemDnsResolver` and `TokioTcpConnector` out of `crates/openwire/src/transport.rs`
-- wire `openwire` defaults through a feature-gated `openwire-tokio` dependency
-- keep old import paths working temporarily via compatibility re-exports while the migration is in flight
+- update workspace crates (`openwire`, `openwire-rustls`, `openwire-test`) to import Tokio adapters from `openwire-tokio`
+- note the current limitation: `runtime-tokio` is still a placeholder feature flag until later phases remove Tokio requirements from the framework path
 
 #### `M2` Checklist
 
@@ -248,16 +248,14 @@ direct tokio imports; openwire-tokio (runtime adapter) provides all tokio defaul
 
 ### Feature gating
 
-openwire's `runtime-tokio` feature (default) gates the `openwire-tokio` dependency.
-`ClientBuilder::default()` uses `TokioRuntime` / `SystemDnsResolver` / `TokioTcpConnector`
-only when `runtime-tokio` is active; without it, the user must provide an equivalent
-runtime configuration plus DNS/TCP defaults explicitly.
+`ClientBuilder::default()` now gets `TokioRuntime` / `SystemDnsResolver` /
+`TokioTcpConnector` from `openwire-tokio`.
 
-Deferred note: the exact semantics of `ClientBuilder::default()` / `Client::builder()`
-when `runtime-tokio` is disabled are intentionally left open for now. The initial rollout
-may simply gate the default builder path behind `runtime-tokio`, or require explicit
-executor/timer/dns/tcp injection when the feature is off. Revisit this when adding
-first-class multi-runtime support.
+Implementation note: after `M1`, the `runtime-tokio` feature name still exists
+but is not yet the final compile-time boundary, because the framework path still
+depends on Tokio-only helpers such as `TokioIo`, `TokioExecutor`, and
+`TokioTimer`. Real feature-gating is deferred until `M2` and `M3` remove those
+framework-path requirements.
 
 ---
 

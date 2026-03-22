@@ -21,8 +21,9 @@ use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
     next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, CoalescingInfo,
     ConnectionId, ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime,
-    TcpConnector, TlsConnector, TokioExecutor, TokioIo, TokioTimer, WireError,
+    TcpConnector, TlsConnector, WireError,
 };
+use openwire_tokio::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
 use tracing::instrument::WithSubscriber;
@@ -40,152 +41,6 @@ use crate::connection::{
 use crate::proxy::ProxyCredentials;
 use crate::sync_util::lock_mutex;
 use crate::trace::PolicyTraceContext;
-
-#[derive(Clone, Debug, Default)]
-pub struct SystemDnsResolver;
-
-impl DnsResolver for SystemDnsResolver {
-    fn resolve(
-        &self,
-        ctx: CallContext,
-        host: String,
-        port: u16,
-    ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
-        Box::pin(async move {
-            ctx.listener().dns_start(&ctx, &host, port);
-            match tokio::net::lookup_host((host.as_str(), port)).await {
-                Ok(addrs) => {
-                    let addrs: Vec<_> = addrs.collect();
-                    if addrs.is_empty() {
-                        let error = WireError::dns(
-                            "DNS resolution returned no socket addresses",
-                            io::Error::new(io::ErrorKind::NotFound, "empty DNS result"),
-                        );
-                        ctx.listener().dns_failed(&ctx, &host, &error);
-                        return Err(error);
-                    }
-                    ctx.listener().dns_end(&ctx, &host, &addrs);
-                    Ok(addrs)
-                }
-                Err(error) => {
-                    let error = WireError::dns("DNS resolution failed", error);
-                    ctx.listener().dns_failed(&ctx, &host, &error);
-                    Err(error)
-                }
-            }
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TokioTcpConnector;
-
-impl TcpConnector for TokioTcpConnector {
-    fn connect(
-        &self,
-        ctx: CallContext,
-        addr: SocketAddr,
-        timeout: Option<Duration>,
-    ) -> BoxFuture<Result<BoxConnection, WireError>> {
-        Box::pin(async move {
-            ctx.listener().connect_start(&ctx, addr);
-            let connect = tokio::net::TcpStream::connect(addr);
-            let stream = match timeout {
-                Some(timeout) => match tokio::time::timeout(timeout, connect).await {
-                    Ok(result) => {
-                        result.map_err(|error| WireError::tcp_connect("TCP connect failed", error))
-                    }
-                    Err(_error) => Err(WireError::connect_timeout(format!(
-                        "connection timed out after {timeout:?}"
-                    ))),
-                },
-                None => connect
-                    .await
-                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error)),
-            };
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(error) => {
-                    ctx.listener().connect_failed(&ctx, addr, &error);
-                    return Err(error);
-                }
-            };
-
-            stream
-                .set_nodelay(true)
-                .map_err(|error| WireError::tcp_connect("failed to configure TCP_NODELAY", error))
-                .inspect_err(|error| {
-                    ctx.listener().connect_failed(&ctx, addr, error);
-                })?;
-
-            let info = ConnectionInfo {
-                id: next_connection_id(),
-                remote_addr: stream.peer_addr().ok(),
-                local_addr: stream.local_addr().ok(),
-                tls: false,
-            };
-
-            ctx.mark_connection_established();
-            ctx.listener().connect_end(&ctx, info.id, addr);
-
-            Ok(Box::new(TcpConnection {
-                inner: TokioIo::new(stream),
-                info,
-            }) as BoxConnection)
-        })
-    }
-}
-
-struct TcpConnection {
-    inner: TokioIo<tokio::net::TcpStream>,
-    info: ConnectionInfo,
-}
-
-impl Connection for TcpConnection {
-    fn connected(&self) -> Connected {
-        Connected::new().extra(self.info.clone())
-    }
-}
-
-impl hyper::rt::Read for TcpConnection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl hyper::rt::Write for TcpConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct ConnectorStack {

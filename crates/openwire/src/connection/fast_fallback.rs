@@ -611,7 +611,7 @@ mod tests {
     }
 
     struct TestConnection {
-        inner: openwire_core::TokioIo<tokio::io::DuplexStream>,
+        inner: openwire_tokio::TokioIo<tokio::io::DuplexStream>,
         info: ConnectionInfo,
         drops: Arc<AtomicUsize>,
     }
@@ -620,7 +620,7 @@ mod tests {
         fn new(info: ConnectionInfo, drops: Arc<AtomicUsize>) -> Self {
             let (stream, _peer) = tokio::io::duplex(64);
             Self {
-                inner: openwire_core::TokioIo::new(stream),
+                inner: openwire_tokio::TokioIo::new(stream),
                 info,
                 drops,
             }
