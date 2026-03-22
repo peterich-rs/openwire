@@ -6,12 +6,13 @@ use futures_util::future::{select, Either};
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
+use hyper::rt::Timer;
 use openwire_core::{
     BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
     NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, SharedEventListenerFactory,
-    SharedInterceptor, TcpConnector, TlsConnector, WireError,
+    SharedInterceptor, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
-use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector};
+use openwire_tokio::{SystemDnsResolver, TokioRuntime, TokioTcpConnector, TokioTimer};
 use pin_project_lite::pin_project;
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
@@ -69,6 +70,8 @@ pub struct ClientBuilder {
     network_interceptors: Vec<SharedInterceptor>,
     event_listener_factory: SharedEventListenerFactory,
     runtime: Arc<dyn Runtime>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     transport: TransportConfig,
     policy: PolicyConfig,
     dns_resolver: Arc<dyn DnsResolver>,
@@ -109,9 +112,27 @@ impl ClientBuilder {
 
     pub fn runtime<R>(mut self, runtime: R) -> Self
     where
-        R: Runtime,
+        R: Runtime + WireExecutor,
     {
-        self.runtime = Arc::new(runtime);
+        let runtime = Arc::new(runtime);
+        self.runtime = runtime.clone();
+        self.executor = runtime;
+        self
+    }
+
+    pub fn executor<E>(mut self, executor: E) -> Self
+    where
+        E: WireExecutor,
+    {
+        self.executor = Arc::new(executor);
+        self
+    }
+
+    pub fn timer<T>(mut self, timer: T) -> Self
+    where
+        T: Timer + Send + Sync + 'static,
+    {
+        self.timer = SharedTimer::new(timer);
         self
     }
 
@@ -304,6 +325,8 @@ impl ClientBuilder {
             connector,
             self.transport.clone(),
             self.runtime.clone(),
+            self.executor.clone(),
+            self.timer.clone(),
             exchange_finder,
             request_admission.clone(),
         );
@@ -330,11 +353,14 @@ impl ClientBuilder {
 
 impl Default for ClientBuilder {
     fn default() -> Self {
+        let runtime = Arc::new(TokioRuntime);
         Self {
             application_interceptors: Vec::new(),
             network_interceptors: Vec::new(),
             event_listener_factory: Arc::new(NoopEventListenerFactory),
-            runtime: Arc::new(TokioRuntime),
+            runtime: runtime.clone(),
+            executor: runtime,
+            timer: SharedTimer::new(TokioTimer::new()),
             transport: TransportConfig {
                 connect_timeout: None,
                 pool_idle_timeout: Some(Duration::from_secs(90)),

@@ -20,10 +20,10 @@ use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
     next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, CoalescingInfo,
-    ConnectionId, ConnectionInfo, DnsResolver, Exchange, RequestBody, ResponseBody, Runtime,
-    TcpConnector, TlsConnector, WireError,
+    ConnectionId, ConnectionInfo, DnsResolver, Exchange, HyperExecutor, RequestBody, ResponseBody,
+    Runtime, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
-use openwire_tokio::{TokioExecutor, TokioIo, TokioTimer};
+use openwire_tokio::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::Service;
 use tracing::instrument::WithSubscriber;
@@ -1531,6 +1531,8 @@ pub(crate) struct TransportService {
     connector: ConnectorStack,
     config: crate::client::TransportConfig,
     runtime: Arc<dyn Runtime>,
+    executor: Arc<dyn WireExecutor>,
+    timer: SharedTimer,
     exchange_finder: Arc<ExchangeFinder>,
     request_admission: RequestAdmissionLimiter,
     connection_limiter: ConnectionLimiter,
@@ -1544,6 +1546,8 @@ impl TransportService {
         connector: ConnectorStack,
         config: crate::client::TransportConfig,
         runtime: Arc<dyn Runtime>,
+        executor: Arc<dyn WireExecutor>,
+        timer: SharedTimer,
         exchange_finder: Arc<ExchangeFinder>,
         request_admission: RequestAdmissionLimiter,
     ) -> Self {
@@ -1557,6 +1561,8 @@ impl TransportService {
             connector,
             config,
             runtime,
+            executor,
+            timer,
             exchange_finder,
             request_admission,
             connection_limiter,
@@ -1762,7 +1768,13 @@ impl TransportService {
                 binding
             }
             ConnectionProtocol::Http2 => {
-                let (sender, task) = bind_http2(stream, &self.config).await?;
+                let (sender, task) = bind_http2(
+                    stream,
+                    &self.config,
+                    HyperExecutor(self.executor.clone()),
+                    self.timer.clone(),
+                )
+                .await?;
                 self.bindings.insert_http2(info.id, info, sender);
                 let binding = match self.bindings.acquire(connection.id()) {
                     BindingAcquireResult::Acquired(binding) => binding,
@@ -1857,7 +1869,7 @@ impl TransportService {
             }
             .instrument(span),
         );
-        match self.runtime.spawn(future) {
+        match self.executor.spawn(future) {
             Ok(handle) => {
                 self.connection_tasks.attach(task_id, handle);
                 Ok(())
@@ -1872,7 +1884,7 @@ impl TransportService {
     fn spawn_http2_task(
         &self,
         connection: crate::connection::RealConnection,
-        task: http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        task: http2::Connection<BoxConnection, RequestBody, HyperExecutor>,
         span: tracing::Span,
     ) -> Result<(), WireError> {
         let connection_id = connection.id();
@@ -1897,7 +1909,7 @@ impl TransportService {
             }
             .instrument(span),
         );
-        match self.runtime.spawn(future) {
+        match self.executor.spawn(future) {
             Ok(handle) => {
                 self.connection_tasks.attach(task_id, handle);
                 Ok(())
@@ -2387,15 +2399,17 @@ async fn bind_http1(
 async fn bind_http2(
     stream: BoxConnection,
     config: &crate::client::TransportConfig,
+    executor: HyperExecutor,
+    timer: SharedTimer,
 ) -> Result<
     (
         http2::SendRequest<RequestBody>,
-        http2::Connection<BoxConnection, RequestBody, TokioExecutor>,
+        http2::Connection<BoxConnection, RequestBody, HyperExecutor>,
     ),
     WireError,
 > {
-    let mut builder = http2::Builder::new(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
+    let mut builder = http2::Builder::new(executor);
+    builder.timer(timer);
     if let Some(interval) = config.http2_keep_alive_interval {
         builder.keep_alive_interval(interval);
         builder.keep_alive_while_idle(config.http2_keep_alive_while_idle);
@@ -2618,6 +2632,7 @@ mod tests {
 
     use openwire_core::{
         BoxFuture, BoxTaskHandle, CallContext, NoopEventListener, Runtime, TaskHandle, WireError,
+        WireExecutor,
     };
 
     use super::{
@@ -2947,6 +2962,12 @@ mod tests {
 
         fn sleep(&self, _duration: Duration) -> BoxFuture<()> {
             Box::pin(async {})
+        }
+    }
+
+    impl WireExecutor for CountingSpawnRuntime {
+        fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+            Runtime::spawn(self, future)
         }
     }
 

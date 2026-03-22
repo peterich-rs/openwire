@@ -19,7 +19,7 @@ pub use event::{
 pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,
 };
-pub use runtime::{BoxTaskHandle, Runtime, TaskHandle};
+pub use runtime::{BoxTaskHandle, HyperExecutor, Runtime, SharedTimer, TaskHandle, WireExecutor};
 pub use transport::{
     BoxConnection, CoalescingInfo, ConnectionInfo, ConnectionIo, DnsResolver, TcpConnector,
     TlsConnector,

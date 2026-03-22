@@ -18,6 +18,7 @@ use openwire::{
     TokioTcpConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
+use openwire_core::WireExecutor;
 use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
     RecordingEventListenerFactory, StaticDnsResolver,
@@ -3845,6 +3846,12 @@ impl Runtime for CountingRuntime {
     }
 }
 
+impl WireExecutor for CountingRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Runtime::spawn(self, future)
+    }
+}
+
 #[derive(Clone, Default)]
 struct SpawnFailingRuntime;
 
@@ -3858,6 +3865,12 @@ impl Runtime for SpawnFailingRuntime {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
         Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+impl WireExecutor for SpawnFailingRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Runtime::spawn(self, future)
     }
 }
 
@@ -3894,6 +3907,12 @@ impl Runtime for AbortCountingRuntime {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
         Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+impl WireExecutor for AbortCountingRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Runtime::spawn(self, future)
     }
 }
 

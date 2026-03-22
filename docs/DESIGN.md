@@ -100,12 +100,15 @@ Important extension traits:
 - `TcpConnector`
 - `TlsConnector`
 - `Runtime`
+- `WireExecutor`
 
 `ClientBuilder::default()` currently resolves to these concrete defaults:
 
 | Setting | Default |
 |---|---|
 | runtime | `TokioRuntime` |
+| executor | `TokioRuntime` |
+| timer | `TokioTimer` |
 | DNS | `SystemDnsResolver` |
 | TCP | `TokioTcpConnector` |
 | TLS | `RustlsTlsConnector::builder().build()?` when `tls-rustls` is enabled |
@@ -138,6 +141,7 @@ Extension boundary contracts:
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `Runtime` | `spawn(BoxFuture<()>) -> BoxTaskHandle` and `sleep(Duration)` | `crates/openwire-core` |
+| `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
 
 Current extension-point rules:
@@ -147,8 +151,9 @@ Current extension-point rules:
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- custom runtimes must return abort-capable `Runtime::spawn` handles for bound
-  connection background tasks
+- custom runtimes still own call-deadline and body-deadline sleep through `Runtime`
+- custom executors own bound-connection background-task spawning through `WireExecutor`
+- custom timers supply HTTP/2 binding timers through `ClientBuilder::timer(...)`
 
 ## 5. Service Chain Construction
 
@@ -422,7 +427,8 @@ Protocol-specific rules:
 
 Current default adapters:
 
-- Tokio runtime through `openwire-tokio` implementing `Runtime`
+- Tokio runtime through `openwire-tokio` implementing `Runtime` and `WireExecutor`
+- Tokio timer through `openwire-tokio::TokioTimer`
 - system DNS through `DnsResolver`
 - Tokio TCP through `TcpConnector`
 - Rustls through `TlsConnector`
@@ -438,8 +444,10 @@ Adapter boundaries that are part of the current code shape:
 - DNS resolution happens only through `DnsResolver`
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
-- background protocol tasks are spawned only through `Runtime::spawn`
-- `Runtime::spawn` must return a handle that can abort tracked background
+- HTTP/2 binding uses `HyperExecutor` over the configured `WireExecutor` plus
+  the configured `hyper::rt::Timer`
+- background protocol tasks are spawned only through `WireExecutor::spawn`
+- `WireExecutor::spawn` must return a handle that can abort tracked background
   protocol tasks during client shutdown
 - `call_timeout` uses the configured `Runtime` instead of directly calling
   Tokio timers

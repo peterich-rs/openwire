@@ -9,7 +9,7 @@ use hyper::rt::{Executor, Sleep, Timer};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
     next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, ConnectionInfo,
-    DnsResolver, Runtime, TaskHandle, TcpConnector, WireError,
+    DnsResolver, Runtime, TaskHandle, TcpConnector, WireError, WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
@@ -38,6 +38,12 @@ impl Runtime for TokioRuntime {
     }
 }
 
+impl WireExecutor for TokioRuntime {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Runtime::spawn(self, future)
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct TokioExecutor;
@@ -55,6 +61,14 @@ where
 {
     fn execute(&self, future: Fut) {
         tokio::spawn(future.with_current_subscriber());
+    }
+}
+
+impl WireExecutor for TokioExecutor {
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Ok(Box::new(TokioTaskHandle(tokio::spawn(
+            future.with_current_subscriber(),
+        ))))
     }
 }
 

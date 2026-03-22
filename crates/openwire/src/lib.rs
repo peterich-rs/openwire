@@ -14,9 +14,9 @@ pub use client::{Call, Client, ClientBuilder};
 pub use cookie::{CookieJar, Jar};
 pub use openwire_core::{
     BoxFuture, BoxTaskHandle, CallContext, CallId, ConnectionId, ConnectionInfo, DnsResolver,
-    EstablishmentStage, EventListener, EventListenerFactory, Exchange, Interceptor, Next,
-    NoopEventListener, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime, TaskHandle,
-    TcpConnector, TlsConnector, WireError, WireErrorKind,
+    EstablishmentStage, EventListener, EventListenerFactory, Exchange, HyperExecutor, Interceptor,
+    Next, NoopEventListener, NoopEventListenerFactory, RequestBody, ResponseBody, Runtime,
+    SharedTimer, TaskHandle, TcpConnector, TlsConnector, WireError, WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

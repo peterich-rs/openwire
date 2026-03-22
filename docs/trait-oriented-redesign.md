@@ -1,7 +1,7 @@
 # Trait-Oriented Redesign
 
 Date: 2026-03-22
-Status: Draft v6
+Status: Draft v7
 
 ## Main Sync Notes
 
@@ -157,7 +157,7 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 
 | Area | Current `main` baseline | Target end-state | Migration note |
 |------|--------------------------|------------------|----------------|
-| Runtime surface | `openwire-core` now exports only `Runtime` / `TaskHandle`; Tokio implementations already live in `openwire-tokio`, but `transport.rs` still hardcodes Tokio executor/timer for HTTP/2 binding | `openwire-core` exports only runtime-neutral traits and adapters; Tokio implementations stay in `openwire-tokio` | `M1` landed; `M2` replaces `Runtime` with the new executor surface |
+| Runtime surface | `openwire-core` now exports `Runtime`, `TaskHandle`, `WireExecutor`, `HyperExecutor`, and `SharedTimer`; `TransportService` now carries executor/timer inputs explicitly | `openwire-core` exports only the runtime-neutral surfaces needed by the framework; `Runtime` remains only if call/body deadlines still need it | `M2` landed additively; `M3` and `M6` remove the remaining `Runtime` dependency |
 | Tokio adapters | `SystemDnsResolver`, `TokioTcpConnector`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, and `TokioIo` already live in `openwire-tokio` | the same adapters remain in `openwire-tokio`, but the framework path stops depending on Tokio-specific APIs directly | `M1` landed without final feature-gating; preserve current DNS/connect event behavior exactly |
 | Transport Tokio leakage | fast fallback, CONNECT/SOCKS timeouts, tunnel I/O, and call/body deadlines still depend on Tokio-specific APIs or Tokio-owned helpers | framework path uses only `WireExecutor`, `hyper::rt::Timer`, and runtime-neutral I/O adapters | this is the critical-path de-Tokio work |
 | Policy traits | `CookieJar`, `Authenticator`, retry logic, and redirect decisions are still centered in `openwire` | traits and contexts move to `openwire-core`; orchestration and request mutation stay in `openwire` | preserve current body and redirect semantics byte-for-byte |
@@ -168,15 +168,15 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 | Milestone | Covers | Goal | Exit criteria |
 |------|--------|------|---------------|
 | `M1` | Phase 1 | create `openwire-tokio` and move Tokio-only adapters without behavior changes | completed on this branch: adapters live in `openwire-tokio`, defaults still work, and workspace callers import Tokio adapters from the new crate |
-| `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | `bind_http2` no longer hardcodes `TokioExecutor::new()` / `TokioTimer::new()` and owned connection tasks can be tracked through executor-returned task handles |
+| `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | completed on this branch: `WireExecutor`, `HyperExecutor`, and `SharedTimer` exist; `bind_http2` no longer hardcodes Tokio executor/timer construction; connection-task tracking uses the configured executor |
 | `M3` | Phase 2c-2h | remove the remaining framework Tokio leakage | non-test framework paths stop depending directly on `tokio::`; fast fallback, tunnels, call deadlines, and body deadlines all use runtime-neutral abstractions |
 | `M4` | Phases 3-4 | move policy traits into `openwire-core` | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps default policy impls and orchestration |
 | `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | `ConnectorStack` depends on `Arc<dyn RoutePlanner>` and public planning types are stable enough for custom planners |
 | `M6` | Phase 6 + cleanup | finish adapter interop and remove compatibility shims | `Runtime` and `openwire-core` Tokio re-exports are gone; docs and examples reflect the final crate boundaries |
 
-Updated recommended delivery order from the new baseline: `M2 -> M3 -> M4 -> M5 -> M6`.
-`M2` and `M3` are the critical path because every later cleanup depends on the
-runtime split being real rather than just crate reshuffling.
+Updated recommended delivery order from the new baseline: `M3 -> M4 -> M5 -> M6`.
+`M3` remains the critical path because the framework still uses Tokio-specific
+fast fallback, tunnel timeouts/I/O, and deadline helpers.
 
 ### Milestone Checklists
 
@@ -193,6 +193,10 @@ runtime split being real rather than just crate reshuffling.
 - make Tokio adapters implement the new executor surface in `openwire-tokio`
 - thread executor/timer inputs through `TransportService` construction and `bind_http2`
 - switch owned connection-task tracking to the executor-returned handle type before removing `Runtime`
+
+Current status: landed additively. `Runtime` still exists for call/body deadline
+handling, and `WireExecutor::spawn` currently remains fallible so the existing
+spawn-failure behavior stays testable during the transition.
 
 #### `M3` Checklist
 
@@ -272,15 +276,20 @@ pub trait TaskHandle: Send + Sync + 'static {
 pub type BoxTaskHandle = Box<dyn TaskHandle>;
 
 pub trait WireExecutor: Send + Sync + 'static {
-    fn spawn(&self, future: BoxFuture<()>) -> BoxTaskHandle;
+    fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError>;
 }
 ```
 
-`spawn` is modeled as infallible once the executor is constructed. Runtime setup
-and validation belong in the adapter crate / builder path, not in per-request
-transport code.
+Incremental-state note: after `M2`, `WireExecutor` is now present in the codebase,
+but it is still additive. `Runtime` has not been removed yet because call timeout
+and body-deadline helpers still depend on `Runtime::sleep`.
 
-`Runtime` is removed. `TokioRuntime` no longer exists as the old `spawn + sleep` trait impl.
+Final-state goal: once `M3` finishes migrating those deadline paths, `Runtime`
+can disappear and `WireExecutor::spawn` can be simplified if the compatibility
+error path is no longer worth preserving.
+
+`Runtime` is removed only in the end-state. At that point, `TokioRuntime` no
+longer exists as the old `spawn + sleep` trait impl.
 In openwire-tokio it may remain only as a convenience bundle around:
 - `TokioExecutor` for `WireExecutor`
 - `TokioTimer` for `hyper::rt::Timer`
@@ -319,6 +328,10 @@ where
 `TokioExecutor` continues to implement both `WireExecutor` and `Executor<Fut>` directly
 (avoids the extra boxing for the default path). `HyperExecutor` is the escape hatch for
 custom runtimes that only implement `WireExecutor`.
+
+Incremental-state note: the current implementation already threads `HyperExecutor`
+and a cloneable timer wrapper through `TransportService` for HTTP/2 binding, while
+still keeping `Runtime` for deadline code that has not been de-Tokioed yet.
 
 Rationale for location: `HyperExecutor` is runtime-neutral. Keeping it in openwire-core
 lets non-tokio runtimes use the adapter without pulling in openwire-tokio.
