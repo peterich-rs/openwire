@@ -1,12 +1,15 @@
+use std::cmp;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use futures_util::task::AtomicWaker;
 use http::header::HOST;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
@@ -582,6 +585,82 @@ struct ConnectResponseHead {
     status: StatusCode,
     status_line: String,
     headers: HeaderMap,
+    prefetched: Bytes,
+}
+
+struct PrefetchedTunnelBytes {
+    inner: BoxConnection,
+    prefetched: Option<Bytes>,
+}
+
+impl PrefetchedTunnelBytes {
+    fn new(inner: BoxConnection, prefetched: Bytes) -> Self {
+        Self {
+            inner,
+            prefetched: (!prefetched.is_empty()).then_some(prefetched),
+        }
+    }
+}
+
+impl Connection for PrefetchedTunnelBytes {
+    fn connected(&self) -> Connected {
+        self.inner.connected()
+    }
+}
+
+impl hyper::rt::Read for PrefetchedTunnelBytes {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        if let Some(mut prefetched) = this.prefetched.take() {
+            let copy_len = cmp::min(prefetched.len(), buf.remaining());
+            buf.put_slice(&prefetched[..copy_len]);
+            prefetched.advance(copy_len);
+            if !prefetched.is_empty() {
+                this.prefetched = Some(prefetched);
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl hyper::rt::Write for PrefetchedTunnelBytes {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+    }
 }
 
 async fn send_connect_request(
@@ -604,7 +683,10 @@ async fn send_connect_request(
 
     let head = read_connect_response(&mut stream, connect_timeout).await?;
     if head.status == StatusCode::OK {
-        return Ok(ConnectTunnelOutcome::Established(stream.into_inner()));
+        let stream = PrefetchedTunnelBytes::new(stream.into_inner(), head.prefetched);
+        return Ok(ConnectTunnelOutcome::Established(
+            Box::new(stream) as BoxConnection
+        ));
     }
 
     Ok(ConnectTunnelOutcome::Response(head))
@@ -652,7 +734,7 @@ async fn read_connect_response_inner(
 ) -> Result<ConnectResponseHead, WireError> {
     let mut response = Vec::with_capacity(1024);
     let mut buf = [0u8; 512];
-    loop {
+    let head_end = loop {
         let read = stream.read(&mut buf).await.map_err(|error| {
             WireError::proxy_tunnel("failed to read proxy CONNECT response", error)
         })?;
@@ -663,8 +745,8 @@ async fn read_connect_response_inner(
             ));
         }
         response.extend_from_slice(&buf[..read]);
-        if response.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(split_at) = find_connect_response_end(&response) {
+            break split_at;
         }
         if response.len() > 8192 {
             return Err(WireError::proxy_tunnel(
@@ -672,9 +754,9 @@ async fn read_connect_response_inner(
                 io::Error::new(io::ErrorKind::InvalidData, "proxy response too large"),
             ));
         }
-    }
-
-    parse_connect_response_head(&response)
+    };
+    let (head, prefetched) = split_connect_response_head(&response, head_end)?;
+    parse_connect_response_head(head, prefetched)
 }
 
 async fn socks5_write_client_greeting(
@@ -858,8 +940,28 @@ fn socks5_reply_reason(code: u8) -> &'static str {
     }
 }
 
-fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, WireError> {
-    let head = std::str::from_utf8(response).map_err(|error| {
+fn find_connect_response_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn split_connect_response_head(
+    response: &[u8],
+    head_end: usize,
+) -> Result<(&[u8], Bytes), WireError> {
+    Ok((
+        &response[..head_end],
+        Bytes::copy_from_slice(&response[head_end..]),
+    ))
+}
+
+fn parse_connect_response_head(
+    head: &[u8],
+    prefetched: Bytes,
+) -> Result<ConnectResponseHead, WireError> {
+    let head = std::str::from_utf8(head).map_err(|error| {
         WireError::proxy_tunnel("proxy CONNECT response was not valid UTF-8", error)
     })?;
     let head = head
@@ -909,6 +1011,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<ConnectResponseHead, W
         status,
         status_line,
         headers,
+        prefetched,
     })
 }
 
@@ -1241,11 +1344,13 @@ impl TransportService {
 
             ctx.listener().response_headers_start(&ctx);
             let (parts, body) = response.response.into_parts();
+            let deadline_expired = spawn_body_deadline_signal(self.runtime.clone(), &ctx)?;
             let body = ObservedIncomingBody::wrap(
                 body,
                 ctx.clone(),
                 attempt,
                 Some(response.release),
+                deadline_expired,
                 self.exchange_finder.clone(),
                 tracing::Span::current(),
             );
@@ -1314,29 +1419,49 @@ impl TransportService {
             info.id, route, protocol, coalescing,
         );
         let _ = connection.try_acquire();
-        self.exchange_finder.pool().insert(connection.clone());
 
-        match protocol {
+        let binding = match protocol {
             ConnectionProtocol::Http1 => {
                 let (sender, task) = bind_http1(stream).await?;
                 self.bindings.insert_http1(info.id, info, sender);
-                self.spawn_http1_task(connection.clone(), task, span)?;
+                let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
+                    self.bindings.remove(connection.id());
+                    WireError::internal(
+                        "freshly bound HTTP/1 connection was not available for request execution",
+                        io::Error::other(
+                            "bound HTTP/1 connection missing immediately after insert",
+                        ),
+                    )
+                })?;
+                self.exchange_finder.pool().insert(connection.clone());
+                if let Err(error) = self.spawn_http1_task(connection.clone(), task, span) {
+                    self.bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    return Err(error);
+                }
+                binding
             }
             ConnectionProtocol::Http2 => {
                 let (sender, task) = bind_http2(stream, &self.config).await?;
                 self.bindings.insert_http2(info.id, info, sender);
-                self.spawn_http2_task(connection.clone(), task, span)?;
+                let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
+                    self.bindings.remove(connection.id());
+                    WireError::internal(
+                        "freshly bound HTTP/2 connection was not available for request execution",
+                        io::Error::other(
+                            "bound HTTP/2 connection missing immediately after insert",
+                        ),
+                    )
+                })?;
+                self.exchange_finder.pool().insert(connection.clone());
+                if let Err(error) = self.spawn_http2_task(connection.clone(), task, span) {
+                    self.bindings.remove(connection.id());
+                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    return Err(error);
+                }
+                binding
             }
-        }
-
-        let binding = self.bindings.acquire(connection.id()).ok_or_else(|| {
-            self.bindings.remove(connection.id());
-            let _ = self.exchange_finder.pool().remove(connection.id());
-            WireError::internal(
-                "freshly bound connection was not available for request execution",
-                io::Error::other("bound connection missing immediately after insert"),
-            )
-        })?;
+        };
 
         Ok(SelectedConnection {
             connection,
@@ -1479,6 +1604,7 @@ struct ObservedIncomingBody {
     attempt: u32,
     bytes_read: u64,
     release: Option<ResponseLease>,
+    deadline_signal: Option<Arc<BodyDeadlineSignal>>,
     exchange_finder: Arc<ExchangeFinder>,
     span: tracing::Span,
     finished: bool,
@@ -1490,6 +1616,7 @@ impl ObservedIncomingBody {
         ctx: CallContext,
         attempt: u32,
         release: Option<ResponseLease>,
+        deadline_signal: Option<Arc<BodyDeadlineSignal>>,
         exchange_finder: Arc<ExchangeFinder>,
         span: tracing::Span,
     ) -> ResponseBody {
@@ -1500,6 +1627,7 @@ impl ObservedIncomingBody {
                 attempt,
                 bytes_read: 0,
                 release,
+                deadline_signal,
                 exchange_finder,
                 span,
                 finished: false,
@@ -1543,7 +1671,31 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
-        self.discard_connection();
+        abandon_response_lease(self.release.take(), &self.ctx, &self.exchange_finder);
+    }
+
+    fn poll_deadline(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, WireError>>> {
+        let Some(deadline_signal) = self.deadline_signal.as_ref() else {
+            return Poll::Pending;
+        };
+        if !deadline_signal.expired.load(Ordering::Relaxed) {
+            deadline_signal.waker.register(cx.waker());
+            if !deadline_signal.expired.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+        }
+
+        let deadline = self
+            .ctx
+            .deadline()
+            .expect("deadline signal exists only when call timeout is configured");
+        let timeout = deadline.saturating_duration_since(self.ctx.created_at());
+        let error = WireError::timeout(format!("call timed out after {timeout:?}"));
+        self.finish_with_error(&error);
+        Poll::Ready(Some(Err(error)))
     }
 
     fn release_connection(&mut self) {
@@ -1607,6 +1759,64 @@ impl ObservedIncomingBody {
     }
 }
 
+struct BodyDeadlineSignal {
+    expired: AtomicBool,
+    waker: AtomicWaker,
+}
+
+fn abandon_response_lease(
+    release: Option<ResponseLease>,
+    ctx: &CallContext,
+    exchange_finder: &Arc<ExchangeFinder>,
+) {
+    if let Some(release) = release {
+        match release {
+            ResponseLease::Http1 {
+                connection,
+                bindings,
+                ..
+            } => {
+                bindings.remove(connection.id());
+                let _ = exchange_finder.pool().remove(connection.id());
+                ctx.listener().connection_released(ctx, connection.id());
+            }
+            ResponseLease::Http2 { connection } => {
+                let _ = exchange_finder.release(&connection);
+                ctx.listener().connection_released(ctx, connection.id());
+            }
+        }
+    }
+}
+
+fn spawn_body_deadline_signal(
+    runtime: Arc<dyn Runtime>,
+    ctx: &CallContext,
+) -> Result<Option<Arc<BodyDeadlineSignal>>, WireError> {
+    let Some(deadline) = ctx.deadline() else {
+        return Ok(None);
+    };
+
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let signal = Arc::new(BodyDeadlineSignal {
+        expired: AtomicBool::new(false),
+        waker: AtomicWaker::new(),
+    });
+    if remaining == Duration::ZERO {
+        signal.expired.store(true, Ordering::Relaxed);
+        return Ok(Some(signal));
+    }
+
+    let sleep_runtime = runtime.clone();
+    let signal_task = signal.clone();
+    runtime.spawn(Box::pin(async move {
+        sleep_runtime.sleep(remaining).await;
+        signal_task.expired.store(true, Ordering::Relaxed);
+        signal_task.waker.wake();
+    }))?;
+
+    Ok(Some(signal))
+}
+
 impl Drop for ObservedIncomingBody {
     fn drop(&mut self) {
         self.finish_abandoned();
@@ -1622,6 +1832,12 @@ impl Body for ObservedIncomingBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(result) = this.poll_deadline(cx) {
+            return Poll::Ready(result);
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -1852,16 +2068,35 @@ fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp;
     use std::collections::HashMap;
+    use std::io;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
+    use bytes::Bytes;
+    use futures_util::task::noop_waker_ref;
+    use hyper::rt::{Read, ReadBuf, Write};
+    use hyper_util::client::legacy::connect::Connected;
     use tracing::field::{Field, Visit};
     use tracing::{Id, Subscriber};
     use tracing_subscriber::layer::{Context as LayerContext, Layer};
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::registry::LookupSpan;
 
-    use super::{record_fast_fallback_trace, FastFallbackOutcome};
+    use openwire_core::{CallContext, NoopEventListener};
+
+    use super::{
+        abandon_response_lease, parse_connect_response_head, record_fast_fallback_trace,
+        split_connect_response_head, FastFallbackOutcome, PrefetchedTunnelBytes,
+    };
+    use crate::connection::ConnectionPool;
+    use crate::connection::{
+        Address, AuthorityKey, ConnectionProtocol, DnsPolicy, PoolSettings, ProtocolPolicy,
+        RealConnection, Route, UriScheme,
+    };
+    use crate::proxy::ProxySelector;
 
     #[derive(Clone, Debug)]
     struct CapturedSpan {
@@ -2001,6 +2236,211 @@ mod tests {
         assert_eq!(
             span.fields.get("connect_winner").map(String::as_str),
             Some("1")
+        );
+    }
+
+    fn make_address() -> Address {
+        Address::new(
+            UriScheme::Https,
+            AuthorityKey::new("example.com", 443),
+            None,
+            None,
+            ProtocolPolicy::Http1OrHttp2,
+            DnsPolicy::System,
+        )
+    }
+
+    fn make_connection(protocol: ConnectionProtocol) -> RealConnection {
+        let route = Route::direct(
+            make_address(),
+            std::net::SocketAddr::from(([192, 0, 2, 10], 443)),
+        );
+        RealConnection::new(route, protocol)
+    }
+
+    fn make_call_context() -> CallContext {
+        CallContext::new(Arc::new(NoopEventListener), None)
+    }
+
+    struct ScriptedConnection {
+        reads: Vec<u8>,
+        read_pos: usize,
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl ScriptedConnection {
+        fn new(reads: &[u8]) -> Self {
+            Self {
+                reads: reads.to_vec(),
+                read_pos: 0,
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl hyper_util::client::legacy::connect::Connection for ScriptedConnection {
+        fn connected(&self) -> Connected {
+            Connected::new()
+        }
+    }
+
+    impl Read for ScriptedConnection {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            mut buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.read_pos >= this.reads.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let copy_len = cmp::min(buf.remaining(), this.reads.len() - this.read_pos);
+            buf.put_slice(&this.reads[this.read_pos..this.read_pos + copy_len]);
+            this.read_pos += copy_len;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Write for ScriptedConnection {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.writes
+                .lock()
+                .expect("scripted writes lock")
+                .extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            false
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let written = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+            let this = self.get_mut();
+            let mut writes = this.writes.lock().expect("scripted writes lock");
+            for buf in bufs {
+                writes.extend_from_slice(buf);
+            }
+            Poll::Ready(Ok(written))
+        }
+    }
+
+    fn poll_read_exact<T>(io: &mut T, out: &mut [u8])
+    where
+        T: Read + Unpin,
+    {
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let mut read_buf = ReadBuf::new(out);
+        let result = Pin::new(io).poll_read(&mut cx, read_buf.unfilled());
+        match result {
+            Poll::Ready(Ok(())) => assert_eq!(read_buf.filled().len(), out.len()),
+            Poll::Ready(Err(error)) => panic!("unexpected read error: {error}"),
+            Poll::Pending => panic!("unexpected pending read"),
+        }
+    }
+
+    #[test]
+    fn parse_connect_response_head_preserves_prefetched_tunnel_bytes() {
+        let response =
+            b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: openwire\r\n\r\n\x00\xffprefetch";
+        let split_at = super::find_connect_response_end(response).expect("split");
+        let (head, prefetched) =
+            split_connect_response_head(response, split_at).expect("connect response split");
+        let parsed = parse_connect_response_head(head, prefetched.clone()).expect("parsed");
+
+        assert_eq!(parsed.status, http::StatusCode::OK);
+        assert_eq!(parsed.status_line, "HTTP/1.1 200 Connection Established");
+        assert_eq!(
+            parsed
+                .headers
+                .get("proxy-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("openwire")
+        );
+        assert_eq!(parsed.prefetched, prefetched);
+        assert_eq!(parsed.prefetched, Bytes::from_static(b"\x00\xffprefetch"));
+    }
+
+    #[test]
+    fn parse_connect_response_head_ignores_407_body_bytes_in_same_read() {
+        let response = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 4\r\n\r\nbody";
+        let split_at = super::find_connect_response_end(response).expect("split");
+        let (head, prefetched) =
+            split_connect_response_head(response, split_at).expect("connect response split");
+        let parsed = parse_connect_response_head(head, prefetched.clone()).expect("parsed");
+
+        assert_eq!(
+            parsed.status,
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+        assert_eq!(
+            parsed
+                .headers
+                .get("proxy-authenticate")
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic realm=\"proxy\"")
+        );
+        assert_eq!(parsed.prefetched, Bytes::from_static(b"body"));
+        assert_eq!(parsed.prefetched, prefetched);
+    }
+
+    #[test]
+    fn prefetched_tunnel_bytes_replays_prefetched_bytes_before_stream() {
+        let inner = Box::new(ScriptedConnection::new(b"world")) as openwire_core::BoxConnection;
+        let mut stream = PrefetchedTunnelBytes::new(inner, Bytes::from_static(b"hello"));
+
+        let mut first = [0u8; 5];
+        poll_read_exact(&mut stream, &mut first);
+        assert_eq!(&first, b"hello");
+
+        let mut second = [0u8; 5];
+        poll_read_exact(&mut stream, &mut second);
+        assert_eq!(&second, b"world");
+    }
+
+    #[test]
+    fn abandoned_http2_lease_does_not_poison_the_session() {
+        let connection = make_connection(ConnectionProtocol::Http2);
+        assert!(connection.try_acquire());
+        let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
+            Arc::new(ConnectionPool::new(PoolSettings::default())),
+            ProxySelector::new(Vec::new()),
+        ));
+        abandon_response_lease(
+            Some(super::ResponseLease::Http2 {
+                connection: connection.clone(),
+            }),
+            &make_call_context(),
+            &exchange_finder,
+        );
+
+        let snapshot = connection.snapshot();
+        assert_eq!(
+            snapshot.health,
+            crate::connection::ConnectionHealth::Healthy
+        );
+        assert_eq!(
+            snapshot.allocation,
+            crate::connection::ConnectionAllocationState::Idle
         );
     }
 }

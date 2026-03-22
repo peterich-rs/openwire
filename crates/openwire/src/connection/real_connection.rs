@@ -166,6 +166,11 @@ impl RealConnection {
         }
     }
 
+    pub(crate) fn is_healthy(&self) -> bool {
+        let state = self.inner.state.lock().expect("real connection lock");
+        state.health == ConnectionHealth::Healthy
+    }
+
     pub(crate) fn close(&self) {
         let mut state = self.inner.state.lock().expect("real connection lock");
         state.health = ConnectionHealth::Closed;
@@ -174,7 +179,8 @@ impl RealConnection {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.snapshot().health == ConnectionHealth::Closed
+        let state = self.inner.state.lock().expect("real connection lock");
+        state.health == ConnectionHealth::Closed
     }
 
     #[cfg(test)]
@@ -248,11 +254,13 @@ mod tests {
 
         connection.mark_unhealthy();
         assert_eq!(connection.snapshot().health, ConnectionHealth::Unhealthy);
+        assert!(!connection.is_healthy());
 
         connection.close();
         let snapshot = connection.snapshot();
         assert_eq!(snapshot.health, ConnectionHealth::Closed);
         assert_eq!(snapshot.allocation, ConnectionAllocationState::Closed);
+        assert!(!connection.is_healthy());
         assert!(snapshot.idle_since.is_none());
     }
 

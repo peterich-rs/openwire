@@ -1,6 +1,6 @@
 # OpenWire Technical Design
 
-Date: 2026-03-21
+Date: 2026-03-22
 
 This is the canonical architecture document for OpenWire. Keep it short,
 current, and focused on the code that exists today.
@@ -28,6 +28,10 @@ openwire/
 ├── crates/openwire-test     test support
 └── docs/
     ├── DESIGN.md            canonical technical design
+    ├── REVIEW_REMEDIATION_DESIGN.md
+    │                        implementation design for 2026-03 review findings
+    ├── REVIEW_REMEDIATION_TASKS.md
+    │                        execution tracker for the 2026-03 remediation work
     └── tasks.md             deferred follow-on tracker
 ```
 
@@ -296,6 +300,8 @@ Pool and reuse rules:
 - `TransportService::try_acquire_coalesced()` performs the secondary HTTPS
   HTTP/2 coalesced lookup after route planning on miss path
 - `ObservedIncomingBody` drives `ConnectionPool::release()` on body completion
+- abandoning an HTTP/2 response body releases only the stream allocation; it
+  does not poison the whole session
 - broken HTTP/1.1 exchanges remove the connection instead of returning it to
   idle reuse
 
@@ -309,7 +315,7 @@ Operational invariants:
 - `ConnectionPool::remove()` always closes the removed connection
 - `ConnectionPool::release()` is valid only for connections that were
   previously acquired
-- pool pruning may evict only closed connections or idle HTTP/1.1 connections
+- pool pruning evicts non-healthy connections and idle HTTP/1.1 connections
   past `idle_timeout`
 - HTTP/2 connections are not subject to HTTP/1.1 idle eviction rules
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
@@ -339,6 +345,8 @@ connect_route_plan(...)
   -> RealConnection::with_id_and_coalescing(...)
   -> bind_http1(...) or bind_http2(...)
   -> ConnectionBindings::insert_http1(...) or insert_http2(...)
+  -> ConnectionBindings::acquire(...) for the current request
+  -> ConnectionPool::insert(...)
   -> spawn_http1_task(...) or spawn_http2_task(...)
 ```
 
@@ -346,6 +354,8 @@ Protocol-specific rules:
 
 - HTTP/1.1 uses one active exchange per connection
 - HTTP/2 reuses a bound sender for multiple exchanges
+- CONNECT tunnel setup preserves any bytes already read past the proxy response
+  header block before handing the stream to TLS or HTTP
 - spawned background connection tasks remove bindings and pool entries on
   termination
 - `record_fast_fallback_trace()` writes `route_count`,
@@ -373,6 +383,10 @@ Adapter boundaries that are part of the current code shape:
 - TCP establishment happens only through `TcpConnector`
 - TLS establishment happens only through `TlsConnector`
 - background protocol tasks are spawned only through `Runtime::spawn`
+- `call_timeout` uses the configured `Runtime` instead of directly calling
+  Tokio timers
+- response-body deadline enforcement uses the same logical call deadline as the
+  request future
 - request policy code does not depend on Tokio-specific networking primitives
 
 ## 10. Observability And Verification
@@ -479,6 +493,8 @@ Retryability contracts:
   retried by connection-failure policy
 - retry-on-connection-failure applies only when the request snapshot is
   replayable
+- canceled requests are retried only when `retry_canceled_requests` is enabled
+  and the request snapshot is replayable
 - non-retryable TCP / TLS / proxy-tunnel establishment failures terminate the
   current retry or race path immediately
 

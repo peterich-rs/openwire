@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -10,6 +11,19 @@ pub struct Proxy {
     target: Url,
     intercept: ProxyIntercept,
     no_proxy: Option<NoProxy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProxyRuleId(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProxySelection {
+    pub(crate) id: ProxyRuleId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProxySelector {
+    proxies: Arc<[Proxy]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +115,37 @@ impl Proxy {
 
     pub(crate) fn target(&self) -> &Url {
         &self.target
+    }
+}
+
+impl ProxySelector {
+    pub(crate) fn new(proxies: Vec<Proxy>) -> Self {
+        Self {
+            proxies: Arc::<[Proxy]>::from(proxies),
+        }
+    }
+
+    pub(crate) fn first_match(&self, uri: &http::Uri) -> Option<(&Proxy, ProxySelection)> {
+        self.proxies
+            .iter()
+            .enumerate()
+            .find(|(_, proxy)| proxy.matches(uri))
+            .map(|(index, proxy)| {
+                (
+                    proxy,
+                    ProxySelection {
+                        id: ProxyRuleId(index),
+                    },
+                )
+            })
+    }
+
+    pub(crate) fn select(&self, uri: &http::Uri) -> Option<&Proxy> {
+        self.first_match(uri).map(|(proxy, _selection)| proxy)
+    }
+
+    pub(crate) fn selection_for(&self, uri: &http::Uri) -> Option<ProxySelection> {
+        self.first_match(uri).map(|(_proxy, selection)| selection)
     }
 }
 
@@ -388,7 +433,9 @@ fn normalize_domain_suffix(suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_no_proxy, system_proxies_from_iter, Proxy, ProxyIntercept};
+    use http::Request;
+
+    use super::{parse_no_proxy, system_proxies_from_iter, Proxy, ProxyIntercept, ProxySelector};
 
     #[test]
     fn system_proxy_parser_uses_stable_variable_precedence() {
@@ -455,5 +502,52 @@ mod tests {
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].target.scheme(), "socks5");
         assert_eq!(proxies[0].intercept, ProxyIntercept::All);
+    }
+
+    #[test]
+    fn proxy_selector_prefers_first_matching_rule_and_honors_no_proxy() {
+        let primary = Proxy::all("http://first.test:8080")
+            .expect("first proxy")
+            .no_proxy(parse_no_proxy("api.example.com").expect("no_proxy"));
+        let fallback = Proxy::all("http://second.test:8080").expect("fallback proxy");
+        let selector = ProxySelector::new(vec![primary, fallback]);
+
+        let direct_uri = Request::builder()
+            .uri("http://service.example.com/resource")
+            .body(())
+            .expect("request")
+            .uri()
+            .clone();
+        assert_eq!(
+            selector
+                .select(&direct_uri)
+                .map(|proxy| proxy.target().host_str()),
+            Some(Some("first.test"))
+        );
+
+        let bypassed_uri = Request::builder()
+            .uri("http://api.example.com/resource")
+            .body(())
+            .expect("request")
+            .uri()
+            .clone();
+        assert_eq!(
+            selector
+                .select(&bypassed_uri)
+                .map(|proxy| proxy.target().host_str()),
+            Some(Some("second.test"))
+        );
+        assert_eq!(
+            selector.selection_for(&direct_uri),
+            Some(super::ProxySelection {
+                id: super::ProxyRuleId(0),
+            })
+        );
+        assert_eq!(
+            selector.selection_for(&bypassed_uri),
+            Some(super::ProxySelection {
+                id: super::ProxyRuleId(1),
+            })
+        );
     }
 }

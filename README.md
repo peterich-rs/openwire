@@ -31,6 +31,8 @@ Rustls.
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
+- [docs/REVIEW_REMEDIATION_DESIGN.md](docs/REVIEW_REMEDIATION_DESIGN.md): implementation design for the 2026-03 review findings
+- [docs/REVIEW_REMEDIATION_TASKS.md](docs/REVIEW_REMEDIATION_TASKS.md): step-by-step execution tracker for the remediation work
 - [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
 
 ## Quick Start

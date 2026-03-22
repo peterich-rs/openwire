@@ -18,6 +18,7 @@ use crate::auth::{
     SharedAuthenticator,
 };
 use crate::cookie::SharedCookieJar;
+use crate::proxy::ProxySelector;
 use crate::trace::PolicyTraceContext;
 
 #[derive(Clone)]
@@ -40,6 +41,7 @@ pub(crate) struct AuthPolicyConfig {
 pub(crate) struct RetryPolicyConfig {
     pub(crate) retry_on_connection_failure: bool,
     pub(crate) max_retries: usize,
+    pub(crate) retry_canceled_requests: bool,
 }
 
 #[derive(Clone)]
@@ -52,11 +54,20 @@ pub(crate) struct RedirectPolicyConfig {
 pub(crate) struct FollowUpPolicyService {
     network: BoxWireService,
     config: PolicyConfig,
+    proxy_selector: ProxySelector,
 }
 
 impl FollowUpPolicyService {
-    pub(crate) fn new(network: BoxWireService, config: PolicyConfig) -> Self {
-        Self { network, config }
+    pub(crate) fn new(
+        network: BoxWireService,
+        config: PolicyConfig,
+        proxy_selector: ProxySelector,
+    ) -> Self {
+        Self {
+            network,
+            config,
+            proxy_selector,
+        }
     }
 }
 
@@ -72,6 +83,7 @@ impl Service<Exchange> for FollowUpPolicyService {
     fn call(&mut self, exchange: Exchange) -> Self::Future {
         let network = self.network.clone();
         let config = self.config.clone();
+        let proxy_selector = self.proxy_selector.clone();
         Box::pin(async move {
             let (mut request, ctx, mut attempt) = exchange.into_parts();
             let mut policy_trace = request
@@ -181,16 +193,17 @@ impl Service<Exchange> for FollowUpPolicyService {
                             response.status(),
                             next_uri,
                             policy_trace,
+                            &proxy_selector,
                         )?;
                         redirects += 1;
                         attempt = next_attempt;
                     }
                     Err(error) => {
-                        let Some(reason) = retry_reason(&error) else {
+                        let Some(reason) = retry_reason(&error, &config.retry) else {
                             return Err(error);
                         };
 
-                        if !config.retry.retry_on_connection_failure
+                        if (reason != "canceled" && !config.retry.retry_on_connection_failure)
                             || retries as usize >= config.retry.max_retries
                             || !snapshot.is_replayable()
                         {
@@ -372,8 +385,11 @@ impl RequestSnapshot {
         status: StatusCode,
         next_uri: Uri,
         policy_trace: PolicyTraceContext,
+        proxy_selector: &ProxySelector,
     ) -> Result<Request<RequestBody>, WireError> {
-        let same_authority = same_authority(&self.uri, &next_uri);
+        let same_origin = same_origin(&self.uri, &next_uri)?;
+        let same_proxy =
+            proxy_selector.selection_for(&self.uri) == proxy_selector.selection_for(&next_uri);
         let should_switch_to_get = matches!(
             status,
             StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
@@ -405,8 +421,11 @@ impl RequestSnapshot {
 
         let mut headers = self.headers;
         headers.remove(HOST);
-        if !same_authority {
+        if !same_origin {
             headers.remove(AUTHORIZATION);
+            headers.remove(COOKIE);
+        }
+        if !same_proxy {
             headers.remove(PROXY_AUTHORIZATION);
         }
         if should_switch_to_get {
@@ -467,11 +486,47 @@ fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri, WireError> {
         .map_err(|error| WireError::redirect(format!("failed to parse redirect URI: {error}")))
 }
 
-fn same_authority(left: &Uri, right: &Uri) -> bool {
-    left.scheme_str() == right.scheme_str() && left.authority() == right.authority()
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OriginKey {
+    scheme: &'static str,
+    host: String,
+    port: u16,
 }
 
-fn retry_reason(error: &WireError) -> Option<&'static str> {
+impl OriginKey {
+    fn from_uri(uri: &Uri) -> Result<Self, WireError> {
+        let scheme = match uri.scheme_str() {
+            Some("http") => "http",
+            Some("https") => "https",
+            Some(other) => {
+                return Err(WireError::invalid_request(format!(
+                    "request URI scheme must be http or https, found {other}"
+                )));
+            }
+            None => {
+                return Err(WireError::invalid_request(
+                    "request URI is missing a scheme",
+                ))
+            }
+        };
+        let host = uri
+            .host()
+            .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?
+            .to_ascii_lowercase();
+        let port = uri.port_u16().unwrap_or(match scheme {
+            "http" => 80,
+            "https" => 443,
+            _ => unreachable!("validated scheme"),
+        });
+        Ok(Self { scheme, host, port })
+    }
+}
+
+fn same_origin(left: &Uri, right: &Uri) -> Result<bool, WireError> {
+    Ok(OriginKey::from_uri(left)? == OriginKey::from_uri(right)?)
+}
+
+fn retry_reason(error: &WireError, config: &RetryPolicyConfig) -> Option<&'static str> {
     match error.establishment_stage() {
         Some(EstablishmentStage::Dns) if error.is_retryable_establishment() => return Some("dns"),
         Some(EstablishmentStage::Tcp) if error.is_connect_timeout() => {
@@ -495,10 +550,135 @@ fn retry_reason(error: &WireError) -> Option<&'static str> {
     }
 
     match error.kind() {
+        WireErrorKind::Canceled if config.retry_canceled_requests => Some("canceled"),
         WireErrorKind::Dns => Some("dns"),
         WireErrorKind::Connect if !error.is_non_retryable_connect() => Some("connect"),
         WireErrorKind::Tls => Some("tls"),
         WireErrorKind::Timeout if error.is_connect_timeout() => Some("connect_timeout"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    use http::{HeaderValue, Request, StatusCode};
+
+    use super::{same_origin, PolicyTraceContext, RequestSnapshot};
+    use crate::proxy::{NoProxy, Proxy, ProxySelector};
+    use crate::RequestBody;
+
+    fn snapshot_with_headers(uri: &str, headers: &[(&http::HeaderName, &str)]) -> RequestSnapshot {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(RequestBody::empty())
+            .expect("request");
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                (*name).clone(),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        RequestSnapshot::capture(&request)
+    }
+
+    #[test]
+    fn same_origin_normalizes_default_ports() {
+        let implicit = "http://example.com/path".parse().expect("implicit uri");
+        let explicit = "http://example.com:80/other".parse().expect("explicit uri");
+        assert!(same_origin(&implicit, &explicit).expect("same origin"));
+    }
+
+    #[test]
+    fn redirect_to_same_origin_default_port_preserves_authorization() {
+        let snapshot = snapshot_with_headers(
+            "http://example.com/start",
+            &[(&AUTHORIZATION, "Bearer secret")],
+        );
+
+        let request = snapshot
+            .into_redirect_request(
+                StatusCode::FOUND,
+                "http://example.com:80/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                &ProxySelector::new(Vec::new()),
+            )
+            .expect("redirect request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret")
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_drops_explicit_cookie_header() {
+        let snapshot = snapshot_with_headers("http://source.test/start", &[(&COOKIE, "manual=1")]);
+
+        let request = snapshot
+            .into_redirect_request(
+                StatusCode::FOUND,
+                "http://target.test/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                &ProxySelector::new(Vec::new()),
+            )
+            .expect("redirect request");
+
+        assert!(request.headers().get(COOKIE).is_none());
+    }
+
+    #[test]
+    fn cross_origin_redirect_through_same_proxy_preserves_proxy_authorization() {
+        let snapshot = snapshot_with_headers(
+            "http://source.test/start",
+            &[(&PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")],
+        );
+        let proxy_selector =
+            ProxySelector::new(vec![Proxy::http("http://proxy.test:8080").expect("proxy")]);
+
+        let request = snapshot
+            .into_redirect_request(
+                StatusCode::FOUND,
+                "http://target.test/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                &proxy_selector,
+            )
+            .expect("redirect request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(PROXY_AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic cHJveHk6c2VjcmV0")
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_to_different_proxy_drops_proxy_authorization() {
+        let snapshot = snapshot_with_headers(
+            "http://source.test/start",
+            &[(&PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")],
+        );
+        let proxy_selector = ProxySelector::new(vec![
+            Proxy::http("http://first.test:8080")
+                .expect("first proxy")
+                .no_proxy(NoProxy::new().domain("target.test")),
+            Proxy::http("http://second.test:8080").expect("second proxy"),
+        ]);
+
+        let request = snapshot
+            .into_redirect_request(
+                StatusCode::FOUND,
+                "http://target.test/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                &proxy_selector,
+            )
+            .expect("redirect request");
+
+        assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
     }
 }

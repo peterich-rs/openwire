@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::Request;
 use openwire_core::{ConnectionId, ConnectionInfo, RequestBody, WireError};
 
-use crate::proxy::Proxy;
+use crate::proxy::{Proxy, ProxySelector};
 
 use super::{
     Address, ConnectionAllocationState, ConnectionPool, ConnectionProtocol, RealConnection, Route,
@@ -65,12 +65,15 @@ impl ObservedConnection {
 #[derive(Clone, Debug)]
 pub(crate) struct ExchangeFinder {
     pool: Arc<ConnectionPool>,
-    proxies: Vec<Proxy>,
+    proxy_selector: ProxySelector,
 }
 
 impl ExchangeFinder {
-    pub(crate) fn new(pool: Arc<ConnectionPool>, proxies: Vec<Proxy>) -> Self {
-        Self { pool, proxies }
+    pub(crate) fn new(pool: Arc<ConnectionPool>, proxy_selector: ProxySelector) -> Self {
+        Self {
+            pool,
+            proxy_selector,
+        }
     }
 
     pub(crate) fn pool(&self) -> &Arc<ConnectionPool> {
@@ -143,7 +146,7 @@ impl ExchangeFinder {
     }
 
     fn matching_proxy(&self, uri: &http::Uri) -> Option<&Proxy> {
-        self.proxies.iter().find(|proxy| proxy.matches(uri))
+        self.proxy_selector.select(uri)
     }
 }
 
@@ -160,6 +163,7 @@ mod tests {
         Address, AuthorityKey, ConnectionAllocationState, ConnectionProtocol, DnsPolicy,
         PoolSettings, ProtocolPolicy, RealConnection, Route, UriScheme,
     };
+    use crate::proxy::{NoProxy, Proxy, ProxySelector};
 
     fn make_address() -> Address {
         Address::new(
@@ -189,7 +193,7 @@ mod tests {
         assert!(connection.try_acquire());
         assert!(connection.release());
         pool.insert(connection.clone());
-        let finder = ExchangeFinder::new(pool, Vec::new());
+        let finder = ExchangeFinder::new(pool, ProxySelector::new(Vec::new()));
 
         let request = Request::builder()
             .uri("http://example.com/resource")
@@ -214,7 +218,7 @@ mod tests {
         assert!(connection.try_acquire());
         assert!(connection.release());
         pool.insert(connection.clone());
-        let finder = ExchangeFinder::new(pool, Vec::new());
+        let finder = ExchangeFinder::new(pool, ProxySelector::new(Vec::new()));
 
         let request = Request::builder()
             .uri("http://example.com/resource")
@@ -249,7 +253,7 @@ mod tests {
         let connection = RealConnection::new(route, ConnectionProtocol::Http2);
         assert!(connection.try_acquire());
         pool.insert(connection.clone());
-        let finder = ExchangeFinder::new(pool, Vec::new());
+        let finder = ExchangeFinder::new(pool, ProxySelector::new(Vec::new()));
 
         let prepared = PreparedExchange {
             address: make_address(),
@@ -270,6 +274,34 @@ mod tests {
         assert_eq!(
             observed.connection().snapshot().allocation,
             ConnectionAllocationState::InUse { allocations: 2 }
+        );
+    }
+
+    #[test]
+    fn exchange_finder_uses_shared_proxy_selection_order() {
+        let pool = Arc::new(crate::connection::ConnectionPool::new(
+            PoolSettings::default(),
+        ));
+        let primary = Proxy::all("http://first.test:8080")
+            .expect("primary proxy")
+            .no_proxy(NoProxy::new().domain("api.example.com"));
+        let fallback = Proxy::all("http://second.test:8080").expect("fallback proxy");
+        let finder = ExchangeFinder::new(pool, ProxySelector::new(vec![primary, fallback]));
+
+        let direct_uri = "http://service.example.com/resource".parse().expect("uri");
+        assert_eq!(
+            finder
+                .matching_proxy_for_uri(&direct_uri)
+                .map(|proxy| proxy.target().host_str()),
+            Some(Some("first.test"))
+        );
+
+        let bypassed_uri = "http://api.example.com/resource".parse().expect("uri");
+        assert_eq!(
+            finder
+                .matching_proxy_for_uri(&bypassed_uri)
+                .map(|proxy| proxy.target().host_str()),
+            Some(Some("second.test"))
         );
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use http::{Request, Response};
 use openwire_core::{
     BoxWireService, CallContext, DnsResolver, EventListenerFactory, Exchange, InterceptorLayer,
@@ -20,7 +21,7 @@ use crate::cookie::{CookieJar, SharedCookieJar};
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
-use crate::proxy::{system_proxies_from_env, Proxy};
+use crate::proxy::{system_proxies_from_env, Proxy, ProxySelector};
 use crate::transport::{ConnectorStack, SystemDnsResolver, TokioTcpConnector, TransportService};
 
 #[derive(Clone)]
@@ -47,7 +48,6 @@ pub(crate) struct TransportConfig {
     pub(crate) pool_max_idle_per_host: usize,
     pub(crate) http2_keep_alive_interval: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: bool,
-    pub(crate) retry_canceled_requests: bool,
 }
 
 pub struct ClientBuilder {
@@ -219,7 +219,7 @@ impl ClientBuilder {
     }
 
     pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
-        self.transport.retry_canceled_requests = enabled;
+        self.policy.retry.retry_canceled_requests = enabled;
         self
     }
 
@@ -245,7 +245,8 @@ impl ClientBuilder {
             idle_timeout: self.transport.pool_idle_timeout,
             max_idle_per_address: self.transport.pool_max_idle_per_host,
         }));
-        let exchange_finder = Arc::new(ExchangeFinder::new(pool, proxies.clone()));
+        let proxy_selector = ProxySelector::new(proxies);
+        let exchange_finder = Arc::new(ExchangeFinder::new(pool, proxy_selector.clone()));
         let connector = ConnectorStack {
             dns_resolver: self.dns_resolver,
             tcp_connector: self.tcp_connector,
@@ -267,6 +268,7 @@ impl ClientBuilder {
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
+            proxy_selector,
         );
 
         Ok(Client {
@@ -293,7 +295,6 @@ impl Default for ClientBuilder {
                 pool_max_idle_per_host: usize::MAX,
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
-                retry_canceled_requests: false,
             },
             policy: PolicyConfig {
                 call_timeout: None,
@@ -306,6 +307,7 @@ impl Default for ClientBuilder {
                 retry: RetryPolicyConfig {
                     retry_on_connection_failure: true,
                     max_retries: 1,
+                    retry_canceled_requests: false,
                 },
                 redirect: RedirectPolicyConfig {
                     follow_redirects: true,
@@ -373,15 +375,9 @@ impl Call {
                     .await
             };
 
-            let result = match ctx
-                .deadline()
-                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
-            {
-                Some(timeout) => tokio::time::timeout(timeout, execute)
-                    .await
-                    .map_err(|_| WireError::timeout(format!("call timed out after {timeout:?}")))?,
-                None => execute.await,
-            };
+            let result =
+                with_call_deadline(self.client.inner.runtime.clone(), ctx.deadline(), execute)
+                    .await;
 
             match result {
                 Ok(response) => {
@@ -405,6 +401,7 @@ fn build_service_chain(
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     policy: PolicyConfig,
+    proxy_selector: ProxySelector,
 ) -> BoxWireService {
     let mut network: BoxWireService = BoxCloneSyncService::new(transport);
     for interceptor in network_interceptors.iter().rev() {
@@ -416,11 +413,35 @@ fn build_service_chain(
     );
 
     let mut service: BoxWireService =
-        BoxCloneSyncService::new(FollowUpPolicyService::new(network, policy));
+        BoxCloneSyncService::new(FollowUpPolicyService::new(network, policy, proxy_selector));
     for interceptor in application_interceptors.iter().rev() {
         service =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
     }
 
     service
+}
+
+async fn with_call_deadline<F>(
+    runtime: Arc<dyn Runtime>,
+    deadline: Option<std::time::Instant>,
+    future: F,
+) -> Result<Response<ResponseBody>, WireError>
+where
+    F: std::future::Future<Output = Result<Response<ResponseBody>, WireError>>,
+{
+    let Some(deadline) = deadline else {
+        return future.await;
+    };
+
+    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+    let future = Box::pin(future);
+    let sleep = runtime.sleep(timeout);
+
+    match select(future, sleep).await {
+        Either::Left((result, _sleep)) => result,
+        Either::Right((_ready, _future)) => Err(WireError::timeout(format!(
+            "call timed out after {timeout:?}"
+        ))),
+    }
 }

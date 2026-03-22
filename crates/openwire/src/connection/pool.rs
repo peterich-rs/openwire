@@ -212,7 +212,8 @@ fn prune_address(
 
 fn prune_connections(settings: &PoolSettings, connections: &mut Vec<RealConnection>) {
     connections.retain(|connection| {
-        if connection.is_closed() {
+        if !connection.is_healthy() {
+            connection.close();
             return false;
         }
 
@@ -362,9 +363,9 @@ mod tests {
 
     use super::{ConnectionPool, PoolSettings, PoolStats};
     use crate::connection::{
-        Address, AuthorityKey, ConnectionAllocationState, ConnectionProtocol, DnsPolicy,
-        ProtocolPolicy, ProxyConfig, ProxyEndpoint, ProxyMode, ProxyScheme, RealConnection, Route,
-        RoutePlan, UriScheme,
+        Address, AuthorityKey, ConnectionAllocationState, ConnectionHealth, ConnectionProtocol,
+        DnsPolicy, ProtocolPolicy, ProxyConfig, ProxyEndpoint, ProxyMode, ProxyScheme,
+        RealConnection, Route, RoutePlan, UriScheme,
     };
 
     fn address_for_host(
@@ -684,6 +685,23 @@ mod tests {
         assert!(pool.remove(oldest.id()).is_none());
         assert!(pool.remove(middle.id()).is_some());
         assert!(pool.remove(newest.id()).is_some());
+    }
+
+    #[test]
+    fn pool_prunes_unhealthy_connections_on_touch() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection = make_connection(address.clone(), 24);
+        let connection_id = connection.id();
+        pool.insert(connection.clone());
+
+        connection.mark_unhealthy();
+
+        assert_eq!(pool.stats(&address), PoolStats::default());
+        assert!(pool.acquire(&address).is_none());
+        assert!(pool.get_by_id(&address, connection_id).is_none());
+        assert!(pool.remove(connection_id).is_none());
+        assert_eq!(connection.snapshot().health, ConnectionHealth::Closed);
     }
 
     #[test]
