@@ -43,6 +43,7 @@ User API
 - Offload research, exploration, and parallel analysis to subagents
 - For complex problems, throw more compute at it via subagents
 - One task per subagent for focused execution
+- Default subagent configuration is model `gpt-5.4-mini` with reasoning effort `high`
 
 ## 3. Autonomous Documentation Maintenance
 - Maintain documentation proactively after ANY implementation change — do not wait to be asked
