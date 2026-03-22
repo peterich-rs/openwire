@@ -10,6 +10,11 @@ mod trace;
 mod transport;
 
 pub use client::{Call, Client, ClientBuilder};
+pub use connection::{
+    Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
+    ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,
+    TlsIdentity, UriScheme,
+};
 pub use cookie::Jar;
 pub use openwire_core::{
     AuthContext, AuthKind, Authenticator, BoxFuture, BoxTaskHandle, CallContext, CallId,

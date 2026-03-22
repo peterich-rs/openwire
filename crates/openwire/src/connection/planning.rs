@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::Uri;
@@ -600,6 +601,23 @@ pub trait RoutePlanner: Send + Sync + 'static {
         address: &Address,
         resolved_addrs: Vec<SocketAddr>,
     ) -> Result<RoutePlan, WireError>;
+}
+
+impl<T> RoutePlanner for Arc<T>
+where
+    T: RoutePlanner + ?Sized,
+{
+    fn dns_target(&self, address: &Address) -> (String, u16) {
+        (**self).dns_target(address)
+    }
+
+    fn plan(
+        &self,
+        address: &Address,
+        resolved_addrs: Vec<SocketAddr>,
+    ) -> Result<RoutePlan, WireError> {
+        (**self).plan(address, resolved_addrs)
+    }
 }
 
 #[derive(Clone, Debug)]

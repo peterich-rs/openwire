@@ -17,11 +17,12 @@ pub(crate) use limits::{
 };
 pub use planning::{
     Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
-    ProxyEndpoint, ProxyMode, ProxyScheme, Route, RoutePlan, RoutePlanner, TlsIdentity, UriScheme,
+    ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,
+    TlsIdentity, UriScheme,
 };
 pub(crate) use planning::{
     ConnectAttempt, ConnectAttemptState, ConnectFailure, ConnectFailureStage, ConnectPlan,
-    DnsResolution, RouteFamily, RouteKind,
+    DnsResolution, RouteKind,
 };
 pub(crate) use pool::{ConnectionPool, PoolSettings, PoolStats};
 pub(crate) use real_connection::{

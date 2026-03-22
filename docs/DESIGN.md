@@ -55,7 +55,7 @@ Source-file map for the main runtime path:
 | `crates/openwire/src/bridge.rs` | `BridgeInterceptor`, request normalization |
 | `crates/openwire/src/transport.rs` | `TransportService`, `ConnectorStack`, direct binding, response-body release |
 | `crates/openwire/src/connection/exchange_finder.rs` | `ExchangeFinder`, pool-hit / miss preparation |
-| `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner` |
+| `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner`, `DefaultRoutePlanner` |
 | `crates/openwire/src/connection/limits.rs` | `RequestAdmissionLimiter`, `ConnectionLimiter`, `ConnectionPermit` |
 | `crates/openwire/src/connection/fast_fallback.rs` | `FastFallbackDialer`, `ConnectPlan` |
 | `crates/openwire/src/connection/pool.rs` | `ConnectionPool` |
@@ -96,9 +96,12 @@ Important extension traits:
 - `EventListener` / `EventListenerFactory`
 - `CookieJar`
 - `Authenticator`
+- `RetryPolicy`
+- `RedirectPolicy`
 - `DnsResolver`
 - `TcpConnector`
 - `TlsConnector`
+- `RoutePlanner`
 - `Runtime`
 - `WireExecutor`
 - `hyper::rt::Timer`
@@ -138,9 +141,12 @@ Extension boundary contracts:
 |---|---|---|
 | `CookieJar` | `set_cookies(&mut Iterator<Item=&HeaderValue>, &Url)` and `cookies(&Url) -> Option<HeaderValue>` | `crates/openwire-core/src/cookie.rs` |
 | `Authenticator` | `authenticate(AuthContext) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>>` | `crates/openwire-core/src/auth.rs` |
+| `RetryPolicy` | `should_retry(&RetryContext) -> Option<&'static str>` | `crates/openwire-core/src/policy.rs` |
+| `RedirectPolicy` | `should_redirect(&RedirectContext) -> RedirectDecision` | `crates/openwire-core/src/policy.rs` |
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
+| `RoutePlanner` | `dns_target(&Address) -> (String, u16)` and `plan(&Address, Vec<SocketAddr>) -> Result<RoutePlan, WireError>` | `crates/openwire/src/connection/planning.rs` |
 | `Runtime` | legacy compatibility surface retained by `ClientBuilder::runtime()` / `Client::runtime()` | `crates/openwire-core` |
 | `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
 | `hyper::rt::Timer` | `sleep`, `sleep_until`, `reset`, `now` | external trait configured through `ClientBuilder::timer(...)` |
@@ -277,7 +283,7 @@ Key internal types:
 - `RealConnection`: owned live connection state
 - `ConnectionPool`: reusable connection storage and eviction policy
 - `ExchangeFinder`: pool lookup plus miss-path acquisition coordinator
-- `RoutePlanner`: direct and proxy route construction
+- `RoutePlanner`: replaceable direct and proxy route construction
 - `FastFallbackDialer`: staged TCP racing plus route-local finalization across
   direct and proxy candidates
 
@@ -327,14 +333,15 @@ TransportService::bind_fresh_connection(...)
     -> connect_via_socks_proxy(...) for `RouteKind::SocksProxy`
 ```
 
-Current `RoutePlanner::default()` uses a fixed fast-fallback stagger of
+Current `DefaultRoutePlanner::default()` uses a fixed fast-fallback stagger of
 `Duration::from_millis(250)`.
 
 Route ownership rules:
 
 - `RoutePlanner::dns_target()` resolves the proxy endpoint when a proxy is
   configured, otherwise resolves the origin authority
-- `RoutePlanner::plan_*()` always returns an ordered `RoutePlan`
+- `DefaultRoutePlanner::plan_*()` always returns an ordered `RoutePlan`
+- `RoutePlan` carries the fast-fallback stagger consumed by the shared dialer
 - proxy URL credentials are parsed once on `Proxy` construction and carried
   through `ProxyConfig` / `RouteKind` instead of being re-read from raw URLs in
   transport code

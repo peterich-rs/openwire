@@ -161,7 +161,7 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 | Tokio adapters | `SystemDnsResolver`, `TokioTcpConnector`, `TokioRuntime`, `TokioExecutor`, `TokioTimer`, and `TokioIo` already live in `openwire-tokio` | the same adapters remain in `openwire-tokio`, but the framework path stops depending on Tokio-specific APIs directly | `M1` landed without final feature-gating; preserve current DNS/connect event behavior exactly |
 | Transport Tokio leakage | non-test framework paths now avoid direct `tokio::` usage; fast fallback, CONNECT/SOCKS timeouts, tunnel I/O, call deadlines, body deadlines, and admission control all use framework-owned abstractions or external traits | keep direct Tokio references confined to `openwire-tokio` and tests | `M3` landed; remaining cleanup is about compatibility surfaces, not runtime leakage |
 | Policy traits | `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` now live in `openwire-core`; `openwire` keeps `Jar`, default retry/redirect implementations, and follow-up orchestration | keep policy traits in core while request mutation and follow-up orchestration stay in `openwire` | `M4` landed additively; next work is route-planning extraction |
-| Planning surface | `ConnectorStack` stores a concrete `RoutePlanner` struct | route planning becomes a replaceable `Arc<dyn RoutePlanner>` boundary in `openwire` | keep proxy credential propagation and shared route-plan fast fallback intact |
+| Planning surface | `ConnectorStack` now stores `Arc<dyn RoutePlanner>` and `openwire` re-exports `Address`, `Route`, `RoutePlan`, and `DefaultRoutePlanner` for custom planners | keep route planning as a replaceable `openwire` boundary while leaving the rest of transport concrete | `M5` landed additively; remaining cleanup is runtime compatibility removal |
 
 ## Delivery Milestones
 
@@ -171,10 +171,10 @@ and break compatibility with any code that expects `Connected`. The cost of keep
 | `M2` | Phase 2a-2b | add the runtime-neutral executor surface and generic HTTP/2 binding path | completed on this branch: `WireExecutor`, `HyperExecutor`, and `SharedTimer` exist; `bind_http2` no longer hardcodes Tokio executor/timer construction; connection-task tracking uses the configured executor |
 | `M3` | Phase 2c-2h | remove the remaining framework Tokio leakage | completed on this branch: non-test framework paths no longer depend directly on `tokio::`; fast fallback, tunnels, call deadlines, body deadlines, and admission control all use runtime-neutral abstractions |
 | `M4` | Phases 3-4 | move policy traits into `openwire-core` | completed on this branch: `CookieJar`, `Authenticator`, `RetryPolicy`, and `RedirectPolicy` live in core while `openwire` keeps `Jar`, default policy impls, and orchestration |
-| `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | `ConnectorStack` depends on `Arc<dyn RoutePlanner>` and public planning types are stable enough for custom planners |
+| `M5` | Phase 5 | turn route planning into a replaceable strategy boundary | completed on this branch: `ConnectorStack` depends on `Arc<dyn RoutePlanner>`, `DefaultRoutePlanner` implements the trait, and public planning types are re-exported from `openwire` |
 | `M6` | Phase 6 + cleanup | finish adapter interop and remove compatibility shims | `Runtime` and `openwire-core` Tokio re-exports are gone; docs and examples reflect the final crate boundaries |
 
-Updated recommended delivery order from the new baseline: `M5 -> M6`.
+Updated recommended delivery order from the new baseline: `M6`.
 The remaining work is now architectural cleanup and trait-boundary extraction,
 not framework-path Tokio removal.
 
@@ -226,6 +226,12 @@ redirect/body semantics remain covered by unit and integration tests.
 - decide the minimum public surface for `Address`, `RoutePlan`, and related planning types
 - keep proxy credential propagation and the shared route-plan fast-fallback contract unchanged
 - verify that custom planners still cannot bypass `TransportService` ownership boundaries
+
+Current status: landed on this branch. `RoutePlanner` is now a public trait in
+`openwire`, `DefaultRoutePlanner` preserves the existing planning behavior,
+`ClientBuilder::route_planner(...)` accepts custom strategies, and transport
+coverage includes a custom-planner unit test in addition to existing direct and
+proxy integration paths.
 
 #### `M6` Checklist
 
@@ -677,7 +683,6 @@ openwire-core would require decoupling Address from proxy types — unnecessary 
 pub trait RoutePlanner: Send + Sync + 'static {
     fn dns_target(&self, address: &Address) -> (String, u16);
     fn plan(&self, address: &Address, resolved: Vec<SocketAddr>) -> Result<RoutePlan, WireError>;
-    fn fast_fallback_stagger(&self) -> Duration;
 }
 ```
 
@@ -686,7 +691,12 @@ ProxyMode-based route kind, proxy-credential propagation into route kinds,
 alternating IPv4/IPv6 for Happy Eyeballs, and a route plan that remains usable
 by the shared fast-fallback dialer across direct and proxy candidates.
 
-`Address` and `RoutePlan` become `pub` (currently `pub(crate)`).
+`Address`, `Route`, `RoutePlan`, `AuthorityKey`, `ProxyConfig`, `ProxyEndpoint`,
+`ProxyMode`, `ProxyScheme`, `TlsIdentity`, `ProtocolPolicy`, `DnsPolicy`, and
+`UriScheme` are now public and re-exported from `openwire`.
+`RoutePlan` continues to carry the fast-fallback stagger consumed by the shared
+dialer, so custom planners can tune stagger behavior by choosing the `RoutePlan`
+they return.
 `ConnectorStack` changes from:
 ```rust
 route_planner: RoutePlanner
