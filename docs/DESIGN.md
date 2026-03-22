@@ -101,6 +101,7 @@ Important extension traits:
 - `TlsConnector`
 - `Runtime`
 - `WireExecutor`
+- `hyper::rt::Timer`
 
 `ClientBuilder::default()` currently resolves to these concrete defaults:
 
@@ -140,8 +141,9 @@ Extension boundary contracts:
 | `DnsResolver` | `resolve(CallContext, host, port) -> BoxFuture<Result<Vec<SocketAddr>, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TcpConnector` | `connect(CallContext, SocketAddr, Option<Duration>) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
 | `TlsConnector` | `connect(CallContext, Uri, BoxConnection) -> BoxFuture<Result<BoxConnection, WireError>>` | `crates/openwire-core/src/transport.rs` |
-| `Runtime` | `spawn(BoxFuture<()>) -> BoxTaskHandle` and `sleep(Duration)` | `crates/openwire-core` |
+| `Runtime` | legacy compatibility surface retained by `ClientBuilder::runtime()` / `Client::runtime()` | `crates/openwire-core` |
 | `WireExecutor` | `spawn(BoxFuture<()>) -> Result<BoxTaskHandle, WireError>` | `crates/openwire-core/src/runtime.rs` |
+| `hyper::rt::Timer` | `sleep`, `sleep_until`, `reset`, `now` | external trait configured through `ClientBuilder::timer(...)` |
 | `EventListenerFactory` | `create(&Request<RequestBody>) -> SharedEventListener` | `crates/openwire-core/src/event.rs` |
 
 Current extension-point rules:
@@ -151,9 +153,9 @@ Current extension-point rules:
 - `DnsResolver`, `TcpConnector`, and `TlsConnector` may affect route execution
   but must not bypass `TransportService`
 - `EventListener` is observational only and must not mutate request execution
-- custom runtimes still own call-deadline and body-deadline sleep through `Runtime`
+- `Runtime` is now a compatibility handle kept on `Client`; framework execution no longer depends on it
 - custom executors own bound-connection background-task spawning through `WireExecutor`
-- custom timers supply HTTP/2 binding timers through `ClientBuilder::timer(...)`
+- custom timers supply call deadlines, body deadlines, CONNECT/SOCKS timeouts, and HTTP/2 binding timers through `ClientBuilder::timer(...)`
 
 ## 5. Service Chain Construction
 
@@ -449,11 +451,11 @@ Adapter boundaries that are part of the current code shape:
 - background protocol tasks are spawned only through `WireExecutor::spawn`
 - `WireExecutor::spawn` must return a handle that can abort tracked background
   protocol tasks during client shutdown
-- `call_timeout` uses the configured `Runtime` instead of directly calling
-  Tokio timers
+- `call_timeout`, response-body deadlines, and proxy tunnel timeouts use the
+  configured `hyper::rt::Timer`
 - response-body deadline enforcement uses the same logical call deadline as the
   request future, with a release/acquire timeout signal between the spawned
-  sleep task and body polling
+  timer task and body polling
 - request policy code does not depend on Tokio-specific networking primitives
 
 ## 10. Observability And Verification

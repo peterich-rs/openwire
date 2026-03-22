@@ -18,7 +18,8 @@ json = ["openwire-core/json"]
 bytes.workspace = true
 cookie = "0.18.0"
 cookie_store = { version = "0.21.1", default-features = false, features = ["public_suffix"] }
-futures-util.workspace = true
+futures-channel.workspace = true
+futures-util = { workspace = true, features = ["io"] }
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true

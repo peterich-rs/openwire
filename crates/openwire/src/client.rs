@@ -41,6 +41,7 @@ pub struct Client {
 struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
     runtime: Arc<dyn Runtime>,
+    timer: SharedTimer,
     call_timeout: Option<Duration>,
     proxy_selector: ProxySelector,
     request_admission: RequestAdmissionLimiter,
@@ -316,6 +317,8 @@ impl ClientBuilder {
             tcp_connector: self.tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
+            executor: self.executor.clone(),
+            timer: self.timer.clone(),
             route_planner: RoutePlanner::default(),
             proxy_authenticator: self.policy.auth.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
@@ -324,7 +327,6 @@ impl ClientBuilder {
         let transport = TransportService::new(
             connector,
             self.transport.clone(),
-            self.runtime.clone(),
             self.executor.clone(),
             self.timer.clone(),
             exchange_finder,
@@ -342,6 +344,7 @@ impl ClientBuilder {
             inner: Arc::new(ClientInner {
                 event_listener_factory: self.event_listener_factory,
                 runtime: self.runtime,
+                timer: self.timer,
                 call_timeout: self.policy.call_timeout,
                 proxy_selector,
                 request_admission,
@@ -461,8 +464,7 @@ impl Call {
             };
 
             let result =
-                with_call_deadline(self.client.inner.runtime.clone(), ctx.deadline(), execute)
-                    .await;
+                with_call_deadline(self.client.inner.timer.clone(), ctx.deadline(), execute).await;
 
             match result {
                 Ok(response) => {
@@ -525,7 +527,7 @@ fn build_service_chain(
 }
 
 async fn with_call_deadline<F>(
-    runtime: Arc<dyn Runtime>,
+    timer: SharedTimer,
     deadline: Option<std::time::Instant>,
     future: F,
 ) -> Result<Response<ResponseBody>, WireError>
@@ -538,7 +540,7 @@ where
 
     let timeout = deadline.saturating_duration_since(std::time::Instant::now());
     let future = Box::pin(future);
-    let sleep = runtime.sleep(timeout);
+    let sleep = timer.sleep(timeout);
 
     match select(future, sleep).await {
         Either::Left((result, _sleep)) => result,
