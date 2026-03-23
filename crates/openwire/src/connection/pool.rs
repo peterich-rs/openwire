@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openwire_core::ConnectionId;
@@ -33,15 +33,16 @@ pub(crate) struct PoolStats {
     pub(crate) in_use: usize,
 }
 
-#[derive(Debug)]
 pub(crate) struct ConnectionPool {
     settings: PoolSettings,
     state: Mutex<PoolState>,
+    insert_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Default)]
 struct PoolState {
     by_address: HashMap<Address, Vec<RealConnection>>,
+    by_id: HashMap<ConnectionId, Address>,
     coalesced_by_target: HashMap<SocketAddr, Vec<RealConnection>>,
 }
 
@@ -50,6 +51,7 @@ impl ConnectionPool {
         Self {
             settings,
             state: Mutex::new(PoolState::default()),
+            insert_hook: Mutex::new(None),
         }
     }
 
@@ -57,16 +59,27 @@ impl ConnectionPool {
         &self.settings
     }
 
+    pub(crate) fn set_insert_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *lock_mutex(&self.insert_hook) = Some(hook);
+    }
+
     pub(crate) fn insert(&self, connection: RealConnection) {
         let address = connection.address().clone();
-        let mut state = lock_mutex(&self.state);
-        state
-            .by_address
-            .entry(address.clone())
-            .or_default()
-            .push(connection.clone());
-        index_connection(&mut state.coalesced_by_target, &connection);
-        prune_address(&self.settings, &mut state, &address);
+        {
+            let mut state = lock_mutex(&self.state);
+            state
+                .by_address
+                .entry(address.clone())
+                .or_default()
+                .push(connection.clone());
+            register_connection(&mut state, &connection);
+            prune_address(&self.settings, &mut state, &address);
+        }
+
+        let insert_hook = lock_mutex(&self.insert_hook).clone();
+        if let Some(hook) = insert_hook {
+            hook();
+        }
     }
 
     pub(crate) fn acquire(&self, address: &Address) -> Option<RealConnection> {
@@ -150,6 +163,9 @@ impl ConnectionPool {
         if !prune_address(&self.settings, &mut state, address) {
             return None;
         }
+        if state.by_id.get(&connection_id) != Some(address) {
+            return None;
+        }
 
         state.by_address.get(address).and_then(|connections| {
             connections
@@ -168,6 +184,9 @@ impl ConnectionPool {
         if !prune_address(&self.settings, &mut state, address) {
             return None;
         }
+        if state.by_id.get(&connection_id) != Some(address) {
+            return None;
+        }
 
         let connections = state.by_address.get_mut(address)?;
         connections.iter().find_map(|connection| {
@@ -178,38 +197,31 @@ impl ConnectionPool {
 
     pub(crate) fn remove(&self, connection_id: ConnectionId) -> Option<RealConnection> {
         let mut state = lock_mutex(&self.state);
-        let keys = state.by_address.keys().cloned().collect::<Vec<_>>();
+        let address = state.by_id.remove(&connection_id)?;
+        let mut removed = None;
+        let mut should_remove_key = false;
 
-        for key in keys {
-            let mut removed = None;
-            let mut should_remove_key = false;
-
-            if let Some(connections) = state.by_address.get_mut(&key) {
-                if let Some(index) = connections
-                    .iter()
-                    .position(|conn| conn.id() == connection_id)
-                {
-                    let connection = connections.remove(index);
-                    connection.close();
-                    removed = Some(connection);
-                }
-                should_remove_key = connections.is_empty();
+        if let Some(connections) = state.by_address.get_mut(&address) {
+            if let Some(index) = connections
+                .iter()
+                .position(|conn| conn.id() == connection_id)
+            {
+                let connection = connections.remove(index);
+                connection.close();
+                removed = Some(connection);
             }
-
-            if should_remove_key {
-                state.by_address.remove(&key);
-            }
-
-            if let Some(ref connection) = removed {
-                remove_index_connection(&mut state.coalesced_by_target, connection);
-            }
-
-            if removed.is_some() {
-                return removed;
-            }
+            should_remove_key = connections.is_empty();
         }
 
-        None
+        if should_remove_key {
+            state.by_address.remove(&address);
+        }
+
+        if let Some(ref connection) = removed {
+            remove_index_connection(&mut state.coalesced_by_target, connection);
+        }
+
+        removed
     }
 
     pub(crate) fn stats(&self, address: &Address) -> PoolStats {
@@ -233,6 +245,22 @@ impl ConnectionPool {
                 stats
             })
     }
+
+    pub(crate) fn prune_all(&self) {
+        let mut state = lock_mutex(&self.state);
+        let addresses = state.by_address.keys().cloned().collect::<Vec<_>>();
+        for address in addresses {
+            prune_address(&self.settings, &mut state, &address);
+        }
+    }
+}
+
+impl std::fmt::Debug for ConnectionPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPool")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 fn prune_address(settings: &PoolSettings, state: &mut PoolState, address: &Address) -> bool {
@@ -246,7 +274,7 @@ fn prune_address(settings: &PoolSettings, state: &mut PoolState, address: &Addre
     };
 
     for connection in &removed {
-        remove_index_connection(&mut state.coalesced_by_target, connection);
+        unregister_connection(state, connection);
     }
 
     if empty {
@@ -429,6 +457,18 @@ fn direct_route_targets(route_plan: &RoutePlan) -> Vec<SocketAddr> {
     targets
 }
 
+fn register_connection(state: &mut PoolState, connection: &RealConnection) {
+    state
+        .by_id
+        .insert(connection.id(), connection.address().clone());
+    index_connection(&mut state.coalesced_by_target, connection);
+}
+
+fn unregister_connection(state: &mut PoolState, connection: &RealConnection) {
+    state.by_id.remove(&connection.id());
+    remove_index_connection(&mut state.coalesced_by_target, connection);
+}
+
 fn index_connection(
     index: &mut HashMap<SocketAddr, Vec<RealConnection>>,
     connection: &RealConnection,
@@ -577,6 +617,10 @@ mod tests {
         let connection = make_connection(address.clone(), 10);
         let connection_id = connection.id();
         pool.insert(connection.clone());
+        assert_eq!(
+            lock_mutex(&pool.state).by_id.get(&connection_id),
+            Some(&address)
+        );
 
         assert_eq!(
             pool.stats(&address),
@@ -616,6 +660,7 @@ mod tests {
 
         let removed = pool.remove(connection_id).expect("connection should exist");
         assert_eq!(removed.id(), connection_id);
+        assert!(!lock_mutex(&pool.state).by_id.contains_key(&connection_id));
         assert_eq!(pool.stats(&address), PoolStats::default());
     }
 
@@ -864,6 +909,7 @@ mod tests {
         assert!(pool.acquire(&address).is_none());
         assert!(pool.get_by_id(&address, connection_id).is_none());
         assert!(pool.remove(connection_id).is_none());
+        assert!(!lock_mutex(&pool.state).by_id.contains_key(&connection_id));
         assert_eq!(connection.snapshot().health, ConnectionHealth::Closed);
     }
 
@@ -920,6 +966,65 @@ mod tests {
         assert!(!lock_mutex(&pool.state)
             .coalesced_by_target
             .contains_key(&target));
+    }
+
+    #[test]
+    fn pool_prune_all_removes_expired_idle_connections_and_syncs_indices() {
+        let address = address_for_host("a.test", None, ProtocolPolicy::Http1OrHttp2);
+        let connection = make_connection_with_protocol_and_coalescing(
+            address.clone(),
+            41,
+            ConnectionProtocol::Http2,
+            &["a.test", "b.test"],
+        );
+        let connection_id = connection.id();
+        let target = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 41), 443));
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_idle_per_address: usize::MAX,
+        });
+        pool.insert(connection.clone());
+        connection.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(6)));
+
+        pool.prune_all();
+
+        let state = lock_mutex(&pool.state);
+        assert!(!state.by_address.contains_key(&address));
+        assert!(!state.by_id.contains_key(&connection_id));
+        assert!(!state.coalesced_by_target.contains_key(&target));
+    }
+
+    #[test]
+    fn pool_prune_all_reaps_idle_addresses_without_future_traffic() {
+        let stale_address = address_for_host("stale.test", None, ProtocolPolicy::Http1OrHttp2);
+        let live_address = address_for_host("live.test", None, ProtocolPolicy::Http1OrHttp2);
+        let stale = make_connection(stale_address.clone(), 51);
+        let live = make_connection(live_address.clone(), 52);
+        let stale_id = stale.id();
+        let live_id = live.id();
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_idle_per_address: usize::MAX,
+        });
+        pool.insert(stale.clone());
+        pool.insert(live.clone());
+        stale.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(6)));
+        live.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(2)));
+
+        pool.prune_all();
+
+        assert_eq!(pool.stats(&stale_address), PoolStats::default());
+        assert_eq!(
+            pool.stats(&live_address),
+            PoolStats {
+                total: 1,
+                idle: 1,
+                in_use: 0,
+            }
+        );
+        let state = lock_mutex(&pool.state);
+        assert!(!state.by_id.contains_key(&stale_id));
+        assert_eq!(state.by_id.get(&live_id), Some(&live_address));
     }
 
     #[test]
