@@ -3,7 +3,7 @@
 Date: 2026-03-23
 PR: `PR2`
 Branch: `refactor/pool-reaper-and-by-id-index`
-Status: planned
+Status: implemented
 
 ## Scope
 

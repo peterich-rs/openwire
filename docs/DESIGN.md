@@ -322,8 +322,9 @@ Current connection-core rules:
   request or response `Connection: close` directive disables pooling
 - HTTP/2 reuse is admitted by bound-sender readiness instead of a separate fixed
   local stream cap
-- HTTP/1.1 idle timeout and max-idle limits are enforced opportunistically on
-  pool touch points; there is no background sweeper today
+- HTTP/1.1 idle timeout and max-idle limits are still enforced on foreground
+  pool touch points, and a best-effort background reaper now calls whole-pool
+  prune passes so idle addresses can age out without future traffic
 
 Exact planning and acquisition path:
 
@@ -389,10 +390,15 @@ Operational invariants:
 - `RealConnection::release()` increments `completed_exchanges` and restores
   `idle_since` only when the allocation count reaches zero
 - `ConnectionPool::remove()` always closes the removed connection
+- `ConnectionPool` keeps a `ConnectionId -> Address` reverse index so exact-id
+  removals do not scan every address bucket
 - `ConnectionPool::release()` is valid only for connections that were
   previously acquired
 - pool pruning evicts non-healthy connections and idle HTTP/1.1 or HTTP/2
   connections past `idle_timeout`
+- background idle reaping uses the same `prune_all()` / `prune_address()`
+  paths as foreground pool touches so reverse-index and coalescing-index cleanup
+  stay centralized
 - `pool_max_idle_per_host` applies to every idle connection stored under the
   logical address, not only HTTP/1.1
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
@@ -743,6 +749,5 @@ These are intentionally outside the current baseline:
 - multipart helpers
 - response decompression policy
 - speculative connection warming
-- background pool sweeper ownership
 - nested origin-address racing inside an already-established proxy tunnel
 - full negotiated HTTP/2 stream-setting ownership
