@@ -305,6 +305,10 @@ Current connection-core rules:
 - direct routes race resolved target addresses
 - proxy routes race resolved proxy endpoints and then run CONNECT / SOCKS /
   TLS finalization on the winning or next still-viable route
+- each proxy route attempt uses one shared connect budget across the proxy TCP
+  dial, CONNECT / SOCKS tunnel handshake, and CONNECT proxy-auth re-dials; if a
+  call deadline is earlier, it caps the remaining connect budget for later
+  tunnel stages
 - retryable post-connect establishment failures continue to later route
   candidates; non-retryable failures stop the race immediately
 - target addresses behind forward proxies / CONNECT / SOCKS tunnels are not
@@ -478,6 +482,9 @@ Adapter boundaries that are part of the current code shape:
   protocol tasks during client shutdown
 - `call_timeout`, response-body deadlines, and proxy tunnel timeouts use the
   configured `hyper::rt::Timer`
+- `connect_timeout` remains opt-in; when configured for proxy routes it is
+  consumed as a shared per-route budget rather than being reapplied to each
+  CONNECT / SOCKS sub-step independently
 - response-body deadline enforcement uses the same logical call deadline as the
   request future, with a release/acquire timeout signal between the spawned
   timer task and body polling

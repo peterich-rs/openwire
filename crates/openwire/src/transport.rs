@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use futures_util::future::{select, Either};
@@ -77,8 +77,29 @@ struct ConnectTunnelParams<'a> {
     tcp_connector: Arc<dyn TcpConnector>,
     proxy_authenticator: Option<SharedAuthenticator>,
     max_proxy_auth_attempts: usize,
-    connect_timeout: Option<Duration>,
+    budget: ConnectBudget,
     timer: SharedTimer,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectBudget {
+    deadline: Option<Instant>,
+}
+
+impl ConnectBudget {
+    fn new(connect_timeout: Option<Duration>, call_deadline: Option<Instant>) -> Self {
+        let connect_deadline = connect_timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = match (connect_deadline, call_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Self { deadline }
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
 }
 
 pin_project! {
@@ -296,11 +317,13 @@ async fn connect_via_http_proxy(
                 move |ctx, route| {
                     let deps = deps.clone();
                     async move {
+                        let budget = ConnectBudget::new(deps.connect_timeout, ctx.deadline());
                         match route.kind() {
                             RouteKind::ConnectProxy { proxy, .. } => {
                                 deps.tcp_connector
-                                    .connect(ctx, *proxy, deps.connect_timeout)
+                                    .connect(ctx, *proxy, budget.remaining())
                                     .await
+                                    .map(|stream| (stream, budget))
                             }
                             other => Err(WireError::internal(
                                 format!(
@@ -314,7 +337,7 @@ async fn connect_via_http_proxy(
             },
             {
                 let deps = deps.clone();
-                move |ctx, target_uri, route, stream| {
+                move |ctx, target_uri, route, (stream, budget)| {
                     let deps = deps.clone();
                     async move {
                         let proxy_addr = match route.kind() {
@@ -336,7 +359,7 @@ async fn connect_via_http_proxy(
                             tcp_connector: deps.tcp_connector.clone(),
                             proxy_authenticator: deps.proxy_authenticator.clone(),
                             max_proxy_auth_attempts: deps.max_proxy_auth_attempts,
-                            connect_timeout: deps.connect_timeout,
+                            budget,
                             timer: deps.timer.clone(),
                         })
                         .await?;
@@ -377,11 +400,13 @@ async fn connect_via_socks_proxy(
                 move |ctx, route| {
                     let deps = deps.clone();
                     async move {
+                        let budget = ConnectBudget::new(deps.connect_timeout, ctx.deadline());
                         match route.kind() {
                             RouteKind::SocksProxy { proxy, .. } => {
                                 deps.tcp_connector
-                                    .connect(ctx, *proxy, deps.connect_timeout)
+                                    .connect(ctx, *proxy, budget.remaining())
                                     .await
+                                    .map(|stream| (stream, budget))
                             }
                             other => Err(WireError::internal(
                                 format!(
@@ -395,7 +420,7 @@ async fn connect_via_socks_proxy(
             },
             {
                 let deps = deps.clone();
-                move |ctx, target_uri, route, stream| {
+                move |ctx, target_uri, route, (stream, budget)| {
                     let deps = deps.clone();
                     async move {
                         let (proxy_addr, credentials) = match route.kind() {
@@ -416,7 +441,7 @@ async fn connect_via_socks_proxy(
                             &target_uri,
                             proxy_addr,
                             stream,
-                            deps.connect_timeout,
+                            budget,
                             deps.timer.clone(),
                             credentials.as_ref(),
                         )
@@ -483,7 +508,7 @@ async fn establish_connect_tunnel(
             &connect_headers,
             stream,
             &params.timer,
-            params.connect_timeout,
+            params.budget.remaining(),
         )
         .await?
         {
@@ -539,7 +564,7 @@ async fn establish_connect_tunnel(
                     .connect(
                         params.ctx.clone(),
                         params.proxy_addr,
-                        params.connect_timeout,
+                        params.budget.remaining(),
                     )
                     .await?;
             }
@@ -552,7 +577,7 @@ async fn establish_socks5_tunnel(
     target_uri: &Uri,
     proxy_addr: SocketAddr,
     stream: BoxConnection,
-    timeout: Option<Duration>,
+    budget: ConnectBudget,
     timer: SharedTimer,
     credentials: Option<&ProxyCredentials>,
 ) -> Result<BoxConnection, WireError> {
@@ -568,8 +593,21 @@ async fn establish_socks5_tunnel(
     });
     let mut stream = IoCompat::new(stream);
 
-    socks5_write_client_greeting(&mut stream, &timer, timeout, credentials.is_some()).await?;
-    match socks5_read_server_choice(&mut stream, &timer, timeout, credentials.is_some()).await? {
+    socks5_write_client_greeting(
+        &mut stream,
+        &timer,
+        budget.remaining(),
+        credentials.is_some(),
+    )
+    .await?;
+    match socks5_read_server_choice(
+        &mut stream,
+        &timer,
+        budget.remaining(),
+        credentials.is_some(),
+    )
+    .await?
+    {
         Socks5AuthMethod::NoAuth => {}
         Socks5AuthMethod::UsernamePassword => {
             let credentials = credentials.ok_or_else(|| {
@@ -577,12 +615,18 @@ async fn establish_socks5_tunnel(
                     "SOCKS5 proxy requested username/password authentication but no credentials were configured",
                 )
             })?;
-            socks5_write_password_auth_request(&mut stream, &timer, timeout, credentials).await?;
-            socks5_read_password_auth_response(&mut stream, &timer, timeout).await?;
+            socks5_write_password_auth_request(
+                &mut stream,
+                &timer,
+                budget.remaining(),
+                credentials,
+            )
+            .await?;
+            socks5_read_password_auth_response(&mut stream, &timer, budget.remaining()).await?;
         }
     }
-    socks5_write_connect_request(&mut stream, &timer, host, port, timeout).await?;
-    socks5_read_connect_response(&mut stream, &timer, timeout).await?;
+    socks5_write_connect_request(&mut stream, &timer, host, port, budget.remaining()).await?;
+    socks5_read_connect_response(&mut stream, &timer, budget.remaining()).await?;
     tracing::debug!(
         call_id = ctx.call_id().as_u64(),
         proxy_addr = %proxy_addr,
@@ -2727,9 +2771,11 @@ mod tests {
     use bytes::Bytes;
     use futures_util::task::noop_waker_ref;
     use http::header::{HeaderValue, CONNECTION};
-    use http::HeaderMap;
+    use http::{HeaderMap, Method, Request};
     use hyper::rt::{Read, ReadBuf, Write};
+    use hyper::Uri;
     use hyper_util::client::legacy::connect::Connected;
+    use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
     use tracing::field::{Field, Visit};
     use tracing::{Id, Subscriber};
     use tracing_subscriber::layer::{Context as LayerContext, Layer};
@@ -2737,8 +2783,9 @@ mod tests {
     use tracing_subscriber::registry::LookupSpan;
 
     use openwire_core::{
-        BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver, NoopEventListener,
-        SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
+        AuthContext, Authenticator, BoxConnection, BoxFuture, BoxTaskHandle, CallContext,
+        DnsResolver, NoopEventListener, RequestBody, SharedTimer, TaskHandle, TcpConnector,
+        WireError, WireExecutor,
     };
 
     use super::{
@@ -2961,6 +3008,60 @@ mod tests {
         CallContext::new(Arc::new(NoopEventListener), None)
     }
 
+    struct DuplexConnection {
+        inner: openwire_tokio::TokioIo<tokio::io::DuplexStream>,
+    }
+
+    impl DuplexConnection {
+        fn new(stream: tokio::io::DuplexStream) -> Self {
+            Self {
+                inner: openwire_tokio::TokioIo::new(stream),
+            }
+        }
+    }
+
+    impl hyper_util::client::legacy::connect::Connection for DuplexConnection {
+        fn connected(&self) -> Connected {
+            Connected::new()
+        }
+    }
+
+    impl Read for DuplexConnection {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl Write for DuplexConnection {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    fn duplex_box_connection(capacity: usize) -> (BoxConnection, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(capacity);
+        (
+            Box::new(DuplexConnection::new(client)) as BoxConnection,
+            server,
+        )
+    }
+
     struct ScriptedConnection {
         reads: Vec<u8>,
         read_pos: usize,
@@ -3068,6 +3169,77 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct RecordingRetryTcpConnector {
+        stream: Arc<Mutex<Option<BoxConnection>>>,
+        timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+    }
+
+    impl RecordingRetryTcpConnector {
+        fn new(stream: BoxConnection) -> Self {
+            Self {
+                stream: Arc::new(Mutex::new(Some(stream))),
+                timeouts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn timeouts(&self) -> Vec<Option<Duration>> {
+            self.timeouts.lock().expect("tcp timeout lock").clone()
+        }
+    }
+
+    impl TcpConnector for RecordingRetryTcpConnector {
+        fn connect(
+            &self,
+            _ctx: CallContext,
+            _addr: std::net::SocketAddr,
+            timeout: Option<Duration>,
+        ) -> BoxFuture<Result<BoxConnection, WireError>> {
+            self.timeouts
+                .lock()
+                .expect("tcp timeout lock")
+                .push(timeout);
+            let stream = self
+                .stream
+                .lock()
+                .expect("tcp stream lock")
+                .take()
+                .expect("retry tcp stream");
+            Box::pin(async move { Ok(stream) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StaticProxyAuthenticator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StaticProxyAuthenticator {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Authenticator for StaticProxyAuthenticator {
+        fn authenticate(
+            &self,
+            _ctx: AuthContext,
+        ) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                let mut request = Request::new(RequestBody::empty());
+                *request.method_mut() = Method::CONNECT;
+                *request.uri_mut() = "https://example.com:443/".parse().expect("auth uri");
+                request.headers_mut().insert(
+                    "proxy-authorization",
+                    HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                );
+                Ok(Some(request))
+            })
+        }
+    }
+
+    #[derive(Clone)]
     struct RecordingDnsResolver {
         calls: Arc<Mutex<Vec<(String, u16)>>>,
         resolved_addrs: Vec<std::net::SocketAddr>,
@@ -3146,6 +3318,62 @@ mod tests {
         }
     }
 
+    async fn read_until_headers_end(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let read = stream.read(&mut buf).await.expect("read request bytes");
+            assert!(read > 0, "peer closed before headers completed");
+            response.extend_from_slice(&buf[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return response;
+            }
+        }
+    }
+
+    async fn read_socks5_connect_request(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut head = [0u8; 4];
+        stream
+            .read_exact(&mut head)
+            .await
+            .expect("read socks5 request head");
+        let mut request = head.to_vec();
+        match head[3] {
+            0x01 => {
+                let mut remainder = [0u8; 6];
+                stream
+                    .read_exact(&mut remainder)
+                    .await
+                    .expect("read socks5 ipv4 remainder");
+                request.extend_from_slice(&remainder);
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream
+                    .read_exact(&mut len)
+                    .await
+                    .expect("read socks5 host len");
+                request.extend_from_slice(&len);
+                let mut remainder = vec![0u8; len[0] as usize + 2];
+                stream
+                    .read_exact(&mut remainder)
+                    .await
+                    .expect("read socks5 host remainder");
+                request.extend_from_slice(&remainder);
+            }
+            0x04 => {
+                let mut remainder = [0u8; 18];
+                stream
+                    .read_exact(&mut remainder)
+                    .await
+                    .expect("read socks5 ipv6 remainder");
+                request.extend_from_slice(&remainder);
+            }
+            atyp => panic!("unexpected SOCKS5 atyp {atyp:#04x}"),
+        }
+        request
+    }
+
     #[test]
     fn parse_connect_response_head_preserves_prefetched_tunnel_bytes() {
         let response =
@@ -3189,6 +3417,12 @@ mod tests {
         );
         assert_eq!(parsed.prefetched, Bytes::from_static(b"body"));
         assert_eq!(parsed.prefetched, prefetched);
+    }
+
+    #[test]
+    fn connect_budget_preserves_none_semantics_without_deadlines() {
+        let budget = super::ConnectBudget::new(None, None);
+        assert_eq!(budget.remaining(), None);
     }
 
     #[test]
@@ -3287,6 +3521,124 @@ mod tests {
             route_plan.fast_fallback_stagger(),
             Duration::from_millis(37)
         );
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
+        let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
+        let target_uri: Uri = "https://example.com:443/".parse().expect("target uri");
+        let (initial_stream, mut initial_peer) = duplex_box_connection(1024);
+        let (retry_stream, mut retry_peer) = duplex_box_connection(1024);
+        let retry_connector = RecordingRetryTcpConnector::new(retry_stream);
+        let authenticator_impl = Arc::new(StaticProxyAuthenticator::default());
+        let authenticator = authenticator_impl.clone() as super::SharedAuthenticator;
+
+        let first_response = tokio::spawn(async move {
+            let request = read_until_headers_end(&mut initial_peer).await;
+            let request = String::from_utf8(request).expect("CONNECT request utf8");
+            assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            initial_peer
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+                )
+                .await
+                .expect("write 407");
+        });
+        let second_response = tokio::spawn(async move {
+            let request = read_until_headers_end(&mut retry_peer).await;
+            let request = String::from_utf8(request).expect("retry CONNECT request utf8");
+            assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+            assert!(request.contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"));
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = retry_peer
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
+        });
+
+        let error = match super::establish_connect_tunnel(super::ConnectTunnelParams {
+            ctx: make_call_context(),
+            proxy_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            target_uri: &target_uri,
+            stream: initial_stream,
+            tcp_connector: Arc::new(retry_connector.clone()),
+            proxy_authenticator: Some(authenticator.clone()),
+            max_proxy_auth_attempts: 1,
+            budget: super::ConnectBudget::new(Some(Duration::from_millis(80)), None),
+            timer: timer.clone(),
+        })
+        .await
+        {
+            Ok(_) => panic!("shared connect budget should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_connect_timeout(), "{error:?}");
+        assert!(
+            error.message().contains("proxy CONNECT timed out"),
+            "{error:?}"
+        );
+        let timeouts = retry_connector.timeouts();
+        assert_eq!(timeouts.len(), 1);
+        assert!(timeouts[0].is_some(), "retry dial should keep a timeout");
+        assert!(
+            timeouts[0].expect("retry timeout") < Duration::from_millis(80),
+            "retry timeout should use remaining budget: {timeouts:?}"
+        );
+        assert_eq!(authenticator_impl.calls(), 1);
+
+        first_response.await.expect("first response task");
+        second_response.await.expect("second response task");
+    }
+
+    #[tokio::test]
+    async fn socks5_tunnel_shares_budget_across_handshake_steps() {
+        let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
+        let target_uri: Uri = "https://example.com:443/".parse().expect("target uri");
+        let (stream, mut peer) = duplex_box_connection(1024);
+
+        let server = tokio::spawn(async move {
+            let mut greeting = [0u8; 3];
+            peer.read_exact(&mut greeting).await.expect("read greeting");
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            peer.write_all(&[0x05, 0x00])
+                .await
+                .expect("write server choice");
+
+            let request = read_socks5_connect_request(&mut peer).await;
+            assert_eq!(&request[..3], &[0x05, 0x01, 0x00]);
+            assert_eq!(request[3], 0x03);
+            assert_eq!(request[4] as usize, "example.com".len());
+            assert_eq!(&request[5..5 + "example.com".len()], b"example.com");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = peer
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xbb])
+                .await;
+        });
+
+        let error = match super::establish_socks5_tunnel(
+            make_call_context(),
+            &target_uri,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1080)),
+            stream,
+            super::ConnectBudget::new(Some(Duration::from_millis(80)), None),
+            timer,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("shared SOCKS5 budget should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_connect_timeout(), "{error:?}");
+        assert!(
+            error.message().contains("SOCKS5 handshake timed out"),
+            "{error:?}"
+        );
+
+        server.await.expect("socks5 server task");
     }
 
     #[test]

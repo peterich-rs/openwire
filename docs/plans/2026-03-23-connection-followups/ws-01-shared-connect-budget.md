@@ -3,7 +3,7 @@
 Date: 2026-03-23
 PR: `PR1`
 Branch: `feature/shared-connect-budget`
-Status: planned
+Status: implemented
 
 ## Scope
 
@@ -58,8 +58,7 @@ Status: planned
   fail within one shared budget.
 - Add a SOCKS5 case where multiple handshake stages cumulatively exhaust one
   shared budget.
-- Add a finalize-stage timeout case proving the error still identifies the
-  current stage rather than a generic budget failure.
+- `ConnectBudget::new(None, None)` preserves the existing no-timeout behavior.
 
 ## Non-goals
 
