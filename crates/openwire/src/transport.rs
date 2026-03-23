@@ -1691,6 +1691,7 @@ pub(crate) struct TransportService {
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
     exchange_finder: Arc<ExchangeFinder>,
+    on_pooled_connection_published: Option<Arc<dyn Fn() + Send + Sync>>,
     connection_limiter: ConnectionLimiter,
     connection_availability: ConnectionAvailability,
     bindings: Arc<ConnectionBindings>,
@@ -1704,6 +1705,7 @@ impl TransportService {
         executor: Arc<dyn WireExecutor>,
         timer: SharedTimer,
         exchange_finder: Arc<ExchangeFinder>,
+        on_pooled_connection_published: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         let connection_availability = ConnectionAvailability::default();
         let connection_limiter = ConnectionLimiter::new(
@@ -1717,6 +1719,7 @@ impl TransportService {
             executor,
             timer,
             exchange_finder,
+            on_pooled_connection_published,
             connection_limiter,
             connection_availability,
             bindings: Arc::new(ConnectionBindings::default()),
@@ -1918,6 +1921,7 @@ impl TransportService {
                     self.connection_availability.notify();
                     return Err(error);
                 }
+                self.start_pool_reaper_if_needed();
                 binding
             }
             ConnectionProtocol::Http2 => {
@@ -1948,6 +1952,7 @@ impl TransportService {
                     self.connection_availability.notify();
                     return Err(error);
                 }
+                self.start_pool_reaper_if_needed();
                 binding
             }
         };
@@ -1992,6 +1997,12 @@ impl TransportService {
         }
 
         None
+    }
+
+    fn start_pool_reaper_if_needed(&self) {
+        if let Some(hook) = self.on_pooled_connection_published.as_ref() {
+            hook();
+        }
     }
 
     fn spawn_http1_task(

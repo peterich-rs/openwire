@@ -335,9 +335,10 @@ Current connection-core rules:
 - HTTP/1.1 idle timeout and max-idle limits are still enforced on foreground
   pool touch points, and a best-effort background reaper now calls whole-pool
   prune passes so idle addresses can age out without future traffic
-- the background reaper is started lazily from pooled inserts instead of during
-  `Client::build()`, retries startup after executor spawn failures, and only
-  keeps one live task handle once startup succeeds
+- the background reaper is started lazily after a fresh connection has been
+  published and its mandatory protocol task spawn has succeeded, retries
+  startup after executor spawn failures, and only keeps one live task handle
+  once startup succeeds
 
 Exact planning and acquisition path:
 
@@ -415,7 +416,8 @@ Operational invariants:
   paths as foreground pool touches so reverse-index and coalescing-index cleanup
   stay centralized
 - the client keeps the reaper task handle and aborts it on final client drop
-- pooled inserts retry reaper startup until `WireExecutor::spawn` succeeds
+- published pooled connections retry reaper startup until `WireExecutor::spawn`
+  succeeds, but only after the mandatory per-connection task is already running
 - `pool_max_idle_per_host` applies to every idle connection stored under the
   logical address, not only HTTP/1.1
 - coalescing is limited to direct HTTPS HTTP/2 connections with verified server
@@ -452,6 +454,7 @@ connect_route_plan(...)
   -> ConnectionBindings::acquire(...) for the current request
   -> ConnectionPool::insert(...)
   -> spawn_http1_task(...) or spawn_http2_task(...)
+  -> start_pool_reaper_if_needed()
 ```
 
 Protocol-specific rules:

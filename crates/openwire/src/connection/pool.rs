@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use openwire_core::ConnectionId;
@@ -36,7 +36,6 @@ pub(crate) struct PoolStats {
 pub(crate) struct ConnectionPool {
     settings: PoolSettings,
     state: Mutex<PoolState>,
-    insert_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,16 +50,11 @@ impl ConnectionPool {
         Self {
             settings,
             state: Mutex::new(PoolState::default()),
-            insert_hook: Mutex::new(None),
         }
     }
 
     pub(crate) fn settings(&self) -> &PoolSettings {
         &self.settings
-    }
-
-    pub(crate) fn set_insert_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *lock_mutex(&self.insert_hook) = Some(hook);
     }
 
     pub(crate) fn insert(&self, connection: RealConnection) {
@@ -74,11 +68,6 @@ impl ConnectionPool {
                 .push(connection.clone());
             register_connection(&mut state, &connection);
             prune_address(&self.settings, &mut state, &address);
-        }
-
-        let insert_hook = lock_mutex(&self.insert_hook).clone();
-        if let Some(hook) = insert_hook {
-            hook();
         }
     }
 

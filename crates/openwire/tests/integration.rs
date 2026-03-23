@@ -2209,7 +2209,7 @@ async fn http2_publication_failure_does_not_leave_pool_entry() {
     let events = RecordingEventListenerFactory::default();
     let client = Client::builder()
         .dns_resolver(HostMapResolver::new([("a.test".to_owned(), server.addr())]))
-        .executor(AllowFirstSpawnThenFailRuntime::default())
+        .executor(AlwaysFailSpawnRuntime)
         .event_listener_factory(events.clone())
         .tls_connector(
             RustlsTlsConnector::builder()
@@ -2239,6 +2239,40 @@ async fn http2_publication_failure_does_not_leave_pool_entry() {
         !events.iter().any(|event| event.starts_with("pool_hit")),
         "events = {events:?}",
     );
+}
+
+#[tokio::test]
+async fn pool_reaper_start_does_not_preempt_http1_connection_task_spawn() {
+    let events = RecordingEventListenerFactory::default();
+    let server = spawn_http1(|_request| async move { ok_text("published") }).await;
+    let client = Client::builder()
+        .executor(AllowTwoSpawnsThenFailRuntime::default())
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    for path in ["/first", "/second"] {
+        let response = client
+            .execute(empty_request(server.http_url(path)))
+            .await
+            .expect("request should succeed even if optional reaper spawn fails");
+        let body = response.into_body().text().await.expect("body");
+        assert_eq!(body, "published");
+    }
+
+    let events = events.events();
+    let pool_misses = events.iter().filter(|event| *event == "pool_miss").count();
+    let pool_hits = events
+        .iter()
+        .filter(|event| event.starts_with("pool_hit "))
+        .count();
+    let connect_ends = events
+        .iter()
+        .filter(|event| event.starts_with("connect_end "))
+        .count();
+    assert_eq!(pool_misses, 1, "events = {events:?}");
+    assert_eq!(pool_hits, 1, "events = {events:?}");
+    assert_eq!(connect_ends, 1, "events = {events:?}");
 }
 
 #[tokio::test]
@@ -4072,14 +4106,14 @@ impl Timer for CountingTimer {
 }
 
 #[derive(Clone, Default)]
-struct AllowFirstSpawnThenFailRuntime {
+struct AllowTwoSpawnsThenFailRuntime {
     spawns: Arc<AtomicUsize>,
 }
 
-impl WireExecutor for AllowFirstSpawnThenFailRuntime {
+impl WireExecutor for AllowTwoSpawnsThenFailRuntime {
     fn spawn(&self, future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
         let spawn_index = self.spawns.fetch_add(1, Ordering::Relaxed);
-        if spawn_index == 0 {
+        if spawn_index < 2 {
             Ok(Box::new(NoopTaskHandle(tokio::spawn(future))))
         } else {
             Err(WireError::internal(
@@ -4087,6 +4121,18 @@ impl WireExecutor for AllowFirstSpawnThenFailRuntime {
                 io::Error::other("scripted spawn failure"),
             ))
         }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct AlwaysFailSpawnRuntime;
+
+impl WireExecutor for AlwaysFailSpawnRuntime {
+    fn spawn(&self, _future: BoxFuture<()>) -> Result<BoxTaskHandle, WireError> {
+        Err(WireError::internal(
+            "scripted spawn failure",
+            io::Error::other("scripted spawn failure"),
+        ))
     }
 }
 

@@ -348,15 +348,17 @@ impl ClientBuilder {
             max_idle_per_address: self.transport.pool_max_idle_per_host,
         }));
         let pool_reaper = Arc::new(PoolReaperController::default());
-        if pool.settings().idle_timeout.is_some() {
+        let on_pooled_connection_published = if pool.settings().idle_timeout.is_some() {
             let reaper = pool_reaper.clone();
             let executor = self.executor.clone();
             let timer = self.timer.clone();
             let weak_pool = Arc::downgrade(&pool);
-            pool.set_insert_hook(Arc::new(move || {
+            Some(Arc::new(move || {
                 reaper.ensure_started(executor.clone(), timer.clone(), weak_pool.clone());
-            }));
-        }
+            }) as Arc<dyn Fn() + Send + Sync>)
+        } else {
+            None
+        };
         let proxy_selector = ProxySelector::new(proxies);
         let request_admission = RequestAdmissionLimiter::new(
             self.transport.max_requests_total,
@@ -381,6 +383,7 @@ impl ClientBuilder {
             self.executor.clone(),
             self.timer.clone(),
             exchange_finder,
+            on_pooled_connection_published,
         );
         let service = build_service_chain(
             transport,
