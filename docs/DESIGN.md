@@ -175,7 +175,8 @@ application interceptors (in insertion order)
   -> FollowUpPolicyService
     -> BridgeInterceptor
       -> network interceptors (in insertion order)
-        -> TransportService
+        -> RequestAdmissionService
+          -> TransportService
 ```
 
 Construction details:
@@ -186,6 +187,8 @@ Construction details:
   matches insertion order
 - `BridgeInterceptor` always runs after follow-up policy and before network
   interceptors
+- `RequestAdmissionService` runs after network interceptors and before transport
+  so admission sees the final request URI for that network attempt
 - `FollowUpPolicyService` always wraps the entire network chain
 
 `BridgeInterceptor` currently performs exactly three normalization steps:
@@ -210,7 +213,8 @@ Tower readiness rules are also exact:
 - interceptor layers move the polled-ready inner service into `Next`
   instead of re-cloning and re-polling it inside `call()`
 - `FollowUpPolicyService::poll_ready()` delegates to the network chain
-- `TransportService::poll_ready()` reflects global request-admission readiness
+- `RequestAdmissionService::poll_ready()` reflects global request-admission
+  readiness
 - follow-up retries and redirects re-poll readiness only for subsequent
   network attempts inside the same logical call
 
@@ -224,7 +228,6 @@ Client::execute(request)
     -> Call::execute()
       -> CallContext::from_factory(...)
       -> tower::ServiceExt::ready(...)
-      -> RequestAdmissionLimiter::acquire(address)
       -> Exchange::new(request, ctx, 1)
       -> build_service_chain(...)
         -> application interceptors
@@ -233,19 +236,21 @@ Client::execute(request)
           -> apply_request_cookies()
           -> BridgeInterceptor::intercept()
           -> network interceptors
-          -> TransportService::call()
-            -> TransportService::execute_exchange()
-              -> request-admission permit stays attached to the response body
-              -> ExchangeFinder::prepare()
-              -> TransportService::acquire_connection()
-                -> wait for reusable connection or fresh-connection permit
-                -> TransportService::bind_fresh_connection() on miss
-                  -> ConnectorStack::route_plan()
-                  -> connect_route_plan()
-                  -> bind_http1() or bind_http2()
-                  -> spawn_http1_task() or spawn_http2_task()
-              -> send_bound_request()
-              -> ObservedIncomingBody::wrap()
+          -> RequestAdmissionService::call()
+            -> RequestAdmissionLimiter::acquire(final_address)
+            -> TransportService::call()
+              -> TransportService::execute_exchange()
+                -> ExchangeFinder::prepare()
+                -> TransportService::acquire_connection()
+                  -> wait for reusable connection or fresh-connection permit
+                  -> TransportService::bind_fresh_connection() on miss
+                    -> ConnectorStack::route_plan()
+                    -> connect_route_plan()
+                    -> bind_http1() or bind_http2()
+                    -> spawn_http1_task() or spawn_http2_task()
+                -> send_bound_request()
+                -> ObservedIncomingBody::wrap()
+            -> request-admission permit stays attached to the response body
           -> store_response_cookies()
           -> authenticate_response()
           -> resolve_redirect_uri()
@@ -304,11 +309,17 @@ Current connection-core rules:
   candidates; non-retryable failures stop the race immediately
 - target addresses behind forward proxies / CONNECT / SOCKS tunnels are not
   independently raced once a proxy connection is established
-- logical call admission is enforced before the request enters the transport
-  stack and is released when the returned response body is dropped or consumed
+- request admission is enforced inside the network chain after application,
+  follow-up, bridge, and network interceptors finalize the request for that
+  attempt
+- request admission does not hold a global permit while waiting for a per-address
+  slot
+- request-admission permits are released when the returned response body is
+  dropped or consumed
 - fresh-connection admission waits for either an existing reusable connection
   or an available connection slot keyed by the logical `Address`
-- HTTP/1.1 reuse is single-exchange and body-lifecycle-driven
+- HTTP/1.1 reuse is single-exchange and body-lifecycle-driven; either the
+  request or response `Connection: close` directive disables pooling
 - HTTP/2 reuse is admitted by bound-sender readiness instead of a separate fixed
   local stream cap
 - HTTP/1.1 idle timeout and max-idle limits are enforced opportunistically on
@@ -571,6 +582,8 @@ Current error-model rules:
   non-retryable establishment flag
 - retry policy decisions and fast-fallback continuation both consume the same
   establishment metadata instead of matching only on `WireErrorKind`
+- `WireError` display output includes the underlying source text when one is
+  present
 
 Retryability contracts:
 

@@ -39,7 +39,7 @@ use crate::auth::{
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
     DirectDialDeps, ExchangeFinder, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,
-    RequestAdmissionLimiter, Route, RouteKind, RoutePlan, RoutePlanner, UriScheme,
+    Route, RouteKind, RoutePlan, RoutePlanner, UriScheme,
 };
 use crate::proxy::ProxyCredentials;
 use crate::sync_util::lock_mutex;
@@ -1637,7 +1637,6 @@ pub(crate) struct TransportService {
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
     exchange_finder: Arc<ExchangeFinder>,
-    request_admission: RequestAdmissionLimiter,
     connection_limiter: ConnectionLimiter,
     connection_availability: ConnectionAvailability,
     bindings: Arc<ConnectionBindings>,
@@ -1651,7 +1650,6 @@ impl TransportService {
         executor: Arc<dyn WireExecutor>,
         timer: SharedTimer,
         exchange_finder: Arc<ExchangeFinder>,
-        request_admission: RequestAdmissionLimiter,
     ) -> Self {
         let connection_availability = ConnectionAvailability::default();
         let connection_limiter = ConnectionLimiter::new(
@@ -1665,7 +1663,6 @@ impl TransportService {
             executor,
             timer,
             exchange_finder,
-            request_admission,
             connection_limiter,
             connection_availability,
             bindings: Arc::new(ConnectionBindings::default()),
@@ -2029,8 +2026,8 @@ impl Service<Exchange> for TransportService {
     type Error = WireError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.request_admission.poll_ready(cx)
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, exchange: Exchange) -> Self::Future {
@@ -2443,11 +2440,12 @@ async fn send_bound_request(
                 cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
                 map_hyper_error(error)
             })?;
+            let request_requests_close = connection_header_requests_close(request.headers());
             let mut response = sender.send_request(request).await.map_err(|error| {
                 cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
                 map_hyper_error(error)
             })?;
-            let reusable = http1_response_allows_reuse(&response);
+            let reusable = http1_exchange_allows_reuse(request_requests_close, &response);
             response.extensions_mut().insert(info);
             Ok(BoundResponse {
                 response,
@@ -2557,7 +2555,13 @@ fn prepare_bound_request(
     Ok(request)
 }
 
-fn http1_response_allows_reuse(response: &Response<Incoming>) -> bool {
+fn http1_exchange_allows_reuse(
+    request_requests_close: bool,
+    response: &Response<Incoming>,
+) -> bool {
+    if request_requests_close {
+        return false;
+    }
     if response.version() == Version::HTTP_10 {
         return false;
     }
