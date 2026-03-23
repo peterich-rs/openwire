@@ -237,6 +237,7 @@ Client::execute(request)
           -> BridgeInterceptor::intercept()
           -> network interceptors
           -> RequestAdmissionService::call()
+            -> cache_request_address(request, proxy_selector)
             -> RequestAdmissionLimiter::acquire(final_address)
             -> TransportService::call()
               -> TransportService::execute_exchange()
@@ -342,7 +343,7 @@ Exact planning and acquisition path:
 
 ```text
 ExchangeFinder::prepare(request)
-  -> Address::from_uri(request.uri(), matching_proxy)
+  -> CachedAddress extension or Address::from_uri(request.uri(), matching_proxy)
   -> ConnectionPool::acquire(&address)
   -> PreparedExchange { PoolHit | PoolMiss }
 
@@ -377,6 +378,8 @@ Route ownership rules:
 Pool and reuse rules:
 
 - `ExchangeFinder::prepare()` performs the first exact-address pool lookup
+- request admission computes the logical `Address` once per attempt, caches it
+  in request extensions, and transport consumes the cached value when present
 - `TransportService::try_acquire_coalesced()` performs the secondary HTTPS
   HTTP/2 coalesced lookup after route planning on miss path, using a
   secondary index keyed by direct target address instead of scanning the full

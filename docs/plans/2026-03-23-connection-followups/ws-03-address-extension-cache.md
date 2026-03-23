@@ -3,7 +3,7 @@
 Date: 2026-03-23
 PR: `PR3`
 Branch: `perf/address-extension-cache`
-Status: planned
+Status: implemented
 
 ## Scope
 

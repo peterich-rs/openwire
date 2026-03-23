@@ -10,6 +10,9 @@ use super::{
 };
 
 #[derive(Clone, Debug)]
+pub(crate) struct CachedAddress(pub(crate) Address);
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedExchange {
     address: Address,
     outcome: PreparedExchangeOutcome,
@@ -84,8 +87,12 @@ impl ExchangeFinder {
         &self,
         request: &Request<RequestBody>,
     ) -> Result<PreparedExchange, WireError> {
-        let proxy = self.matching_proxy(request.uri());
-        let address = Address::from_uri(request.uri(), proxy)?;
+        let address = if let Some(cached) = request.extensions().get::<CachedAddress>() {
+            cached.0.clone()
+        } else {
+            let proxy = self.matching_proxy(request.uri());
+            Address::from_uri(request.uri(), proxy)?
+        };
         let outcome = match self.pool.acquire(&address) {
             Some(connection) => PreparedExchangeOutcome::PoolHit { connection },
             None => PreparedExchangeOutcome::PoolMiss,
@@ -156,7 +163,7 @@ mod tests {
     use http::Request;
     use openwire_core::{ConnectionInfo, RequestBody};
 
-    use super::{ExchangeFinder, PreparedExchange, PreparedExchangeOutcome};
+    use super::{CachedAddress, ExchangeFinder, PreparedExchange, PreparedExchangeOutcome};
     use crate::connection::{
         Address, AuthorityKey, ConnectionAllocationState, ConnectionProtocol, DnsPolicy,
         PoolSettings, ProtocolPolicy, RealConnection, Route, UriScheme,
@@ -301,5 +308,65 @@ mod tests {
                 .map(|proxy| proxy.target().host_str()),
             Some(Some("second.test"))
         );
+    }
+
+    #[test]
+    fn exchange_finder_uses_cached_address_when_present() {
+        let cached_address = Address::new(
+            UriScheme::Http,
+            AuthorityKey::new("cached.test", 80),
+            None,
+            None,
+            ProtocolPolicy::Http1OrHttp2,
+            DnsPolicy::System,
+        );
+        let route = Route::direct(
+            cached_address.clone(),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 80)),
+        );
+        let connection = RealConnection::new(route, ConnectionProtocol::Http1);
+        assert!(connection.try_acquire());
+        assert!(connection.release());
+
+        let pool = Arc::new(crate::connection::ConnectionPool::new(
+            PoolSettings::default(),
+        ));
+        pool.insert(connection.clone());
+        let finder = ExchangeFinder::new(pool, ProxySelector::new(Vec::new()));
+
+        let mut request = Request::builder()
+            .uri("http://example.com/resource")
+            .body(RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(CachedAddress(cached_address.clone()));
+
+        let prepared = finder.prepare(&request).expect("prepared exchange");
+
+        assert_eq!(prepared.address(), &cached_address);
+        assert_eq!(prepared.pool_connection_id(), Some(connection.id()));
+    }
+
+    #[test]
+    fn exchange_finder_recomputes_address_when_cache_is_absent() {
+        let finder = ExchangeFinder::new(
+            Arc::new(crate::connection::ConnectionPool::new(
+                PoolSettings::default(),
+            )),
+            ProxySelector::new(Vec::new()),
+        );
+        let request = Request::builder()
+            .uri("http://example.com/resource")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let prepared = finder.prepare(&request).expect("prepared exchange");
+
+        assert_eq!(prepared.address(), &make_address());
+        assert!(matches!(
+            prepared.outcome(),
+            PreparedExchangeOutcome::PoolMiss
+        ));
     }
 }

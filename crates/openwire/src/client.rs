@@ -24,7 +24,7 @@ use tracing::Instrument;
 use crate::auth::SharedAuthenticator;
 use crate::bridge::BridgeInterceptor;
 use crate::connection::{
-    Address, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
+    Address, CachedAddress, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
     RequestAdmissionLimiter, RequestAdmissionPermit, RoutePlanner,
 };
 use crate::cookie::SharedCookieJar;
@@ -669,15 +669,24 @@ where
         let limiter = self.limiter.clone();
         let proxy_selector = self.proxy_selector.clone();
         Box::pin(async move {
-            let request_address = Address::from_uri(
-                exchange.request().uri(),
-                proxy_selector.select(exchange.request().uri()),
-            )?;
+            let mut exchange = exchange;
+            let request_address = cache_request_address(exchange.request_mut(), &proxy_selector)?;
             let permit = limiter.acquire(request_address).await?;
             let response = inner.call(exchange).await?;
             Ok(attach_request_admission(response, permit))
         })
     }
+}
+
+fn cache_request_address(
+    request: &mut Request<RequestBody>,
+    proxy_selector: &ProxySelector,
+) -> Result<Address, WireError> {
+    let address = Address::from_uri(request.uri(), proxy_selector.select(request.uri()))?;
+    request
+        .extensions_mut()
+        .insert(CachedAddress(address.clone()));
+    Ok(address)
 }
 
 async fn with_call_deadline<F>(
@@ -766,11 +775,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use openwire_core::{BoxFuture, TaskHandle, WireError};
+<<<<<<< HEAD
+    use http::Request;
+    use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
+=======
+    use http::Request;
+    use openwire_core::{BoxFuture, RequestBody, TaskHandle};
+>>>>>>> 80b8505 (perf: cache request addresses across admission and transport)
 
     use super::{
-        pool_reaper_cadence, spawn_pool_reaper, ConnectionPool, PoolReaperController, PoolSettings,
+        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, ConnectionPool,
+        PoolReaperController, PoolSettings,
     };
+    use crate::connection::CachedAddress;
+    use crate::proxy::ProxySelector;
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
     }
@@ -887,6 +905,25 @@ mod tests {
 
         reaper.abort();
         assert_eq!(executor.aborts(), 1);
+    }
+
+    #[test]
+    fn cache_request_address_inserts_cached_extension() {
+        let mut request = Request::builder()
+            .uri("http://example.com/resource")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let address =
+            cache_request_address(&mut request, &ProxySelector::new(Vec::new())).expect("address");
+
+        assert_eq!(
+            request
+                .extensions()
+                .get::<CachedAddress>()
+                .map(|cached| &cached.0),
+            Some(&address)
+        );
     }
 
     #[test]
