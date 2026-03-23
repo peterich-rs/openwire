@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openwire_core::ConnectionId;
@@ -33,10 +33,10 @@ pub(crate) struct PoolStats {
     pub(crate) in_use: usize,
 }
 
-#[derive(Debug)]
 pub(crate) struct ConnectionPool {
     settings: PoolSettings,
     state: Mutex<PoolState>,
+    insert_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +51,7 @@ impl ConnectionPool {
         Self {
             settings,
             state: Mutex::new(PoolState::default()),
+            insert_hook: Mutex::new(None),
         }
     }
 
@@ -58,16 +59,27 @@ impl ConnectionPool {
         &self.settings
     }
 
+    pub(crate) fn set_insert_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *lock_mutex(&self.insert_hook) = Some(hook);
+    }
+
     pub(crate) fn insert(&self, connection: RealConnection) {
         let address = connection.address().clone();
-        let mut state = lock_mutex(&self.state);
-        state
-            .by_address
-            .entry(address.clone())
-            .or_default()
-            .push(connection.clone());
-        register_connection(&mut state, &connection);
-        prune_address(&self.settings, &mut state, &address);
+        {
+            let mut state = lock_mutex(&self.state);
+            state
+                .by_address
+                .entry(address.clone())
+                .or_default()
+                .push(connection.clone());
+            register_connection(&mut state, &connection);
+            prune_address(&self.settings, &mut state, &address);
+        }
+
+        let insert_hook = lock_mutex(&self.insert_hook).clone();
+        if let Some(hook) = insert_hook {
+            hook();
+        }
     }
 
     pub(crate) fn acquire(&self, address: &Address) -> Option<RealConnection> {
@@ -240,6 +252,14 @@ impl ConnectionPool {
         for address in addresses {
             prune_address(&self.settings, &mut state, &address);
         }
+    }
+}
+
+impl std::fmt::Debug for ConnectionPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPool")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
     }
 }
 

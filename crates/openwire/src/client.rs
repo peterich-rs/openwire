@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -44,7 +44,7 @@ struct ClientInner {
     timer: SharedTimer,
     call_timeout: Option<Duration>,
     service: BoxWireService,
-    pool_reaper_task: Option<BoxTaskHandle>,
+    pool_reaper: Arc<PoolReaperController>,
 }
 
 pub struct Call {
@@ -83,6 +83,17 @@ pub struct ClientBuilder {
 
 const MIN_POOL_REAPER_CADENCE: Duration = Duration::from_secs(5);
 const MAX_POOL_REAPER_CADENCE: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct PoolReaperController {
+    state: Mutex<PoolReaperState>,
+}
+
+#[derive(Default)]
+struct PoolReaperState {
+    attempted: bool,
+    handle: Option<BoxTaskHandle>,
+}
 
 impl ClientBuilder {
     pub fn new() -> Self {
@@ -337,7 +348,16 @@ impl ClientBuilder {
             idle_timeout: self.transport.pool_idle_timeout,
             max_idle_per_address: self.transport.pool_max_idle_per_host,
         }));
-        let pool_reaper_task = spawn_pool_reaper(self.executor.clone(), self.timer.clone(), &pool)?;
+        let pool_reaper = Arc::new(PoolReaperController::default());
+        if pool.settings().idle_timeout.is_some() {
+            let reaper = pool_reaper.clone();
+            let executor = self.executor.clone();
+            let timer = self.timer.clone();
+            let weak_pool = Arc::downgrade(&pool);
+            pool.set_insert_hook(Arc::new(move || {
+                reaper.ensure_started(executor.clone(), timer.clone(), weak_pool.clone());
+            }));
+        }
         let proxy_selector = ProxySelector::new(proxies);
         let request_admission = RequestAdmissionLimiter::new(
             self.transport.max_requests_total,
@@ -378,7 +398,7 @@ impl ClientBuilder {
                 timer: self.timer,
                 call_timeout: self.policy.call_timeout,
                 service,
-                pool_reaper_task,
+                pool_reaper,
             }),
         })
     }
@@ -446,7 +466,38 @@ impl Client {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
-        if let Some(handle) = self.pool_reaper_task.take() {
+        self.pool_reaper.abort();
+    }
+}
+
+impl PoolReaperController {
+    fn ensure_started(
+        &self,
+        executor: Arc<dyn WireExecutor>,
+        timer: SharedTimer,
+        pool: Weak<ConnectionPool>,
+    ) {
+        let mut state = self.state.lock().expect("pool reaper state lock");
+        if state.attempted || state.handle.is_some() {
+            return;
+        }
+        state.attempted = true;
+
+        let Some(pool) = pool.upgrade() else {
+            return;
+        };
+
+        state.handle = spawn_pool_reaper(executor, timer, &pool).ok().flatten();
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = self
+            .state
+            .lock()
+            .expect("pool reaper state lock")
+            .handle
+            .take()
+        {
             handle.abort();
         }
     }
@@ -717,10 +768,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use http::Uri;
-    use openwire_core::{BoxConnection, BoxFuture, TaskHandle};
+    use openwire_core::{BoxFuture, TaskHandle};
 
-    use super::{pool_reaper_cadence, spawn_pool_reaper, Client, ConnectionPool, PoolSettings};
+    use super::{
+        pool_reaper_cadence, spawn_pool_reaper, ConnectionPool, PoolReaperController,
+        PoolSettings,
+    };
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
     }
@@ -756,20 +809,6 @@ mod tests {
             Ok(Box::new(CountingTaskHandle {
                 aborts: self.aborts.clone(),
             }))
-        }
-    }
-
-    #[derive(Clone)]
-    struct PassthroughTlsConnector;
-
-    impl openwire_core::TlsConnector for PassthroughTlsConnector {
-        fn connect(
-            &self,
-            _ctx: openwire_core::CallContext,
-            _uri: Uri,
-            stream: BoxConnection,
-        ) -> BoxFuture<Result<BoxConnection, openwire_core::WireError>> {
-            Box::pin(async move { Ok(stream) })
         }
     }
 
@@ -809,17 +848,15 @@ mod tests {
     #[test]
     fn dropping_final_client_aborts_pool_reaper_task() {
         let executor = CountingExecutor::default();
-        let client = Client::builder()
-            .executor(executor.clone())
-            .tls_connector(PassthroughTlsConnector)
-            .build()
-            .expect("build client");
+        let timer = openwire_core::SharedTimer::new(openwire_tokio::TokioTimer::new());
+        let pool = Arc::new(ConnectionPool::new(PoolSettings::default()));
+        let reaper = PoolReaperController::default();
 
+        reaper.ensure_started(Arc::new(executor.clone()), timer, Arc::downgrade(&pool));
         assert_eq!(executor.spawns(), 1);
         assert_eq!(executor.aborts(), 0);
 
-        drop(client);
-
+        reaper.abort();
         assert_eq!(executor.aborts(), 1);
     }
 }
