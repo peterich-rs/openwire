@@ -771,8 +771,7 @@ mod tests {
     use openwire_core::{BoxFuture, TaskHandle};
 
     use super::{
-        pool_reaper_cadence, spawn_pool_reaper, ConnectionPool, PoolReaperController,
-        PoolSettings,
+        pool_reaper_cadence, spawn_pool_reaper, ConnectionPool, PoolReaperController, PoolSettings,
     };
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
