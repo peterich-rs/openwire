@@ -30,8 +30,9 @@ Status: implemented
 - Background reaper holds `Weak<ConnectionPool>` and exits when upgrade fails.
 - The client retains an abort-capable task handle for the reaper and aborts it
   on final client drop.
-- Reaper start is lazy: the client installs a pool-insert hook, and the first
-  successful pooled insert starts the background task only once.
+- Reaper start is lazy: the client installs a pool-insert hook, retries startup
+  on later inserts after executor spawn failures, and keeps only one live task
+  handle once startup succeeds.
 - Reaper starts only when `idle_timeout.is_some()`.
 - Reaper cadence is `(idle_timeout / 2).clamp(5s, 60s)`.
 - Reaper uses the same `prune_address` / `prune_all` path as foreground pool
@@ -57,6 +58,8 @@ Status: implemented
 - Add a test that an idle address can be reaped without any later traffic on
   that address.
 - Add a lifecycle test that dropping the final client aborts the reaper task.
+- Add a lifecycle test that a failed reaper spawn is retried on a later pooled
+  insert.
 
 ## Non-goals
 

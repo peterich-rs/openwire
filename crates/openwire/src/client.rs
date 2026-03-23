@@ -91,7 +91,6 @@ struct PoolReaperController {
 
 #[derive(Default)]
 struct PoolReaperState {
-    attempted: bool,
     handle: Option<BoxTaskHandle>,
 }
 
@@ -478,10 +477,9 @@ impl PoolReaperController {
         pool: Weak<ConnectionPool>,
     ) {
         let mut state = self.state.lock().expect("pool reaper state lock");
-        if state.attempted || state.handle.is_some() {
+        if state.handle.is_some() {
             return;
         }
-        state.attempted = true;
 
         let Some(pool) = pool.upgrade() else {
             return;
@@ -768,7 +766,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use openwire_core::{BoxFuture, TaskHandle};
+    use openwire_core::{BoxFuture, TaskHandle, WireError};
 
     use super::{
         pool_reaper_cadence, spawn_pool_reaper, ConnectionPool, PoolReaperController, PoolSettings,
@@ -805,6 +803,38 @@ mod tests {
             _future: BoxFuture<()>,
         ) -> Result<openwire_core::BoxTaskHandle, openwire_core::WireError> {
             self.spawns.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(CountingTaskHandle {
+                aborts: self.aborts.clone(),
+            }))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailOnceExecutor {
+        spawns: Arc<AtomicUsize>,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl FailOnceExecutor {
+        fn spawns(&self) -> usize {
+            self.spawns.load(Ordering::Relaxed)
+        }
+
+        fn aborts(&self) -> usize {
+            self.aborts.load(Ordering::Relaxed)
+        }
+    }
+
+    impl openwire_core::WireExecutor for FailOnceExecutor {
+        fn spawn(&self, _future: BoxFuture<()>) -> Result<openwire_core::BoxTaskHandle, WireError> {
+            let attempt = self.spawns.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                return Err(WireError::internal(
+                    "scripted spawn failure",
+                    std::io::Error::other("scripted spawn failure"),
+                ));
+            }
+
             Ok(Box::new(CountingTaskHandle {
                 aborts: self.aborts.clone(),
             }))
@@ -854,6 +884,35 @@ mod tests {
         reaper.ensure_started(Arc::new(executor.clone()), timer, Arc::downgrade(&pool));
         assert_eq!(executor.spawns(), 1);
         assert_eq!(executor.aborts(), 0);
+
+        reaper.abort();
+        assert_eq!(executor.aborts(), 1);
+    }
+
+    #[test]
+    fn pool_reaper_retries_after_spawn_failure() {
+        let executor = FailOnceExecutor::default();
+        let timer = openwire_core::SharedTimer::new(openwire_tokio::TokioTimer::new());
+        let pool = Arc::new(ConnectionPool::new(PoolSettings::default()));
+        let reaper = PoolReaperController::default();
+
+        reaper.ensure_started(
+            Arc::new(executor.clone()),
+            timer.clone(),
+            Arc::downgrade(&pool),
+        );
+        assert_eq!(executor.spawns(), 1);
+        assert_eq!(executor.aborts(), 0);
+
+        reaper.ensure_started(Arc::new(executor.clone()), timer, Arc::downgrade(&pool));
+        assert_eq!(executor.spawns(), 2);
+
+        reaper.ensure_started(
+            Arc::new(executor.clone()),
+            openwire_core::SharedTimer::new(openwire_tokio::TokioTimer::new()),
+            Arc::downgrade(&pool),
+        );
+        assert_eq!(executor.spawns(), 2);
 
         reaper.abort();
         assert_eq!(executor.aborts(), 1);
