@@ -71,7 +71,7 @@ impl DirectDialDeps {
 }
 
 impl FastFallbackDialer {
-    pub(crate) async fn dial_route_plan<C, CFut, F, FFut>(
+    pub(crate) async fn dial_route_plan<I, C, CFut, F, FFut>(
         &self,
         ctx: CallContext,
         uri: Uri,
@@ -81,9 +81,10 @@ impl FastFallbackDialer {
         finalize: F,
     ) -> Result<(BoxConnection, FastFallbackOutcome), WireError>
     where
+        I: Send + 'static,
         C: Fn(CallContext, Route) -> CFut + Send + Sync + Clone + 'static,
-        CFut: Future<Output = Result<BoxConnection, WireError>> + Send + 'static,
-        F: Fn(CallContext, Uri, Route, BoxConnection) -> FFut + Send + Sync + Clone + 'static,
+        CFut: Future<Output = Result<I, WireError>> + Send + 'static,
+        F: Fn(CallContext, Uri, Route, I) -> FFut + Send + Sync + Clone + 'static,
         FFut: Future<Output = Result<BoxConnection, WireError>> + Send + 'static,
     {
         let route_count = route_plan.len();
@@ -104,7 +105,7 @@ impl FastFallbackDialer {
         }
 
         let mut connect_plan = ConnectPlan::from_route_plan(&route_plan);
-        let (tx, mut rx) = mpsc::unbounded();
+        let (tx, mut rx) = mpsc::unbounded::<FastFallbackMessage<I>>();
         let mut tasks = Vec::new();
         for index in 0..route_count {
             let attempt = connect_plan
@@ -370,7 +371,7 @@ fn loss_reason(stage: ConnectFailureStage) -> &'static str {
     }
 }
 
-enum FastFallbackMessage {
+enum FastFallbackMessage<I> {
     Started {
         race_id: u64,
         route_index: usize,
@@ -379,7 +380,7 @@ enum FastFallbackMessage {
     },
     Finished {
         route_index: usize,
-        result: Result<BoxConnection, WireError>,
+        result: Result<I, WireError>,
     },
 }
 
@@ -399,14 +400,14 @@ fn route_family_label(family: RouteFamily) -> String {
     }
 }
 
-async fn cleanup_losers(
+async fn cleanup_losers<I>(
     ctx: &CallContext,
     connect_plan: &mut ConnectPlan,
     race_id: u64,
     winner_index: usize,
     route_count: usize,
     tasks: &mut [RaceTask],
-    rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage>,
+    rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage<I>>,
 ) {
     let mut canceled_routes = vec![false; route_count];
     for (index, task) in tasks.iter_mut().enumerate() {
