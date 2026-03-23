@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use futures_util::future::poll_fn;
 use tokio::sync::{Notify, OwnedSemaphorePermit as TokioOwnedSemaphorePermit, Semaphore};
-use tokio_util::sync::PollSemaphore;
 
 use openwire_core::WireError;
 
@@ -84,7 +83,7 @@ struct AddressSemaphorePermit {
 struct AsyncSemaphore {
     limit: usize,
     semaphore: Arc<Semaphore>,
-    poller: Mutex<PollSemaphore>,
+    waiters: Mutex<Vec<Waker>>,
 }
 
 #[derive(Debug)]
@@ -247,11 +246,8 @@ impl ConnectionAvailability {
         self.notify.notify_waiters();
     }
 
-    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> {
-        let notify = self.notify.clone();
-        async move {
-            notify.notified().await;
-        }
+    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
     }
 }
 
@@ -304,12 +300,6 @@ impl AddressSemaphoreSet {
     }
 }
 
-impl Drop for RequestGlobalPermit {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-    }
-}
-
 impl Drop for ConnectionPermitInner {
     fn drop(&mut self) {
         drop(self.per_address.take());
@@ -350,8 +340,8 @@ impl AsyncSemaphore {
         let semaphore = Arc::new(Semaphore::new(limit));
         Self {
             limit,
-            poller: Mutex::new(PollSemaphore::new(semaphore.clone())),
             semaphore,
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -360,14 +350,20 @@ impl AsyncSemaphore {
     }
 
     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut poller = self.poller.lock().expect("semaphore poller lock");
-        match poller.poll_acquire(cx) {
-            Poll::Ready(Some(permit)) => {
-                drop(permit);
-                Poll::Ready(())
-            }
-            Poll::Ready(None) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
+        if self.available_permits() > 0 {
+            return Poll::Ready(());
+        }
+
+        let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+        if self.available_permits() > 0 {
+            return Poll::Ready(());
+        }
+
+        register_waker_locked(&mut waiters, cx.waker());
+        if self.available_permits() > 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
@@ -394,11 +390,24 @@ impl AsyncSemaphore {
             permit: Some(permit),
         }
     }
+
+    fn wake_waiters(&self) {
+        let waiters = {
+            let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+            std::mem::take(&mut *waiters)
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
 }
 
 impl Drop for OwnedSemaphorePermit {
     fn drop(&mut self) {
-        let _ = self.permit.take();
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+            self.semaphore.wake_waiters();
+        }
     }
 }
 
@@ -406,10 +415,18 @@ fn limit_semaphore(limit: usize) -> Option<Arc<AsyncSemaphore>> {
     (limit != usize::MAX).then(|| Arc::new(AsyncSemaphore::new(limit)))
 }
 
+fn register_waker_locked(waiters: &mut Vec<Waker>, waker: &Waker) {
+    if waiters.iter().any(|existing| existing.will_wake(waker)) {
+        return;
+    }
+    waiters.push(waker.clone());
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use futures_util::future::poll_fn;
     use tokio::time::timeout;
 
     use super::{ConnectionAvailability, ConnectionLimiter, RequestAdmissionLimiter};
@@ -455,6 +472,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_admission_multiple_waiters_complete_after_permit_drop() {
+        let limiter = RequestAdmissionLimiter::new(1, 1);
+        let first = limiter
+            .acquire(make_address("example.com"))
+            .await
+            .expect("first permit");
+
+        let waiters = (0..4)
+            .map(|_| {
+                let limiter = limiter.clone();
+                tokio::spawn(async move {
+                    let permit = limiter
+                        .acquire(make_address("example.com"))
+                        .await
+                        .expect("waiter permit");
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        drop(first);
+
+        for waiter in waiters {
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter completed")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_admission_poll_ready_wakes_all_waiters() {
+        let limiter = RequestAdmissionLimiter::new(1, usize::MAX);
+        let permit = limiter
+            .acquire(make_address("example.com"))
+            .await
+            .expect("held permit");
+
+        let waiters = (0..8)
+            .map(|_| {
+                let limiter = limiter.clone();
+                tokio::spawn(async move {
+                    poll_fn(|cx| limiter.poll_ready(cx))
+                        .await
+                        .expect("limiter ready");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        drop(permit);
+
+        for waiter in waiters {
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter completed")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
     async fn connection_availability_broadcasts_to_all_waiters() {
         let availability = ConnectionAvailability::default();
         let waiters = (0..8)
@@ -475,6 +555,18 @@ mod tests {
                 .expect("waiter completed")
                 .expect("waiter join");
         }
+    }
+
+    #[tokio::test]
+    async fn connection_availability_listen_observes_notify_before_first_poll() {
+        let availability = ConnectionAvailability::default();
+        let waiter = availability.listen();
+
+        availability.notify();
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter completed");
     }
 
     #[tokio::test]

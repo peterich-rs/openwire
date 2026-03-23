@@ -7,10 +7,9 @@ Status: implemented
 
 ## Scope
 
-- remove wakeup-list accumulation and full-vector `Waker` scans from limiter
-  coordination
-- replace custom async semaphore logic with Tokio primitives unless a hidden
-  runtime-independence requirement is discovered
+- replace custom permit accounting with Tokio primitives while preserving
+  concurrent `poll_ready()` correctness
+- replace the connection-availability waker list with `tokio::sync::Notify`
 
 ## Owned Files
 
@@ -24,28 +23,33 @@ Status: implemented
 - `ConnectionAvailability` is replaced with `tokio::sync::Notify`.
 - Availability notifications use `notify_waiters()` to preserve broadcast
   semantics.
-- Preferred path: replace custom `AsyncSemaphore` with `tokio::sync::Semaphore`.
-- Fall back to a custom FIFO waiter queue only if implementation review uncovers
-  a concrete incompatibility with Tokio semaphore semantics.
+- `AsyncSemaphore` delegates owned permit acquisition to
+  `tokio::sync::Semaphore`.
+- Shared readiness polling does not use a shared `PollSemaphore`; it keeps a
+  local deduplicated waiter list so concurrent callers do not lose wakeups.
 - The PR must preserve current limiter correctness before attempting perf
   tuning.
 
 ## Implementation Steps
 
 1. Replace the custom availability waker list with `Notify`.
-2. Prototype the `AsyncSemaphore -> tokio::sync::Semaphore` swap and adapt the
-   owned-permit plumbing.
-3. Re-run correctness tests covering request admission and connection admission.
-4. Add a focused contention check or benchmark to confirm the new wakeup path
-   eliminates the current wake-all + linear-scan debt.
-5. Update design docs to say limiter waiting uses Tokio primitives.
+2. Replace custom permit accounting with Tokio owned permits while keeping a
+   local readiness waiter list for shared `poll_ready()` call sites.
+3. Add regression coverage for:
+   - concurrent `poll_ready()` waiters on the same limiter
+   - multiple concurrent request-admission waiters
+   - `listen()` notifications that happen after `listen()` but before first poll
+4. Re-run correctness tests covering request admission and connection admission.
+5. Update design docs to describe the hybrid implementation accurately.
 
 ## Verification
 
 - Existing request-limit and connection-limit tests continue to pass.
 - Add coverage that waiting tasks are released correctly after permits return.
-- Add a contention-oriented benchmark or narrow perf harness that exercises many
-  waiters and validates the removal of custom-waker overhead.
+- Add coverage that concurrent `poll_ready()` callers all wake after a permit is
+  released.
+- Add coverage that `ConnectionAvailability::listen()` observes notifications
+  sent before first poll.
 
 ## Non-goals
 
