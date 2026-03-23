@@ -83,22 +83,32 @@ struct ConnectTunnelParams<'a> {
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectBudget {
-    deadline: Option<Instant>,
+    started_at: Instant,
+    connect_timeout: Option<Duration>,
+    call_deadline: Option<Instant>,
 }
 
 impl ConnectBudget {
     fn new(connect_timeout: Option<Duration>, call_deadline: Option<Instant>) -> Self {
-        let connect_deadline = connect_timeout.map(|timeout| Instant::now() + timeout);
-        let deadline = match (connect_deadline, call_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        Self { deadline }
+        Self {
+            started_at: Instant::now(),
+            connect_timeout,
+            call_deadline,
+        }
     }
 
     fn remaining(&self) -> Option<Duration> {
-        self.deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        let connect_remaining = self
+            .connect_timeout
+            .map(|timeout| timeout.saturating_sub(self.started_at.elapsed()));
+        let call_remaining = self
+            .call_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+
+        match (connect_remaining, call_remaining) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -3434,6 +3444,14 @@ mod tests {
 
         let remaining = budget.remaining().expect("remaining budget");
         assert!(remaining < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn connect_budget_handles_huge_timeouts_without_instant_overflow() {
+        let budget = super::ConnectBudget::new(Some(Duration::MAX), None);
+
+        let remaining = budget.remaining().expect("remaining budget");
+        assert!(remaining > Duration::from_secs(60), "{remaining:?}");
     }
 
     #[test]

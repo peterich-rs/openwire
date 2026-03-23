@@ -22,12 +22,12 @@ Status: implemented
 
 ## Locked Decisions
 
-- Introduce `ConnectBudget { deadline: Option<Instant> }`.
-- `ConnectBudget::new(connect_timeout, call_deadline)` computes
-  `min(now + connect_timeout, call_deadline)` when both exist, else whichever
-  exists, else `None`.
-- `ConnectBudget::remaining()` returns `Option<Duration>` using
-  `saturating_duration_since(Instant::now())`.
+- Introduce `ConnectBudget { started_at, connect_timeout, call_deadline }`.
+- `ConnectBudget::new(connect_timeout, call_deadline)` snapshots `started_at`
+  once and stores the raw timeout plus optional call deadline.
+- `ConnectBudget::remaining()` returns `Option<Duration>` by subtracting
+  elapsed time from `connect_timeout`, comparing that with the remaining call
+  deadline when present, and taking the earlier budget.
 - `FastFallbackDialer::dial_route_plan` is generalized over an intermediate
   connect result type `I`.
 - Direct and forward-proxy paths use `I = BoxConnection`.
@@ -59,6 +59,7 @@ Status: implemented
 - Add a SOCKS5 case where multiple handshake stages cumulatively exhaust one
   shared budget.
 - `ConnectBudget::new(None, None)` preserves the existing no-timeout behavior.
+- `ConnectBudget::new(Some(Duration::MAX), None)` does not panic.
 
 ## Non-goals
 
