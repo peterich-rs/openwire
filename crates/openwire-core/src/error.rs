@@ -3,8 +3,6 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-use thiserror::Error;
-
 pub type BoxError = Arc<dyn StdError + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,14 +57,30 @@ struct EstablishmentContext {
     connect_timeout: bool,
 }
 
-#[derive(Debug, Clone, Error)]
-#[error("{kind}: {message}")]
+#[derive(Debug, Clone)]
 pub struct WireError {
     kind: WireErrorKind,
     message: Cow<'static, str>,
     establishment: Option<EstablishmentContext>,
-    #[source]
     source: Option<BoxError>,
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.kind, self.message)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for WireError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
+    }
 }
 
 impl WireError {
@@ -284,5 +298,25 @@ impl From<hyper::Error> for WireError {
         }
 
         Self::with_source(WireErrorKind::Protocol, "HTTP protocol error", source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::WireError;
+
+    #[test]
+    fn display_includes_underlying_source_when_present() {
+        let error = WireError::connect(
+            "TCP connect failed",
+            io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "connect: TCP connect failed: connection refused"
+        );
     }
 }

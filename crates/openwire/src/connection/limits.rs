@@ -130,22 +130,56 @@ impl RequestAdmissionLimiter {
             });
         };
 
-        let global = match &inner.global {
-            Some(state) => Some(RequestGlobalPermit {
-                permit: Some(state.acquire_owned().await),
+        match (&inner.global, &inner.per_address) {
+            (Some(global), Some(limiters)) => {
+                let address_semaphore = limiters.semaphore_for(&address);
+                let owner = limiters.clone();
+                let key = address;
+                poll_fn(move |cx| loop {
+                    if global.poll_ready(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    if address_semaphore.poll_ready(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+
+                    let Some(global_permit) = global.try_acquire_owned() else {
+                        continue;
+                    };
+                    let Some(per_address_permit) = address_semaphore.try_acquire_owned() else {
+                        drop(global_permit);
+                        continue;
+                    };
+
+                    return Poll::Ready(Ok(RequestAdmissionPermit {
+                        global: Some(RequestGlobalPermit {
+                            permit: Some(global_permit),
+                        }),
+                        per_address: Some(AddressSemaphorePermit {
+                            key: key.clone(),
+                            owner: owner.clone(),
+                            semaphore: address_semaphore.clone(),
+                            permit: Some(per_address_permit),
+                        }),
+                    }));
+                })
+                .await
+            }
+            (Some(global), None) => Ok(RequestAdmissionPermit {
+                global: Some(RequestGlobalPermit {
+                    permit: Some(global.acquire_owned().await),
+                }),
+                per_address: None,
             }),
-            None => None,
-        };
-
-        let per_address = match &inner.per_address {
-            Some(limiters) => Some(limiters.acquire(address).await?),
-            None => None,
-        };
-
-        Ok(RequestAdmissionPermit {
-            global,
-            per_address,
-        })
+            (None, Some(limiters)) => Ok(RequestAdmissionPermit {
+                global: None,
+                per_address: Some(limiters.acquire(address).await?),
+            }),
+            (None, None) => Ok(RequestAdmissionPermit {
+                global: None,
+                per_address: None,
+            }),
+        }
     }
 
     pub(crate) fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), WireError>> {

@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream;
-use http::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT};
+use http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT,
+};
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
@@ -294,6 +296,125 @@ async fn request_limit_per_host_blocks_parallel_calls_to_same_address() {
 
     let response = second.await.expect("second task");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_limit_per_host_uses_interceptor_rewritten_address() {
+    let server = spawn_http1(|_request| async move { ok_text("rewritten") }).await;
+    let client = Client::builder()
+        .application_interceptor(RewriteUriInterceptor::new(format!(
+            "backend.test:{}",
+            server.addr().port()
+        )))
+        .dns_resolver(HostMapResolver::new([(
+            "backend.test".to_owned(),
+            server.addr(),
+        )]))
+        .max_requests_total(2)
+        .max_requests_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request("http://placeholder-one.test/resource"))
+        .await
+        .expect("first response");
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request("http://placeholder-two.test/resource"))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should remain blocked while the rewritten backend response is still live",
+    );
+
+    drop(first);
+
+    let response = second.await.expect("second task");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_limit_waiting_on_same_host_does_not_consume_global_capacity() {
+    let server_a = spawn_http1(|_request| async move { ok_text("host-a") }).await;
+    let server_b = spawn_http1(|_request| async move { ok_text("host-b") }).await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server_a.addr()),
+            ("b.test".to_owned(), server_b.addr()),
+        ]))
+        .max_requests_total(2)
+        .max_requests_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://a.test:{}/resource",
+            server_a.addr().port()
+        )))
+        .await
+        .expect("first response");
+
+    let queued_same_host_done = Arc::new(AtomicBool::new(false));
+    let queued_same_host_done_clone = queued_same_host_done.clone();
+    let queued_same_host_client = client.clone();
+    let queued_same_host = tokio::spawn(async move {
+        let response = queued_same_host_client
+            .execute(empty_request(format!(
+                "http://a.test:{}/queued",
+                server_a.addr().port()
+            )))
+            .await
+            .expect("queued same-host response");
+        queued_same_host_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !queued_same_host_done.load(Ordering::Relaxed),
+        "same-host queued call should still be waiting for the per-host slot",
+    );
+
+    let other_host_client = client.clone();
+    let other_host = tokio::spawn(async move {
+        other_host_client
+            .execute(empty_request(format!(
+                "http://b.test:{}/resource",
+                server_b.addr().port()
+            )))
+            .await
+            .expect("other-host response")
+    });
+
+    let other_host_response = tokio::time::timeout(Duration::from_millis(200), other_host)
+        .await
+        .expect("other host should not wait for a same-host queue")
+        .expect("other host task");
+    assert_eq!(other_host_response.status(), StatusCode::OK);
+    assert!(
+        !queued_same_host_done.load(Ordering::Relaxed),
+        "same-host queued call should remain blocked until the first response is released",
+    );
+
+    drop(first);
+
+    let queued_same_host_response =
+        tokio::time::timeout(Duration::from_millis(200), queued_same_host)
+            .await
+            .expect("same-host queued call should complete after release")
+            .expect("same-host queued task");
+    assert_eq!(queued_same_host_response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -2276,6 +2397,43 @@ async fn pool_lookup_events_report_miss_then_hit_for_reused_connections() {
 }
 
 #[tokio::test]
+async fn http1_pool_does_not_reuse_connection_when_request_asks_to_close() {
+    let server = spawn_http1(|_request| async move { ok_text("close requested") }).await;
+    let connector = AttemptCountingTcpConnector::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/first",
+            server.addr().port()
+        ))
+        .header(CONNECTION, "close")
+        .body(RequestBody::empty())
+        .expect("request");
+    let response = client.execute(request).await.expect("first response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "close requested");
+    assert_eq!(connector.attempts(), 1);
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/second",
+            server.addr().port()
+        )))
+        .await
+        .expect("second response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "close requested");
+    assert_eq!(connector.attempts(), 2);
+}
+
+#[tokio::test]
 async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
     let _trace_test_guard = trace_test_lock().lock().await;
     let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
@@ -3585,6 +3743,11 @@ struct ExtensionCaptureInterceptor {
     seen: Arc<Mutex<Vec<Option<&'static str>>>>,
 }
 
+#[derive(Clone)]
+struct RewriteUriInterceptor {
+    authority: Arc<str>,
+}
+
 impl HeaderCaptureInterceptor {
     fn take_single(&self) -> ObservedHeaders {
         let seen = self.seen.lock().expect("captured headers");
@@ -3596,6 +3759,14 @@ impl HeaderCaptureInterceptor {
 impl ExtensionCaptureInterceptor {
     fn seen(&self) -> Vec<Option<&'static str>> {
         self.seen.lock().expect("captured extensions").clone()
+    }
+}
+
+impl RewriteUriInterceptor {
+    fn new(authority: impl Into<Arc<str>>) -> Self {
+        Self {
+            authority: authority.into(),
+        }
     }
 }
 
@@ -3629,6 +3800,21 @@ impl Interceptor for ExtensionCaptureInterceptor {
             .map(|marker| marker.0);
         Box::pin(async move {
             seen.lock().expect("captured extensions").push(marker);
+            next.run(exchange).await
+        })
+    }
+}
+
+impl Interceptor for RewriteUriInterceptor {
+    fn intercept(
+        &self,
+        mut exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let authority = self.authority.clone();
+        let rewritten_uri = rewrite_request_uri(exchange.request().uri(), authority.as_ref());
+        Box::pin(async move {
+            *exchange.request_mut().uri_mut() = rewritten_uri?;
             next.run(exchange).await
         })
     }
@@ -3674,6 +3860,19 @@ fn header_value(headers: &http::HeaderMap, name: http::header::HeaderName) -> Op
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn rewrite_request_uri(uri: &http::Uri, authority: &str) -> Result<http::Uri, WireError> {
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    format!("{scheme}://{authority}{path_and_query}")
+        .parse()
+        .map_err(|error| {
+            WireError::invalid_request(format!("failed to rewrite request URI: {error}"))
+        })
 }
 
 fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {

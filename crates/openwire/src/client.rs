@@ -43,8 +43,6 @@ struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
     timer: SharedTimer,
     call_timeout: Option<Duration>,
-    proxy_selector: ProxySelector,
-    request_admission: RequestAdmissionLimiter,
     service: BoxWireService,
 }
 
@@ -359,10 +357,10 @@ impl ClientBuilder {
             self.executor.clone(),
             self.timer.clone(),
             exchange_finder,
-            request_admission.clone(),
         );
         let service = build_service_chain(
             transport,
+            request_admission,
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
@@ -374,8 +372,6 @@ impl ClientBuilder {
                 event_listener_factory: self.event_listener_factory,
                 timer: self.timer,
                 call_timeout: self.policy.call_timeout,
-                proxy_selector,
-                request_admission,
                 service,
             }),
         })
@@ -444,10 +440,6 @@ impl Client {
 
 impl Call {
     pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
-        let request_address = Address::from_uri(
-            self.request.uri(),
-            self.client.inner.proxy_selector.select(self.request.uri()),
-        )?;
         let ctx = CallContext::from_factory(
             &self.client.inner.event_listener_factory,
             &self.request,
@@ -466,16 +458,13 @@ impl Call {
 
             let mut service = self.client.inner.service.clone();
             let execute_ctx = ctx.clone();
-            let request_admission = self.client.inner.request_admission.clone();
             let execute = async move {
                 tower::ServiceExt::ready(&mut service)
                     .await
                     .map_err(|error| WireError::internal("service chain not ready", error))?;
-                let permit = request_admission.acquire(request_address).await?;
-                let response = service
+                service
                     .call(Exchange::new(self.request, execute_ctx, 1))
-                    .await?;
-                Ok(attach_request_admission(response, permit))
+                    .await
             };
 
             let result =
@@ -517,12 +506,16 @@ fn attach_request_admission(
 
 fn build_service_chain(
     transport: TransportService,
+    request_admission: RequestAdmissionLimiter,
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     policy: PolicyConfig,
     proxy_selector: ProxySelector,
 ) -> BoxWireService {
     let mut network: BoxWireService = BoxCloneSyncService::new(transport);
+    network = BoxCloneSyncService::new(
+        RequestAdmissionLayer::new(request_admission, proxy_selector.clone()).layer(network),
+    );
     for interceptor in network_interceptors.iter().rev() {
         network =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
@@ -539,6 +532,89 @@ fn build_service_chain(
     }
 
     service
+}
+
+#[derive(Clone)]
+struct RequestAdmissionLayer {
+    limiter: RequestAdmissionLimiter,
+    proxy_selector: ProxySelector,
+}
+
+impl RequestAdmissionLayer {
+    fn new(limiter: RequestAdmissionLimiter, proxy_selector: ProxySelector) -> Self {
+        Self {
+            limiter,
+            proxy_selector,
+        }
+    }
+}
+
+impl<S> Layer<S> for RequestAdmissionLayer
+where
+    S: Service<Exchange, Response = Response<ResponseBody>, Error = WireError>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Service = RequestAdmissionService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestAdmissionService {
+            inner,
+            limiter: self.limiter.clone(),
+            proxy_selector: self.proxy_selector.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestAdmissionService<S> {
+    inner: S,
+    limiter: RequestAdmissionLimiter,
+    proxy_selector: ProxySelector,
+}
+
+impl<S> Service<Exchange> for RequestAdmissionService<S>
+where
+    S: Service<Exchange, Response = Response<ResponseBody>, Error = WireError>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response<ResponseBody>;
+    type Error = WireError;
+    type Future = openwire_core::BoxFuture<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.inner.poll_ready(cx) {
+            std::task::Poll::Ready(Ok(())) => self.limiter.poll_ready(cx),
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, exchange: Exchange) -> Self::Future {
+        let replacement = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, replacement);
+        let limiter = self.limiter.clone();
+        let proxy_selector = self.proxy_selector.clone();
+        Box::pin(async move {
+            let request_address = Address::from_uri(
+                exchange.request().uri(),
+                proxy_selector.select(exchange.request().uri()),
+            )?;
+            let permit = limiter.acquire(request_address).await?;
+            let response = inner.call(exchange).await?;
+            Ok(attach_request_admission(response, permit))
+        })
+    }
 }
 
 async fn with_call_deadline<F>(

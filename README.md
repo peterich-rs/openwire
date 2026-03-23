@@ -76,8 +76,8 @@ Today the repository includes:
 - route planning plus TCP fast fallback across direct routes and resolved proxy
   endpoints
 - SOCKS5 username/password tunnel authentication from proxy URL userinfo
-- request admission limits for logical in-flight calls plus fresh-connection
-  admission limits for transport fan-out
+- request-admission limits that use the final post-interceptor destination plus
+  fresh-connection admission limits for transport fan-out
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
 - connection pooling for HTTP/1.1 and HTTP/2, including verified-authority
   HTTPS HTTP/2 coalescing and protocol-agnostic idle eviction
