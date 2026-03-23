@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use futures_util::future::poll_fn;
+use tokio::sync::{Notify, OwnedSemaphorePermit as TokioOwnedSemaphorePermit, Semaphore};
 
 use openwire_core::WireError;
 
@@ -57,13 +57,7 @@ struct ConnectionPermitInner {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConnectionAvailability {
-    inner: Arc<AvailabilityState>,
-}
-
-#[derive(Debug, Default)]
-struct AvailabilityState {
-    version: AtomicU64,
-    wakers: Mutex<Vec<Waker>>,
+    notify: Arc<Notify>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,19 +82,14 @@ struct AddressSemaphorePermit {
 #[derive(Debug)]
 struct AsyncSemaphore {
     limit: usize,
-    state: Mutex<SemaphoreState>,
-}
-
-#[derive(Debug)]
-struct SemaphoreState {
-    available: usize,
-    wakers: Vec<Waker>,
+    semaphore: Arc<Semaphore>,
+    waiters: Mutex<Vec<Waker>>,
 }
 
 #[derive(Debug)]
 struct OwnedSemaphorePermit {
     semaphore: Arc<AsyncSemaphore>,
-    released: bool,
+    permit: Option<TokioOwnedSemaphorePermit>,
 }
 
 impl RequestAdmissionLimiter {
@@ -254,31 +243,11 @@ impl ConnectionLimiter {
 
 impl ConnectionAvailability {
     pub(crate) fn notify(&self) {
-        self.inner.version.fetch_add(1, Ordering::Release);
-        let wakers = {
-            let mut wakers = self.inner.wakers.lock().expect("availability waker lock");
-            std::mem::take(&mut *wakers)
-        };
-        for waker in wakers {
-            waker.wake();
-        }
+        self.notify.notify_waiters();
     }
 
-    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> {
-        let inner = self.inner.clone();
-        let observed = inner.version.load(Ordering::Acquire);
-        poll_fn(move |cx| {
-            if inner.version.load(Ordering::Acquire) != observed {
-                return Poll::Ready(());
-            }
-
-            register_waker(&inner.wakers, cx.waker());
-            if inner.version.load(Ordering::Acquire) != observed {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
+    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
     }
 }
 
@@ -331,12 +300,6 @@ impl AddressSemaphoreSet {
     }
 }
 
-impl Drop for RequestGlobalPermit {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-    }
-}
-
 impl Drop for ConnectionPermitInner {
     fn drop(&mut self) {
         drop(self.per_address.take());
@@ -374,27 +337,30 @@ impl Drop for AddressSemaphorePermit {
 
 impl AsyncSemaphore {
     fn new(limit: usize) -> Self {
+        let semaphore = Arc::new(Semaphore::new(limit));
         Self {
             limit,
-            state: Mutex::new(SemaphoreState {
-                available: limit,
-                wakers: Vec::new(),
-            }),
+            semaphore,
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
     fn available_permits(&self) -> usize {
-        self.state.lock().expect("semaphore lock").available
+        self.semaphore.available_permits()
     }
 
     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.state.lock().expect("semaphore lock");
-        if state.available > 0 {
+        if self.available_permits() > 0 {
             return Poll::Ready(());
         }
 
-        register_waker_locked(&mut state.wakers, cx.waker());
-        if state.available > 0 {
+        let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+        if self.available_permits() > 0 {
+            return Poll::Ready(());
+        }
+
+        register_waker_locked(&mut waiters, cx.waker());
+        if self.available_permits() > 0 {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -402,54 +368,46 @@ impl AsyncSemaphore {
     }
 
     fn try_acquire_owned(self: &Arc<Self>) -> Option<OwnedSemaphorePermit> {
-        let mut state = self.state.lock().expect("semaphore lock");
-        if state.available == 0 {
-            return None;
-        }
-        state.available -= 1;
-        Some(OwnedSemaphorePermit {
-            semaphore: self.clone(),
-            released: false,
-        })
+        self.semaphore
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| OwnedSemaphorePermit {
+                semaphore: self.clone(),
+                permit: Some(permit),
+            })
     }
 
     async fn acquire_owned(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        let semaphore = self.clone();
-        poll_fn(move |cx| {
-            let mut state = semaphore.state.lock().expect("semaphore lock");
-            if state.available > 0 {
-                state.available -= 1;
-                return Poll::Ready(OwnedSemaphorePermit {
-                    semaphore: semaphore.clone(),
-                    released: false,
-                });
-            }
-
-            register_waker_locked(&mut state.wakers, cx.waker());
-            Poll::Pending
-        })
-        .await
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore should not close");
+        OwnedSemaphorePermit {
+            semaphore: self.clone(),
+            permit: Some(permit),
+        }
     }
 
-    fn release(&self) {
-        let wakers = {
-            let mut state = self.state.lock().expect("semaphore lock");
-            state.available = (state.available + 1).min(self.limit);
-            std::mem::take(&mut state.wakers)
+    fn wake_waiters(&self) {
+        let waiters = {
+            let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+            std::mem::take(&mut *waiters)
         };
-        for waker in wakers {
-            waker.wake();
+        for waiter in waiters {
+            waiter.wake();
         }
     }
 }
 
 impl Drop for OwnedSemaphorePermit {
     fn drop(&mut self) {
-        if self.released {
-            return;
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+            self.semaphore.wake_waiters();
         }
-        self.released = true;
-        self.semaphore.release();
     }
 }
 
@@ -457,14 +415,181 @@ fn limit_semaphore(limit: usize) -> Option<Arc<AsyncSemaphore>> {
     (limit != usize::MAX).then(|| Arc::new(AsyncSemaphore::new(limit)))
 }
 
-fn register_waker(waiters: &Mutex<Vec<Waker>>, waker: &Waker) {
-    let mut waiters = waiters.lock().expect("waker lock");
-    register_waker_locked(&mut waiters, waker);
-}
-
 fn register_waker_locked(waiters: &mut Vec<Waker>, waker: &Waker) {
     if waiters.iter().any(|existing| existing.will_wake(waker)) {
         return;
     }
     waiters.push(waker.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::future::poll_fn;
+    use tokio::time::timeout;
+
+    use super::{ConnectionAvailability, ConnectionLimiter, RequestAdmissionLimiter};
+    use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, UriScheme};
+
+    fn make_address(host: &str) -> Address {
+        Address::new(
+            UriScheme::Https,
+            AuthorityKey::new(host, 443),
+            None,
+            Some(crate::connection::TlsIdentity::new(host)),
+            ProtocolPolicy::Http1OrHttp2,
+            DnsPolicy::System,
+        )
+    }
+
+    #[tokio::test]
+    async fn request_admission_waiter_completes_after_permit_drop() {
+        let limiter = RequestAdmissionLimiter::new(1, 1);
+        let first = limiter
+            .acquire(make_address("example.com"))
+            .await
+            .expect("first permit");
+
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                limiter
+                    .acquire(make_address("example.com"))
+                    .await
+                    .expect("second permit")
+            })
+        };
+
+        tokio::task::yield_now().await;
+        drop(first);
+
+        let second = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter completed")
+            .expect("waiter join");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn request_admission_multiple_waiters_complete_after_permit_drop() {
+        let limiter = RequestAdmissionLimiter::new(1, 1);
+        let first = limiter
+            .acquire(make_address("example.com"))
+            .await
+            .expect("first permit");
+
+        let waiters = (0..4)
+            .map(|_| {
+                let limiter = limiter.clone();
+                tokio::spawn(async move {
+                    let permit = limiter
+                        .acquire(make_address("example.com"))
+                        .await
+                        .expect("waiter permit");
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        drop(first);
+
+        for waiter in waiters {
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter completed")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_admission_poll_ready_wakes_all_waiters() {
+        let limiter = RequestAdmissionLimiter::new(1, usize::MAX);
+        let permit = limiter
+            .acquire(make_address("example.com"))
+            .await
+            .expect("held permit");
+
+        let waiters = (0..8)
+            .map(|_| {
+                let limiter = limiter.clone();
+                tokio::spawn(async move {
+                    poll_fn(|cx| limiter.poll_ready(cx))
+                        .await
+                        .expect("limiter ready");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        drop(permit);
+
+        for waiter in waiters {
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter completed")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_availability_broadcasts_to_all_waiters() {
+        let availability = ConnectionAvailability::default();
+        let waiters = (0..8)
+            .map(|_| {
+                let availability = availability.clone();
+                tokio::spawn(async move {
+                    availability.listen().await;
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        availability.notify();
+
+        for waiter in waiters {
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter completed")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_availability_listen_observes_notify_before_first_poll() {
+        let availability = ConnectionAvailability::default();
+        let waiter = availability.listen();
+
+        availability.notify();
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter completed");
+    }
+
+    #[tokio::test]
+    async fn connection_permit_drop_notifies_availability_waiters() {
+        let availability = ConnectionAvailability::default();
+        let limiter = ConnectionLimiter::new(1, 1, availability.clone());
+        let permit = limiter
+            .try_acquire(make_address("example.com"))
+            .expect("connection permit");
+
+        let waiter = {
+            let availability = availability.clone();
+            tokio::spawn(async move {
+                availability.listen().await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        drop(permit);
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter completed")
+            .expect("waiter join");
+    }
 }

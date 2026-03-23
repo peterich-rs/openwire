@@ -318,6 +318,11 @@ Current connection-core rules:
   attempt
 - request admission does not hold a global permit while waiting for a per-address
   slot
+- request-admission and fresh-connection limiters use Tokio `Semaphore` for
+  owned permits and `Notify` for connection-availability broadcasts
+- shared readiness polling still keeps a local deduplicated waiter list so
+  concurrent `poll_ready()` callers do not lose wakeups on a single shared
+  limiter
 - request-admission permits are released when the returned response body is
   dropped or consumed
 - fresh-connection admission waits for either an existing reusable connection
