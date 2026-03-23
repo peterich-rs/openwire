@@ -314,6 +314,9 @@ Current connection-core rules:
   attempt
 - request admission does not hold a global permit while waiting for a per-address
   slot
+- request-admission and fresh-connection limiters use Tokio `Semaphore` /
+  `Notify` primitives under a thin local wrapper rather than custom waker
+  vectors
 - request-admission permits are released when the returned response body is
   dropped or consumed
 - fresh-connection admission waits for either an existing reusable connection

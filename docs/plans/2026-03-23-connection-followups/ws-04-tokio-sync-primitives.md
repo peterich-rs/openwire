@@ -3,7 +3,7 @@
 Date: 2026-03-23
 PR: `PR4`
 Branch: `refactor/tokio-sync-primitives`
-Status: planned
+Status: implemented
 
 ## Scope
 
