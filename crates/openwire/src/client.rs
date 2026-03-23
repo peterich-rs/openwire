@@ -775,13 +775,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-<<<<<<< HEAD
     use http::Request;
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
-=======
-    use http::Request;
-    use openwire_core::{BoxFuture, RequestBody, TaskHandle};
->>>>>>> 80b8505 (perf: cache request addresses across admission and transport)
 
     use super::{
         cache_request_address, pool_reaper_cadence, spawn_pool_reaper, ConnectionPool,
