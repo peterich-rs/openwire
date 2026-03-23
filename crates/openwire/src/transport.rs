@@ -2766,7 +2766,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use futures_util::task::noop_waker_ref;
@@ -3423,6 +3423,17 @@ mod tests {
     fn connect_budget_preserves_none_semantics_without_deadlines() {
         let budget = super::ConnectBudget::new(None, None);
         assert_eq!(budget.remaining(), None);
+    }
+
+    #[test]
+    fn connect_budget_uses_the_earliest_available_deadline() {
+        let budget = super::ConnectBudget::new(
+            Some(Duration::from_secs(30)),
+            Some(Instant::now() + Duration::from_millis(250)),
+        );
+
+        let remaining = budget.remaining().expect("remaining budget");
+        assert!(remaining < Duration::from_secs(1));
     }
 
     #[test]
