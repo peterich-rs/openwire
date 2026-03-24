@@ -162,6 +162,14 @@ impl ProxyCredentials {
     pub(crate) fn password(&self) -> &str {
         &self.password
     }
+
+    pub(crate) fn basic_auth_header_value(&self) -> String {
+        use base64::Engine;
+
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", self.username, self.password));
+        format!("Basic {encoded}")
+    }
 }
 
 impl ProxySelector {
@@ -548,6 +556,10 @@ mod tests {
         let credentials = proxy.credentials().expect("proxy credentials");
         assert_eq!(credentials.username(), "alice");
         assert_eq!(credentials.password(), "secret");
+        assert_eq!(
+            credentials.basic_auth_header_value(),
+            "Basic YWxpY2U6c2VjcmV0"
+        );
         assert_eq!(proxy.target.host_str(), Some("proxy.test"));
         assert_eq!(proxy.target.username(), "");
         assert!(proxy.target.password().is_none());

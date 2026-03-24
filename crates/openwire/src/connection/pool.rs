@@ -81,6 +81,22 @@ impl ConnectionPool {
         connections.iter().find(|conn| conn.try_acquire()).cloned()
     }
 
+    pub(crate) fn has_in_use_connection(&self, address: &Address) -> bool {
+        let mut state = lock_mutex(&self.state);
+        if !prune_address(&self.settings, &mut state, address) {
+            return false;
+        }
+
+        state.by_address.get(address).is_some_and(|connections| {
+            connections.iter().any(|connection| {
+                matches!(
+                    connection.snapshot().allocation,
+                    ConnectionAllocationState::InUse { .. }
+                )
+            })
+        })
+    }
+
     pub(crate) fn acquire_coalesced(
         &self,
         address: &Address,
@@ -1080,5 +1096,35 @@ mod tests {
         assert!(pool.acquire(&address).is_some());
         assert!(connection.release());
         assert!(pool.acquire(&address).is_some());
+    }
+
+    #[test]
+    fn pool_reports_in_use_connections_after_pruning() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection = make_connection(address.clone(), 61);
+        pool.insert(connection.clone());
+
+        assert!(!pool.has_in_use_connection(&address));
+
+        assert!(connection.try_acquire());
+        assert!(pool.has_in_use_connection(&address));
+
+        assert!(connection.release());
+        assert!(!pool.has_in_use_connection(&address));
+    }
+
+    #[test]
+    fn pool_does_not_report_pruned_connections_as_in_use() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_idle_per_address: usize::MAX,
+        });
+        let connection = make_connection(address.clone(), 62);
+        pool.insert(connection.clone());
+        connection.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(6)));
+
+        assert!(!pool.has_in_use_connection(&address));
     }
 }

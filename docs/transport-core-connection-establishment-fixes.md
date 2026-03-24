@@ -1,10 +1,11 @@
 # Transport Core Connection Establishment Fixes
 
 Date: 2026-03-24
+Status: Implemented
 
-This document captures the final implementation plan for the three outstanding
-transport/core connection-establishment gaps called out in review. The plan is
-intentionally scoped to preserve the current layering:
+This document records the implemented fixes for the three transport/core
+connection-establishment gaps called out in review. The changes preserve the
+existing layering:
 
 ```text
 TransportService
@@ -29,8 +30,8 @@ not allow opening another socket, a transient DNS failure aborts the request
 even though the already-open keep-alive connection could satisfy it once
 released.
 
-Approach — make DNS failure recoverable only when a fresh connection cannot be
-opened, and keep coalesced-before-permit intact:
+Implementation summary — DNS failure is now recoverable only when a fresh
+connection cannot be opened, while keeping coalesced-before-permit intact:
 
 - `try_acquire_coalesced` must stay before permit consumption. It reuses an
   existing H2 connection and depends on `RoutePlan` for `route_overlap`
@@ -165,7 +166,7 @@ loop. While one route is performing expensive post-TCP establishment work
 queued in the channel instead of progressing in parallel. For proxy routes this
 degrades fast-fallback into serialized failover.
 
-Approach — fold `finalize` into each spawned route task:
+Implementation summary — `finalize` now runs inside each spawned route task:
 
 Each route already runs inside its own executor task. Extend that task to run
 the full connect-plus-finalize pipeline and send the final
@@ -255,8 +256,9 @@ consults `proxy_authenticator` after a `407`. As a result, URL-embedded
 credentials such as `Proxy::https("http://user:pass@proxy...")` are not sent on
 the initial CONNECT request.
 
-Approach — pre-seed CONNECT with Basic auth from `ProxyCredentials`, while
-leaving the challenge-response authenticator path unchanged:
+Implementation summary — CONNECT now pre-seeds Basic auth from
+`ProxyCredentials`, while leaving the challenge-response authenticator path
+unchanged:
 
 Add dependency:
 
@@ -342,4 +344,3 @@ Test changes:
   - assert the proxy only received one CONNECT request
   - assert that first CONNECT request already contains
     `proxy-authorization: Basic dXNlcjpwYXNz`
-

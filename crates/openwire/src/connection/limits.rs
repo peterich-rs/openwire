@@ -239,6 +239,21 @@ impl ConnectionLimiter {
             }),
         })
     }
+
+    pub(crate) fn can_acquire(&self, address: &Address) -> bool {
+        let Some(inner) = &self.inner else {
+            return true;
+        };
+
+        inner
+            .global
+            .as_ref()
+            .map_or(true, |semaphore| semaphore.can_acquire())
+            && inner
+                .per_address
+                .as_ref()
+                .map_or(true, |limiters| limiters.can_acquire(address))
+    }
 }
 
 impl ConnectionAvailability {
@@ -298,6 +313,15 @@ impl AddressSemaphoreSet {
             })
             .clone()
     }
+
+    fn can_acquire(&self, key: &Address) -> bool {
+        self.inner
+            .semaphores
+            .lock()
+            .expect("address semaphore lock")
+            .get(key)
+            .map_or(true, |semaphore| semaphore.can_acquire())
+    }
 }
 
 impl Drop for ConnectionPermitInner {
@@ -349,18 +373,22 @@ impl AsyncSemaphore {
         self.semaphore.available_permits()
     }
 
+    fn can_acquire(&self) -> bool {
+        self.available_permits() > 0
+    }
+
     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.available_permits() > 0 {
+        if self.can_acquire() {
             return Poll::Ready(());
         }
 
         let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
-        if self.available_permits() > 0 {
+        if self.can_acquire() {
             return Poll::Ready(());
         }
 
         register_waker_locked(&mut waiters, cx.waker());
-        if self.available_permits() > 0 {
+        if self.can_acquire() {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -591,5 +619,22 @@ mod tests {
             .await
             .expect("waiter completed")
             .expect("waiter join");
+    }
+
+    #[test]
+    fn connection_limiter_can_acquire_without_consuming_permits() {
+        let availability = ConnectionAvailability::default();
+        let limiter = ConnectionLimiter::new(1, 1, availability);
+        let address = make_address("example.com");
+
+        assert!(limiter.can_acquire(&address));
+
+        let permit = limiter
+            .try_acquire(address.clone())
+            .expect("connection permit");
+        assert!(!limiter.can_acquire(&address));
+
+        drop(permit);
+        assert!(limiter.can_acquire(&address));
     }
 }

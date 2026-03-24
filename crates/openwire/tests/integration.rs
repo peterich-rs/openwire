@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -470,6 +470,71 @@ async fn connection_limit_per_host_waits_for_existing_connection_to_become_reusa
 }
 
 #[tokio::test]
+async fn connection_limit_per_host_tolerates_dns_failure_when_busy_connection_can_be_reused() {
+    let server = spawn_http1(|_request| async move { ok_text("reused after dns failure") }).await;
+    let connector = AttemptCountingTcpConnector::default();
+    let resolver = ScriptedDnsResolver::new([(
+        "openwire.test".to_owned(),
+        vec![
+            DnsAttemptScript::Success(server.addr()),
+            DnsAttemptScript::Fail,
+        ],
+    )]);
+    let client = Client::builder()
+        .dns_resolver(resolver.clone())
+        .tcp_connector(connector.clone())
+        .max_requests_total(2)
+        .max_connections_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/resource",
+            server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(resolver.calls(), 1);
+
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second_done_clone = second_done.clone();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        let response = second_client
+            .execute(empty_request(format!(
+                "http://openwire.test:{}/resource",
+                server.addr().port()
+            )))
+            .await
+            .expect("second response");
+        second_done_clone.store(true, Ordering::Relaxed);
+        response
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(resolver.calls(), 2);
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "second call should wait for the busy pooled connection instead of failing DNS",
+    );
+
+    let body = first.into_body().text().await.expect("first body");
+    assert_eq!(body, "reused after dns failure");
+
+    let response = tokio::time::timeout(Duration::from_millis(200), second)
+        .await
+        .expect("second call should complete after release")
+        .expect("second task");
+    let body = response.into_body().text().await.expect("second body");
+    assert_eq!(body, "reused after dns failure");
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(resolver.calls(), 2);
+}
+
+#[tokio::test]
 async fn connection_limit_total_waits_for_an_existing_connection_to_close() {
     let first_server = spawn_http1(|_request| async move {
         Response::builder()
@@ -720,6 +785,62 @@ async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator
     );
     assert!(
         requests[1].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn https_proxy_connect_uses_url_embedded_credentials_on_initial_connect() {
+    let server =
+        spawn_https_http1(|_request| async move { ok_text("proxied tls url auth ok") }).await;
+    let proxy =
+        spawn_connect_proxy_requiring_authorization("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+            .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "proxy.test".to_owned(),
+            proxy.addr(),
+        )]))
+        .proxy(
+            Proxy::https(format!(
+                "http://user:pass@proxy.test:{}",
+                proxy.addr().port()
+            ))
+            .expect("proxy config"),
+        )
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://localhost:{}/secure-embedded-auth",
+            server.addr().port()
+        ))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "proxied tls url auth ok");
+
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 1, "requests = {requests:?}");
+    assert!(
+        requests[0].starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            server.addr().port()
+        )),
+        "requests = {requests:?}",
+    );
+    assert!(
+        requests[0].contains("proxy-authorization: Basic dXNlcjpwYXNz"),
         "requests = {requests:?}",
     );
 }
@@ -1210,6 +1331,67 @@ async fn connect_proxy_fast_fallback_continues_after_proxy_tunnel_failure() {
         lost_events[0].contains("reason=proxy_failed"),
         "events = {events:?}",
     );
+}
+
+#[tokio::test]
+async fn connect_proxy_fast_fallback_parallelizes_stalled_tunnel_finalization() {
+    let server =
+        spawn_http1(|_request| async move { ok_text("parallel connect proxy fallback") }).await;
+    let stalling_proxy = spawn_stalling_connect_proxy().await;
+    let working_proxy = spawn_connect_proxy().await;
+    let fake_ipv6 = SocketAddr::from(([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2], 9305));
+    let fake_ipv4 = SocketAddr::from(([192, 0, 2, 43], 9306));
+    let resolver = MultiAddrResolver::new([("proxy.test".to_owned(), vec![fake_ipv6, fake_ipv4])]);
+    let connector = ScriptedRaceTcpConnector::new([
+        (
+            fake_ipv6,
+            TcpAttemptScript {
+                actual_addr: stalling_proxy.addr(),
+                delay: Duration::ZERO,
+            },
+        ),
+        (
+            fake_ipv4,
+            TcpAttemptScript {
+                actual_addr: working_proxy.addr(),
+                delay: Duration::from_millis(200),
+            },
+        ),
+    ]);
+    let tls = ScriptedPassThroughTlsConnector::new(vec![TlsAttemptScript::Pass(
+        Duration::from_millis(1),
+    )]);
+    let client = Client::builder()
+        .dns_resolver(resolver)
+        .tcp_connector(connector.clone())
+        .tls_connector(tls.clone())
+        .proxy(
+            Proxy::https(format!(
+                "http://proxy.test:{}",
+                stalling_proxy.addr().port()
+            ))
+            .expect("proxy config"),
+        )
+        .build()
+        .expect("client");
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.execute(empty_request(format!(
+            "https://localhost:{}/proxy-connect-stall",
+            server.addr().port()
+        ))),
+    )
+    .await
+    .expect("request should complete without waiting for stalled CONNECT")
+    .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "parallel connect proxy fallback");
+    assert_eq!(connector.attempts(), 2);
+    assert_eq!(tls.calls(), 1);
+    assert_eq!(stalling_proxy.requests().len(), 1);
+    assert_eq!(working_proxy.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -4333,6 +4515,79 @@ impl DnsResolver for MultiAddrResolver {
             })?;
             ctx.listener().dns_end(&ctx, &host, &addrs);
             Ok(addrs)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedDnsResolver {
+    scripts: Arc<Mutex<HashMap<String, VecDeque<DnsAttemptScript>>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum DnsAttemptScript {
+    Success(SocketAddr),
+    Fail,
+}
+
+impl ScriptedDnsResolver {
+    fn new(entries: impl IntoIterator<Item = (String, Vec<DnsAttemptScript>)>) -> Self {
+        Self {
+            scripts: Arc::new(Mutex::new(
+                entries
+                    .into_iter()
+                    .map(|(host, scripts)| (host, VecDeque::from(scripts)))
+                    .collect(),
+            )),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl DnsResolver for ScriptedDnsResolver {
+    fn resolve(
+        &self,
+        ctx: CallContext,
+        host: String,
+        port: u16,
+    ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
+        let scripts = self.scripts.clone();
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            ctx.listener().dns_start(&ctx, &host, port);
+            let script = scripts
+                .lock()
+                .expect("scripted dns scripts")
+                .get_mut(&host)
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| {
+                    WireError::dns(
+                        "missing scripted dns response",
+                        io::Error::new(io::ErrorKind::NotFound, "missing scripted dns response"),
+                    )
+                })?;
+
+            match script {
+                DnsAttemptScript::Success(mut addr) => {
+                    addr.set_port(port);
+                    ctx.listener().dns_end(&ctx, &host, &[addr]);
+                    Ok(vec![addr])
+                }
+                DnsAttemptScript::Fail => {
+                    let error = WireError::dns(
+                        "scripted dns failure",
+                        io::Error::new(io::ErrorKind::TimedOut, "scripted dns failure"),
+                    );
+                    ctx.listener().dns_failed(&ctx, &host, &error);
+                    Err(error)
+                }
+            }
         })
     }
 }

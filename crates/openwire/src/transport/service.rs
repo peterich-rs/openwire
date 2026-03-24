@@ -229,6 +229,7 @@ impl TransportService {
 
         loop {
             let wait_for_availability = self.connection_availability.listen();
+            let mut waitable_pooled_connection = false;
 
             let connection = match exact_candidate.take() {
                 Some(connection) => Some(connection),
@@ -248,6 +249,7 @@ impl TransportService {
                     }
                     BindingAcquireResult::Busy => {
                         let _ = self.exchange_finder.release(&connection);
+                        waitable_pooled_connection = true;
                     }
                     BindingAcquireResult::Stale => {
                         let _ = self.exchange_finder.pool().remove(connection.id());
@@ -256,12 +258,29 @@ impl TransportService {
                 }
             }
 
+            if !waitable_pooled_connection {
+                waitable_pooled_connection = self
+                    .exchange_finder
+                    .pool()
+                    .has_in_use_connection(prepared.address());
+            }
+
             if route_plan.is_none() {
-                route_plan = Some(
-                    self.connector
-                        .route_plan(ctx.clone(), prepared.address())
-                        .await?,
-                );
+                match self
+                    .connector
+                    .route_plan(ctx.clone(), prepared.address())
+                    .await
+                {
+                    Ok(plan) => route_plan = Some(plan),
+                    Err(_error)
+                        if waitable_pooled_connection
+                            && !self.connection_limiter.can_acquire(prepared.address()) =>
+                    {
+                        wait_for_availability.await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if let Some(selected) = self
                 .try_acquire_coalesced(prepared.address(), route_plan.as_ref().expect("route plan"))

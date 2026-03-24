@@ -62,6 +62,7 @@ pub(super) struct ConnectTunnelParams<'a> {
     pub(super) target_uri: &'a Uri,
     pub(super) stream: BoxConnection,
     pub(super) tcp_connector: Arc<dyn TcpConnector>,
+    pub(super) initial_proxy_credentials: Option<ProxyCredentials>,
     pub(super) proxy_authenticator: Option<SharedAuthenticator>,
     pub(super) max_proxy_auth_attempts: usize,
     pub(super) budget: ConnectBudget,
@@ -337,8 +338,10 @@ async fn connect_via_http_proxy(
                 move |ctx, target_uri, route, (stream, budget)| {
                     let deps = deps.clone();
                     async move {
-                        let proxy_addr = match route.kind() {
-                            RouteKind::ConnectProxy { proxy, .. } => *proxy,
+                        let (proxy_addr, credentials) = match route.kind() {
+                            RouteKind::ConnectProxy { proxy, credentials } => {
+                                (*proxy, credentials.clone())
+                            }
                             other => {
                                 return Err(WireError::internal(
                                     format!(
@@ -354,6 +357,7 @@ async fn connect_via_http_proxy(
                             target_uri: &target_uri,
                             stream,
                             tcp_connector: deps.tcp_connector.clone(),
+                            initial_proxy_credentials: credentials,
                             proxy_authenticator: deps.proxy_authenticator.clone(),
                             max_proxy_auth_attempts: deps.max_proxy_auth_attempts,
                             budget,
@@ -498,6 +502,11 @@ pub(super) async fn establish_connect_tunnel(
     let mut stream = params.stream;
     let mut auth_count = 0u32;
     let mut connect_headers = HeaderMap::new();
+    if let Some(credentials) = &params.initial_proxy_credentials {
+        let value = HeaderValue::from_str(&credentials.basic_auth_header_value())
+            .expect("proxy basic auth header should be valid ASCII");
+        connect_headers.insert(http::header::PROXY_AUTHORIZATION, value);
+    }
 
     loop {
         match send_connect_request(

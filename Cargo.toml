@@ -19,6 +19,7 @@ rust-version = "1.80"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+base64 = "0.22"
 bytes = "1.10.1"
 futures-channel = "0.3.31"
 futures-core = "0.3.31"

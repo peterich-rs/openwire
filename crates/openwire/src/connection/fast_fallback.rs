@@ -105,7 +105,7 @@ impl FastFallbackDialer {
         }
 
         let mut connect_plan = ConnectPlan::from_route_plan(&route_plan);
-        let (tx, mut rx) = mpsc::unbounded::<FastFallbackMessage<I>>();
+        let (tx, mut rx) = mpsc::unbounded::<FastFallbackMessage>();
         let mut tasks = Vec::new();
         for index in 0..route_count {
             let attempt = connect_plan
@@ -113,8 +113,10 @@ impl FastFallbackDialer {
                 .expect("connect plan should contain every route")
                 .clone();
             let ctx = ctx.clone();
+            let uri = uri.clone();
             let tx = tx.clone();
             let connect = connect.clone();
+            let finalize = finalize.clone();
             let timer = runtime.timer.clone();
             let (abort, abort_registration) = AbortHandle::new_pair();
             let (done_tx, done_rx) = oneshot::channel();
@@ -132,7 +134,11 @@ impl FastFallbackDialer {
                             route_family,
                         });
 
-                        let result = connect(ctx, attempt.route().clone()).await;
+                        let route = attempt.route().clone();
+                        let result = match connect(ctx.clone(), route.clone()).await {
+                            Ok(intermediate) => finalize(ctx, uri, route, intermediate).await,
+                            Err(error) => Err(error),
+                        };
                         let _ = tx.unbounded_send(FastFallbackMessage::Finished {
                             route_index: index,
                             result,
@@ -189,91 +195,55 @@ impl FastFallbackDialer {
                     result,
                 } => match result {
                     Ok(stream) => {
-                        let route = connect_plan
-                            .attempt(route_index)
-                            .expect("connect plan should contain finished route")
-                            .route()
-                            .clone();
-                        match finalize(ctx.clone(), uri.clone(), route, stream).await {
-                            Ok(stream) => {
-                                connect_plan.promote_winner(route_index);
-                                ctx.listener().connect_race_won(
-                                    &ctx,
-                                    race_id,
-                                    route_index,
-                                    route_count,
-                                );
-                                tracing::debug!(
-                                    call_id = ctx.call_id().as_u64(),
-                                    connect_race_id = race_id,
-                                    route_index,
-                                    route_count,
-                                    "fast fallback connect attempt won",
-                                );
-                                cleanup_losers(
-                                    &ctx,
-                                    &mut connect_plan,
-                                    race_id,
-                                    route_index,
-                                    route_count,
-                                    &mut tasks,
-                                    &mut rx,
-                                )
-                                .await;
-                                return Ok((
-                                    stream,
-                                    FastFallbackOutcome {
-                                        race_id,
-                                        route_count,
-                                        winner_index: route_index,
-                                        fast_fallback_enabled,
-                                    },
-                                ));
-                            }
-                            Err(error) => {
-                                let stage = failure_stage(&error);
-                                connect_plan.mark_failed(
-                                    route_index,
-                                    ConnectFailure::new(stage, error.message().to_owned()),
-                                );
-                                ctx.listener().connect_race_lost(
-                                    &ctx,
-                                    race_id,
-                                    route_index,
-                                    route_count,
-                                    loss_reason(stage),
-                                );
-                                tracing::debug!(
-                                    call_id = ctx.call_id().as_u64(),
-                                    connect_race_id = race_id,
-                                    route_index,
-                                    route_count,
-                                    failure_stage = ?stage,
-                                    error_kind = %error.kind(),
-                                    error_message = %error.message(),
-                                    "fast fallback connect attempt lost after establishment failure",
-                                );
-                                if !error.is_retryable_establishment() {
-                                    abort_all(&mut tasks).await;
-                                    return Err(error);
-                                }
-                                last_error = Some(error);
-                            }
-                        }
+                        connect_plan.promote_winner(route_index);
+                        ctx.listener()
+                            .connect_race_won(&ctx, race_id, route_index, route_count);
+                        tracing::debug!(
+                            call_id = ctx.call_id().as_u64(),
+                            connect_race_id = race_id,
+                            route_index,
+                            route_count,
+                            "fast fallback connect attempt won",
+                        );
+                        cleanup_losers(
+                            &ctx,
+                            &mut connect_plan,
+                            race_id,
+                            route_index,
+                            route_count,
+                            &mut tasks,
+                            &mut rx,
+                        )
+                        .await;
+                        return Ok((
+                            stream,
+                            FastFallbackOutcome {
+                                race_id,
+                                route_count,
+                                winner_index: route_index,
+                                fast_fallback_enabled,
+                            },
+                        ));
                     }
                     Err(error) => {
+                        let stage = failure_stage(&error);
                         connect_plan.mark_failed(
                             route_index,
-                            ConnectFailure::new(
-                                ConnectFailureStage::Tcp,
-                                error.message().to_owned(),
-                            ),
+                            ConnectFailure::new(stage, error.message().to_owned()),
+                        );
+                        ctx.listener().connect_race_lost(
+                            &ctx,
+                            race_id,
+                            route_index,
+                            route_count,
+                            loss_reason(stage),
                         );
                         tracing::debug!(
                             call_id = ctx.call_id().as_u64(),
                             connect_race_id = race_id,
                             route_index,
                             route_count,
+                            failure_stage = ?stage,
                             error_kind = %error.kind(),
                             error_message = %error.message(),
                             "fast fallback connect attempt failed",
@@ -371,7 +341,7 @@ fn loss_reason(stage: ConnectFailureStage) -> &'static str {
     }
 }
 
-enum FastFallbackMessage<I> {
+enum FastFallbackMessage {
     Started {
         race_id: u64,
         route_index: usize,
@@ -380,7 +350,7 @@ enum FastFallbackMessage<I> {
     },
     Finished {
         route_index: usize,
-        result: Result<I, WireError>,
+        result: Result<BoxConnection, WireError>,
     },
 }
 
@@ -400,14 +370,14 @@ fn route_family_label(family: RouteFamily) -> String {
     }
 }
 
-async fn cleanup_losers<I>(
+async fn cleanup_losers(
     ctx: &CallContext,
     connect_plan: &mut ConnectPlan,
     race_id: u64,
     winner_index: usize,
     route_count: usize,
     tasks: &mut [RaceTask],
-    rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage<I>>,
+    rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage>,
 ) {
     let mut canceled_routes = vec![false; route_count];
     for (index, task) in tasks.iter_mut().enumerate() {
@@ -840,10 +810,16 @@ mod tests {
             ])
             .with_success_notifiers([(addr2, loser_connected.clone())]),
         );
-        let tls = Arc::new(ScriptedTlsConnector::new(vec![TlsScript::Pass {
-            delay: Duration::ZERO,
-            wait_for: Some(loser_connected),
-        }]));
+        let tls = Arc::new(ScriptedTlsConnector::new(vec![
+            TlsScript::Pass {
+                delay: Duration::ZERO,
+                wait_for: Some(loser_connected),
+            },
+            TlsScript::Pass {
+                delay: Duration::from_millis(5),
+                wait_for: None,
+            },
+        ]));
 
         let (stream, _outcome) = FastFallbackDialer
             .dial_direct(
@@ -856,7 +832,8 @@ mod tests {
             .expect("dial should succeed");
 
         drop(stream);
-        assert_eq!(tls.calls.load(Ordering::Relaxed), 1);
+        assert!(tls.calls.load(Ordering::Relaxed) >= 1);
+        assert!(tls.calls.load(Ordering::Relaxed) <= 2);
         assert_eq!(tcp.drops.load(Ordering::Relaxed), 2);
     }
 
