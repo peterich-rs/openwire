@@ -2,7 +2,7 @@
 
 Date: 2026-03-24
 Branch: `refactor/transport-module-split`
-Status: proposed
+Status: implemented
 
 ## Scope
 
@@ -413,7 +413,7 @@ Verification:
 
 Verification:
 
-- `rg -n "crates/openwire/src/transport.rs|transport/mod.rs" docs`
+- `rg -n "crates/openwire/src/transport.rs" docs --glob '!docs/plans/transport-module-split.md'`
 - `cargo test -q -p openwire`
 
 ## Refactor Rules

@@ -15,7 +15,7 @@ Status: implemented
 
 ## Owned Files
 
-- `crates/openwire/src/transport.rs`
+- `crates/openwire/src/transport/connect.rs`
 - `crates/openwire/src/connection/fast_fallback.rs`
 - `crates/openwire/tests/integration.rs`
 - `docs/DESIGN.md`
