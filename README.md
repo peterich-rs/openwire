@@ -7,6 +7,10 @@ around request policy, route planning, connection pooling, fast fallback, and
 protocol binding. The default executor/timer and TLS integrations are Tokio and
 Rustls.
 
+It is aimed at cases where a plain protocol client is not enough and the
+networking layer needs clear policy behavior, reusable transport building
+blocks, and stable observability hooks.
+
 ## What It Provides
 
 - `Client`, `ClientBuilder`, and one-shot `Call` over `http::Request<RequestBody>`
@@ -36,11 +40,6 @@ Rustls.
 Tokio-specific adapters are imported from `openwire-tokio` directly; `openwire`
 keeps the client API and higher-level policy / planning surfaces.
 
-## Architecture
-
-Detailed execution flow, transport layering, and extension boundaries are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
 ## Quick Start
 
 ```rust
@@ -60,31 +59,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Current Baseline
+## Current Status
 
-Today the repository includes:
+Today the project includes:
 
 - request execution through `Client::execute(...)` and `Call::execute()`
-- application and network interceptor chains
-- redirect, retry, cookie, and authenticator follow-up handling
-- request normalization for `Host`, `User-Agent`, and body framing
-- redirect policy defaults to rejecting `https -> http` downgrades unless
-  `ClientBuilder::allow_insecure_redirects(true)` is set
-- route planning plus TCP fast fallback across direct routes and resolved proxy
-  endpoints
-- SOCKS5 username/password tunnel authentication from proxy URL userinfo
-- request-admission limits that use the final post-interceptor destination plus
-  fresh-connection admission limits for transport fan-out
+- application and network interceptors
+- retry, redirect, cookie, and authenticator follow-up handling
+- HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
-- connection pooling for HTTP/1.1 and HTTP/2, including verified-authority
-  HTTPS HTTP/2 coalescing and protocol-agnostic idle eviction
-- `ClientBuilder` knobs for `max_requests_total`,
-  `max_requests_per_host`, `max_connections_total`, and
-  `max_connections_per_host`
-- opt-in system proxy loading from standard environment variables
-- local performance tests and Criterion benchmarks for warm and cold paths
+- connection pooling, fast fallback, and route planning
+- optional cache integration in `openwire-cache`
+- an opt-in live-network smoke suite outside the required CI path
 
-## Verification
+## Development
 
 ```bash
 cargo check --workspace --all-targets
@@ -110,3 +98,8 @@ when they require external credentials, temporary remote resources, untrusted
 public proxies, or timing-sensitive assertions that public networks cannot make
 credible. Those follow-ons are tracked in
 [docs/live-network-follow-ups.md](docs/live-network-follow-ups.md).
+
+## Architecture
+
+Detailed execution flow, transport layering, and extension boundaries are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
