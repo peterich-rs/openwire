@@ -1,9 +1,9 @@
-# OpenWire Execution Tasks
+# OpenWire Live-Network Follow-Ups
 
-Date: 2026-03-21
+Date: 2026-03-24
 
-This file tracks only the remaining deferred follow-on work for the
-real-network-validation baseline described in `docs/DESIGN.md`.
+This file tracks only deferred follow-on work for the opt-in live-network
+validation surface.
 
 Completed baseline:
 
