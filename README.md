@@ -36,10 +36,10 @@ Rustls.
 Tokio-specific adapters are imported from `openwire-tokio` directly; `openwire`
 keeps the client API and higher-level policy / planning surfaces.
 
-## Project References
+## Architecture
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, execution flow, and extension boundaries
-- [docs/tasks.md](docs/tasks.md): deferred live-validation follow-on work
+Detailed execution flow, transport layering, and extension boundaries are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick Start
 
@@ -108,4 +108,5 @@ runs without affecting the required CI path.
 Deferred public-origin follow-ons are intentionally kept out of this baseline
 when they require external credentials, temporary remote resources, untrusted
 public proxies, or timing-sensitive assertions that public networks cannot make
-credible.
+credible. Those follow-ons are tracked in
+[docs/live-network-follow-ups.md](docs/live-network-follow-ups.md).
