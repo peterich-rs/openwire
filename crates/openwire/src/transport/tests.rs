@@ -23,20 +23,26 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
 use openwire_core::{
-    AuthContext, Authenticator, BoxConnection, BoxFuture, BoxTaskHandle, CallContext,
-    DnsResolver, NoopEventListener, RequestBody, SharedTimer, TaskHandle, TcpConnector,
-    WireError, WireExecutor,
+    AuthContext, Authenticator, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver,
+    NoopEventListener, RequestBody, SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
 };
 
-use super::{
-    abandon_response_lease, parse_connect_response_head, record_fast_fallback_trace,
-    split_connect_response_head, ConnectionTaskRegistry, FastFallbackOutcome,
-    PrefetchedTunnelBytes,
+use super::bindings::ConnectionTaskRegistry;
+use super::body::{
+    abandon_response_lease, spawn_body_deadline_signal, ResponseLease, ResponseLeaseShared,
 };
+use super::connect::{
+    establish_connect_tunnel, establish_socks5_tunnel, find_connect_response_end,
+    parse_connect_response_head, record_fast_fallback_trace, split_connect_response_head,
+    ConnectBudget, ConnectTunnelParams, PrefetchedTunnelBytes,
+};
+use super::protocol::connection_header_requests_close;
+use crate::auth::SharedAuthenticator;
 use crate::connection::ConnectionPool;
 use crate::connection::{
-    Address, AuthorityKey, ConnectionProtocol, DnsPolicy, PoolSettings, ProtocolPolicy,
-    RealConnection, Route, RoutePlan, RoutePlanner, UriScheme,
+    Address, AuthorityKey, ConnectionAvailability, ConnectionProtocol, DnsPolicy,
+    FastFallbackOutcome, PoolSettings, ProtocolPolicy, RealConnection, Route, RoutePlan,
+    RoutePlanner, UriScheme,
 };
 use crate::proxy::ProxySelector;
 
@@ -94,12 +100,7 @@ where
         );
     }
 
-    fn on_record(
-        &self,
-        id: &Id,
-        values: &tracing::span::Record<'_>,
-        _ctx: LayerContext<'_, S>,
-    ) {
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _ctx: LayerContext<'_, S>) {
         let mut visitor = FieldCapture::default();
         values.record(&mut visitor);
         if let Some(span) = self
@@ -187,7 +188,7 @@ fn connection_header_close_matches_multiple_values() {
     headers.append(CONNECTION, HeaderValue::from_static("keep-alive"));
     headers.append(CONNECTION, HeaderValue::from_static("close"));
 
-    assert!(super::connection_header_requests_close(&headers));
+    assert!(connection_header_requests_close(&headers));
 }
 
 #[test]
@@ -195,7 +196,7 @@ fn connection_header_close_matches_comma_separated_tokens() {
     let mut headers = HeaderMap::new();
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, close"));
 
-    assert!(super::connection_header_requests_close(&headers));
+    assert!(connection_header_requests_close(&headers));
 }
 
 #[test]
@@ -203,7 +204,7 @@ fn connection_header_close_ignores_non_close_tokens() {
     let mut headers = HeaderMap::new();
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, upgrade"));
 
-    assert!(!super::connection_header_requests_close(&headers));
+    assert!(!connection_header_requests_close(&headers));
 }
 
 #[test]
@@ -214,7 +215,7 @@ fn connection_header_close_tolerates_empty_members_and_tabs() {
         HeaderValue::from_static("keep-alive,\t,\tclose\t,"),
     );
 
-    assert!(super::connection_header_requests_close(&headers));
+    assert!(connection_header_requests_close(&headers));
 }
 
 #[test]
@@ -222,7 +223,7 @@ fn connection_header_close_conservatively_rejects_malformed_members() {
     let mut headers = HeaderMap::new();
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive;timeout=5"));
 
-    assert!(super::connection_header_requests_close(&headers));
+    assert!(connection_header_requests_close(&headers));
 }
 
 fn make_address() -> Address {
@@ -618,7 +619,7 @@ async fn read_socks5_connect_request(stream: &mut tokio::io::DuplexStream) -> Ve
 fn parse_connect_response_head_preserves_prefetched_tunnel_bytes() {
     let response =
         b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: openwire\r\n\r\n\x00\xffprefetch";
-    let split_at = super::find_connect_response_end(response).expect("split");
+    let split_at = find_connect_response_end(response).expect("split");
     let (head, prefetched) =
         split_connect_response_head(response, split_at).expect("connect response split");
     let parsed = parse_connect_response_head(head, prefetched.clone()).expect("parsed");
@@ -639,7 +640,7 @@ fn parse_connect_response_head_preserves_prefetched_tunnel_bytes() {
 #[test]
 fn parse_connect_response_head_ignores_407_body_bytes_in_same_read() {
     let response = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 4\r\n\r\nbody";
-    let split_at = super::find_connect_response_end(response).expect("split");
+    let split_at = find_connect_response_end(response).expect("split");
     let (head, prefetched) =
         split_connect_response_head(response, split_at).expect("connect response split");
     let parsed = parse_connect_response_head(head, prefetched.clone()).expect("parsed");
@@ -661,13 +662,13 @@ fn parse_connect_response_head_ignores_407_body_bytes_in_same_read() {
 
 #[test]
 fn connect_budget_preserves_none_semantics_without_deadlines() {
-    let budget = super::ConnectBudget::new(None, None);
+    let budget = ConnectBudget::new(None, None);
     assert_eq!(budget.remaining(), None);
 }
 
 #[test]
 fn connect_budget_uses_the_earliest_available_deadline() {
-    let budget = super::ConnectBudget::new(
+    let budget = ConnectBudget::new(
         Some(Duration::from_secs(30)),
         Some(Instant::now() + Duration::from_millis(250)),
     );
@@ -678,7 +679,7 @@ fn connect_budget_uses_the_earliest_available_deadline() {
 
 #[test]
 fn connect_budget_handles_huge_timeouts_without_instant_overflow() {
-    let budget = super::ConnectBudget::new(Some(Duration::MAX), None);
+    let budget = ConnectBudget::new(Some(Duration::MAX), None);
 
     let remaining = budget.remaining().expect("remaining budget");
     assert!(remaining > Duration::from_secs(60), "{remaining:?}");
@@ -706,13 +707,13 @@ fn abandoned_http2_lease_does_not_poison_the_session() {
         Arc::new(ConnectionPool::new(PoolSettings::default())),
         ProxySelector::new(Vec::new()),
     ));
-    abandon_response_lease(Some(super::ResponseLease::http2(
+    abandon_response_lease(Some(ResponseLease::http2(
         connection.clone(),
-        super::ResponseLeaseShared::new(
+        ResponseLeaseShared::new(
             exchange_finder.clone(),
             make_call_context(),
-            super::ConnectionTaskRegistry::default(),
-            super::ConnectionAvailability::default(),
+            ConnectionTaskRegistry::default(),
+            ConnectionAvailability::default(),
         ),
     )));
 
@@ -733,7 +734,7 @@ fn spawn_body_deadline_signal_marks_expired_deadlines_without_spawning() {
     let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
     let ctx = CallContext::new(Arc::new(NoopEventListener), Some(Duration::ZERO));
 
-    let signal = super::spawn_body_deadline_signal(runtime.clone(), timer, &ctx)
+    let signal = spawn_body_deadline_signal(runtime.clone(), timer, &ctx)
         .expect("deadline signal")
         .expect("signal");
 
@@ -790,7 +791,7 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
     let (retry_stream, mut retry_peer) = duplex_box_connection(1024);
     let retry_connector = RecordingRetryTcpConnector::new(retry_stream);
     let authenticator_impl = Arc::new(StaticProxyAuthenticator::default());
-    let authenticator = authenticator_impl.clone() as super::SharedAuthenticator;
+    let authenticator = authenticator_impl.clone() as SharedAuthenticator;
 
     let first_response = tokio::spawn(async move {
         let request = read_until_headers_end(&mut initial_peer).await;
@@ -815,7 +816,7 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
             .await;
     });
 
-    let error = match super::establish_connect_tunnel(super::ConnectTunnelParams {
+    let error = match establish_connect_tunnel(ConnectTunnelParams {
         ctx: make_call_context(),
         proxy_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
         target_uri: &target_uri,
@@ -823,7 +824,7 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
         tcp_connector: Arc::new(retry_connector.clone()),
         proxy_authenticator: Some(authenticator.clone()),
         max_proxy_auth_attempts: 1,
-        budget: super::ConnectBudget::new(Some(Duration::from_millis(80)), None),
+        budget: ConnectBudget::new(Some(Duration::from_millis(80)), None),
         timer: timer.clone(),
     })
     .await
@@ -876,12 +877,12 @@ async fn socks5_tunnel_shares_budget_across_handshake_steps() {
             .await;
     });
 
-    let error = match super::establish_socks5_tunnel(
+    let error = match establish_socks5_tunnel(
         make_call_context(),
         &target_uri,
         std::net::SocketAddr::from(([127, 0, 0, 1], 1080)),
         stream,
-        super::ConnectBudget::new(Some(Duration::from_millis(80)), None),
+        ConnectBudget::new(Some(Duration::from_millis(80)), None),
         timer,
         None,
     )
