@@ -101,6 +101,11 @@ impl ResponseLease {
             discard_response_lease(state);
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn discard_for_test(self) {
+        self.discard();
+    }
 }
 
 impl Drop for ResponseLease {
@@ -278,44 +283,14 @@ fn release_response_lease(state: ResponseLeaseState) {
 }
 
 fn discard_response_lease(state: ResponseLeaseState) {
-    match state {
-        ResponseLeaseState::Http1 {
-            connection,
-            bindings,
-            shared:
-                ResponseLeaseShared {
-                    exchange_finder,
-                    ctx,
-                    availability,
-                    ..
-                },
-            ..
-        } => {
-            bindings.remove(connection.id());
-            let _ = exchange_finder.pool().remove(connection.id());
-            availability.notify();
-            ctx.listener().connection_released(&ctx, connection.id());
-        }
-        ResponseLeaseState::Http2 {
-            connection,
-            shared:
-                ResponseLeaseShared {
-                    exchange_finder,
-                    ctx,
-                    availability,
-                    ..
-                },
-            ..
-        } => {
-            connection.mark_unhealthy();
-            let _ = exchange_finder.release(&connection);
-            availability.notify();
-            ctx.listener().connection_released(&ctx, connection.id());
-        }
-    }
+    evict_response_lease_state(state, true);
 }
 
 fn abandon_response_lease_state(state: ResponseLeaseState) {
+    evict_response_lease_state(state, false);
+}
+
+fn evict_response_lease_state(state: ResponseLeaseState, mark_unhealthy: bool) {
     match state {
         ResponseLeaseState::Http1 {
             connection,
@@ -345,6 +320,9 @@ fn abandon_response_lease_state(state: ResponseLeaseState) {
                 },
             ..
         } => {
+            if mark_unhealthy {
+                connection.mark_unhealthy();
+            }
             let _ = exchange_finder.release(&connection);
             availability.notify();
             ctx.listener().connection_released(&ctx, connection.id());

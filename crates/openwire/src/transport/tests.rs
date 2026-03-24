@@ -729,6 +729,37 @@ fn abandoned_http2_lease_does_not_poison_the_session() {
 }
 
 #[test]
+fn discarded_http2_lease_marks_connection_unhealthy() {
+    let connection = make_connection(ConnectionProtocol::Http2);
+    assert!(connection.try_acquire());
+    let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
+        Arc::new(ConnectionPool::new(PoolSettings::default())),
+        ProxySelector::new(Vec::new()),
+    ));
+    ResponseLease::http2(
+        connection.clone(),
+        ResponseLeaseShared::new(
+            exchange_finder,
+            make_call_context(),
+            ConnectionTaskRegistry::default(),
+            ConnectionAvailability::default(),
+        ),
+    )
+    .discard_for_test();
+
+    let snapshot = connection.snapshot();
+    assert_eq!(
+        snapshot.health,
+        crate::connection::ConnectionHealth::Unhealthy
+    );
+    assert_eq!(
+        snapshot.allocation,
+        crate::connection::ConnectionAllocationState::Idle
+    );
+    assert_eq!(snapshot.completed_exchanges, 1);
+}
+
+#[test]
 fn spawn_body_deadline_signal_marks_expired_deadlines_without_spawning() {
     let runtime = Arc::new(CountingSpawnRuntime::default());
     let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
