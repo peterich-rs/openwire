@@ -3,7 +3,7 @@
 Date: 2026-03-21
 
 This file tracks only the remaining deferred follow-on work for the
-real-network-validation baseline described in `docs/DESIGN.md`.
+real-network-validation baseline described in `docs/ARCHITECTURE.md`.
 
 Completed baseline:
 

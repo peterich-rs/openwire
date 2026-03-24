@@ -36,13 +36,10 @@ Rustls.
 Tokio-specific adapters are imported from `openwire-tokio` directly; `openwire`
 keeps the client API and higher-level policy / planning surfaces.
 
-## Docs
+## Project References
 
-- [docs/DESIGN.md](docs/DESIGN.md): canonical architecture and execution chain
-- [docs/core-review.md](docs/core-review.md): completed core-review summary and doc index
-- [docs/plans/core-review-plan-spec.md](docs/plans/core-review-plan-spec.md): historical closure map for the landed core-review workstreams
-- [docs/trait-oriented-redesign.md](docs/trait-oriented-redesign.md): completed trait and crate-boundary redesign closure
-- [docs/tasks.md](docs/tasks.md): deferred follow-on tracker for live validation
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, execution flow, and extension boundaries
+- [docs/tasks.md](docs/tasks.md): deferred live-validation follow-on work
 
 ## Quick Start
 
