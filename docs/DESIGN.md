@@ -53,7 +53,12 @@ Source-file map for the main runtime path:
 | `crates/openwire/src/client.rs` | `Client`, `ClientBuilder`, `Call`, `build_service_chain()` |
 | `crates/openwire/src/policy/follow_up.rs` | `FollowUpPolicyService`, retry / redirect / auth / cookie orchestration |
 | `crates/openwire/src/bridge.rs` | `BridgeInterceptor`, request normalization |
-| `crates/openwire/src/transport.rs` | `TransportService`, `ConnectorStack`, direct binding, response-body release |
+| `crates/openwire/src/transport/mod.rs` | transport module wiring and re-exports |
+| `crates/openwire/src/transport/connect.rs` | `ConnectorStack`, route dialing, CONNECT / SOCKS tunnel setup |
+| `crates/openwire/src/transport/bindings.rs` | `ConnectionBindings`, acquired binding cleanup, connection task registry |
+| `crates/openwire/src/transport/body.rs` | `BoundResponse`, `ResponseLease`, `ObservedIncomingBody`, body deadline handling |
+| `crates/openwire/src/transport/protocol.rs` | protocol binding, request normalization, Hyper error mapping |
+| `crates/openwire/src/transport/service.rs` | `TransportService`, fresh binding orchestration, bound send path |
 | `crates/openwire/src/connection/exchange_finder.rs` | `ExchangeFinder`, pool-hit / miss preparation |
 | `crates/openwire/src/connection/planning.rs` | `Address`, `Route`, `RoutePlan`, `RoutePlanner`, `DefaultRoutePlanner` |
 | `crates/openwire/src/connection/limits.rs` | `RequestAdmissionLimiter`, `ConnectionLimiter`, `ConnectionPermit` |

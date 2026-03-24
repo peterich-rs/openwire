@@ -13,12 +13,12 @@ live in the codebase and docs.
 
 | Workstream | Landed outcomes | Current anchors |
 | --- | --- | --- |
-| `WS-01 Lifecycle / RAII` | RAII cleanup for acquired connections and response leases; tracked connection tasks abort on final client drop | `crates/openwire/src/transport.rs`; `docs/DESIGN.md` sections 6, 8, 9 |
+| `WS-01 Lifecycle / RAII` | RAII cleanup for acquired connections and response leases; tracked connection tasks abort on final client drop | `crates/openwire/src/transport/bindings.rs`; `crates/openwire/src/transport/body.rs`; `docs/DESIGN.md` sections 6, 8, 9 |
 | `WS-02 Policy / Body Semantics` | `RequestBody::absent()` vs `explicit_empty()`; downgrade redirect guard; real readiness propagation | `crates/openwire-core/src/body.rs`; `crates/openwire/src/bridge.rs`; `crates/openwire/src/policy/follow_up.rs`; `docs/DESIGN.md` sections 5, 6 |
-| `WS-03 Connectivity / Admission Control` | request and connection admission limits; sharded `ConnectionBindings`; single-owner connect failure signaling | `crates/openwire/src/client.rs`; `crates/openwire/src/connection/limits.rs`; `crates/openwire/src/transport.rs`; `docs/DESIGN.md` sections 4, 6, 7 |
-| `WS-04 Proxy / Route Dialing` | proxy credentials propagate through planning; proxy routes use shared fast fallback; SOCKS5 username/password auth | `crates/openwire/src/proxy.rs`; `crates/openwire/src/connection/planning.rs`; `crates/openwire/src/connection/fast_fallback.rs`; `crates/openwire/src/transport.rs`; `docs/DESIGN.md` section 7 |
+| `WS-03 Connectivity / Admission Control` | request and connection admission limits; sharded `ConnectionBindings`; single-owner connect failure signaling | `crates/openwire/src/client.rs`; `crates/openwire/src/connection/limits.rs`; `crates/openwire/src/transport/bindings.rs`; `crates/openwire/src/transport/service.rs`; `docs/DESIGN.md` sections 4, 6, 7 |
+| `WS-04 Proxy / Route Dialing` | proxy credentials propagate through planning; proxy routes use shared fast fallback; SOCKS5 username/password auth | `crates/openwire/src/proxy.rs`; `crates/openwire/src/connection/planning.rs`; `crates/openwire/src/connection/fast_fallback.rs`; `crates/openwire/src/transport/connect.rs`; `docs/DESIGN.md` section 7 |
 | `WS-05 Pool / State Management` | protocol-agnostic idle eviction; coalescing secondary index; poison-safe lock recovery | `crates/openwire/src/connection/pool.rs`; `crates/openwire/src/cookie.rs`; `crates/openwire/src/sync_util.rs`; `docs/DESIGN.md` section 7 |
-| `WS-06 Protocol / Low-level Correctness` | RFC 9110 `Connection` token parsing; acquire/release ordering for body deadline signal | `crates/openwire/src/transport.rs`; `docs/DESIGN.md` sections 8, 9 |
+| `WS-06 Protocol / Low-level Correctness` | RFC 9110 `Connection` token parsing; acquire/release ordering for body deadline signal | `crates/openwire/src/transport/protocol.rs`; `crates/openwire/src/transport/body.rs`; `docs/DESIGN.md` sections 8, 9 |
 
 ## Verification That Now Guards These Outcomes
 
