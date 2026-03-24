@@ -904,14 +904,7 @@ async fn socks5_tunnel_shares_budget_across_handshake_steps() {
 fn connection_task_registry_recovers_after_mutex_poisoning() {
     let registry = ConnectionTaskRegistry::default();
 
-    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-        let _guard = registry
-            .inner
-            .handles
-            .lock()
-            .expect("poison connection task registry lock for test");
-        panic!("poison connection task registry");
-    }));
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| registry.poison_handles_for_test()));
 
     let (task_id, _weak) = registry.reserve();
     registry.cancel(task_id);
