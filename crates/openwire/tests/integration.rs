@@ -1420,16 +1420,31 @@ async fn connect_proxy_fast_fallback_parallelizes_stalled_tunnel_finalization() 
         .build()
         .expect("client");
 
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.execute(empty_request(format!(
+    let response_task = tokio::spawn({
+        let client = client.clone();
+        let request = empty_request(format!(
             "https://localhost:{}/proxy-connect-stall",
             server.addr().port()
-        ))),
-    )
+        ));
+        async move { client.execute(request).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if working_proxy.requests().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("request should complete without waiting for stalled CONNECT")
-    .expect("response");
+    .expect("working CONNECT attempt should start before stalled tunnel finalization completes");
+
+    let response = tokio::time::timeout(Duration::from_secs(5), response_task)
+        .await
+        .expect("request should complete without waiting for stalled CONNECT")
+        .expect("response task")
+        .expect("response");
     let body = response.into_body().text().await.expect("body");
 
     assert_eq!(body, "parallel connect proxy fallback");
