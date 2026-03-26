@@ -103,3 +103,6 @@ credible. Those follow-ons are tracked in
 
 Detailed execution flow, transport layering, and extension boundaries are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Error-handling review, current gaps, and the long-term failure-model roadmap
+are tracked in [docs/error-handling-roadmap.md](docs/error-handling-roadmap.md).
