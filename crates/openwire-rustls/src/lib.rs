@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use hyper::Uri;
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    BoxConnection, BoxFuture, CallContext, CoalescingInfo, ConnectionInfo, TlsConnector, WireError,
+    BoxConnection, BoxFuture, CallContext, CoalescingInfo, Connected, Connection, ConnectionInfo,
+    ConnectionIo, TlsConnector, WireError,
 };
 use openwire_tokio::TokioIo;
 use pin_project_lite::pin_project;
@@ -189,25 +189,18 @@ pin_project! {
 
 impl Connection for RustlsConnection {
     fn connected(&self) -> Connected {
-        let mut connected = Connected::new()
-            .extra(self.info.clone())
-            .extra(self.coalescing.clone());
-        if self
-            .inner
-            .inner()
-            .get_ref()
-            .0
-            .inner()
-            .connected()
-            .is_proxied()
-        {
-            connected = connected.proxy(true);
-        }
-        if self.negotiated_h2 {
-            connected.negotiated_h2()
-        } else {
-            connected
-        }
+        build_connected(
+            self.info.clone(),
+            self.coalescing.clone(),
+            self.inner
+                .inner()
+                .get_ref()
+                .0
+                .inner()
+                .connected()
+                .is_proxied(),
+            self.negotiated_h2,
+        )
     }
 }
 
@@ -272,17 +265,21 @@ fn classify_tls_handshake_error(error: std::io::Error) -> WireError {
     }
 }
 
-fn connection_info_from_stream(stream: &dyn openwire_core::ConnectionIo) -> ConnectionInfo {
-    let mut extensions = http::Extensions::new();
-    stream.connected().get_extras(&mut extensions);
-    extensions
-        .remove::<ConnectionInfo>()
-        .unwrap_or(ConnectionInfo {
-            id: openwire_core::next_connection_id(),
-            remote_addr: None,
-            local_addr: None,
-            tls: false,
-        })
+fn build_connected(
+    info: ConnectionInfo,
+    coalescing: CoalescingInfo,
+    inner_proxied: bool,
+    negotiated_h2: bool,
+) -> Connected {
+    Connected::new()
+        .info(info)
+        .coalescing(coalescing)
+        .proxy(inner_proxied)
+        .negotiated_h2(negotiated_h2)
+}
+
+fn connection_info_from_stream(stream: &dyn ConnectionIo) -> ConnectionInfo {
+    stream.connected().connection_info_or_default()
 }
 
 fn coalescing_info_from_session(session: &rustls::ClientConnection) -> CoalescingInfo {
@@ -337,6 +334,56 @@ mod tests {
 
         let connector = RustlsTlsConnector::from_config(config);
         assert_eq!(connector.config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn build_connected_preserves_inner_proxy_flag() {
+        let info = test_connection_info();
+        let coalescing = CoalescingInfo::new(vec!["example.com".to_owned()]);
+
+        let connected = build_connected(info.clone(), coalescing.clone(), true, false);
+
+        assert!(connected.is_proxied());
+        assert!(!connected.is_negotiated_h2());
+        let connected_info = connected.connection_info().expect("connection info");
+        assert_eq!(connected_info.id, info.id);
+        assert_eq!(connected_info.remote_addr, info.remote_addr);
+        assert_eq!(connected_info.local_addr, info.local_addr);
+        assert_eq!(connected_info.tls, info.tls);
+        assert_eq!(connected.coalescing_info(), &coalescing);
+    }
+
+    #[test]
+    fn build_connected_marks_negotiated_h2_when_requested() {
+        let connected = build_connected(
+            test_connection_info(),
+            CoalescingInfo::default(),
+            false,
+            true,
+        );
+
+        assert!(connected.is_negotiated_h2());
+    }
+
+    #[test]
+    fn build_connected_leaves_negotiated_h2_false_without_h2() {
+        let connected = build_connected(
+            test_connection_info(),
+            CoalescingInfo::default(),
+            false,
+            false,
+        );
+
+        assert!(!connected.is_negotiated_h2());
+    }
+
+    fn test_connection_info() -> ConnectionInfo {
+        ConnectionInfo {
+            id: openwire_core::next_connection_id(),
+            remote_addr: Some(([192, 0, 2, 10], 443).into()),
+            local_addr: Some(([192, 0, 2, 20], 50000).into()),
+            tls: true,
+        }
     }
 
     #[derive(Debug)]

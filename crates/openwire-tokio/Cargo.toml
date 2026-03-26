@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 hyper.workspace = true
-hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
 pin-project-lite.workspace = true
 tokio.workspace = true

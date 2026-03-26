@@ -4,10 +4,9 @@ use std::task::{Context, Poll};
 
 use http::{Request, Response};
 use hyper::client::conn::{http1, http2};
-use hyper_util::client::legacy::connect::Connection;
 use openwire_core::{
-    BoxConnection, BoxFuture, CallContext, ConnectionInfo, Exchange, HyperExecutor, RequestBody,
-    ResponseBody, SharedTimer, WireError, WireExecutor,
+    BoxConnection, BoxFuture, CallContext, Connection, ConnectionInfo, Exchange, HyperExecutor,
+    RequestBody, ResponseBody, SharedTimer, WireError, WireExecutor,
 };
 use tower::Service;
 use tracing::instrument::WithSubscriber;

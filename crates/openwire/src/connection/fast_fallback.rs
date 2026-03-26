@@ -505,11 +505,10 @@ mod tests {
     use std::time::Duration;
 
     use hyper::Uri;
-    use hyper_util::client::legacy::connect::{Connected, Connection};
     use openwire_core::{
-        BoxConnection, CallContext, ConnectionInfo, NoopEventListenerFactory,
-        SharedEventListenerFactory, SharedTimer, TlsConnector, WireError, WireErrorKind,
-        WireExecutor,
+        BoxConnection, CallContext, Connected, Connection, ConnectionInfo,
+        NoopEventListenerFactory, SharedEventListenerFactory, SharedTimer, TlsConnector, WireError,
+        WireErrorKind, WireExecutor,
     };
     use tokio::sync::Notify;
 
@@ -704,7 +703,7 @@ mod tests {
 
     impl Connection for TestConnection {
         fn connected(&self) -> Connected {
-            Connected::new().extra(self.info.clone())
+            Connected::new().info(self.info.clone())
         }
     }
 
