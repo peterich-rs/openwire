@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_channel::{mpsc, oneshot};
+use futures_channel::mpsc;
 use futures_util::future::{AbortHandle, Abortable};
 use futures_util::stream::StreamExt;
 use hyper::rt::Timer;
@@ -119,7 +119,6 @@ impl FastFallbackDialer {
             let finalize = finalize.clone();
             let timer = runtime.timer.clone();
             let (abort, abort_registration) = AbortHandle::new_pair();
-            let (done_tx, done_rx) = oneshot::channel();
             let future = async move {
                 let _ = Abortable::new(
                     async move {
@@ -147,19 +146,15 @@ impl FastFallbackDialer {
                     abort_registration,
                 )
                 .await;
-                let _ = done_tx.send(());
             };
             if let Err(error) = runtime
                 .executor
                 .spawn(Box::pin(future.with_current_subscriber()))
             {
-                abort_all(&mut tasks).await;
+                abort_all(&mut tasks);
                 return Err(error);
             }
-            tasks.push(RaceTask {
-                abort,
-                done: Some(done_rx),
-            });
+            tasks.push(RaceTask { abort });
         }
         drop(tx);
 
@@ -212,9 +207,7 @@ impl FastFallbackDialer {
                             route_index,
                             route_count,
                             &mut tasks,
-                            &mut rx,
-                        )
-                        .await;
+                        );
                         return Ok((
                             stream,
                             FastFallbackOutcome {
@@ -249,7 +242,7 @@ impl FastFallbackDialer {
                             "fast fallback connect attempt failed",
                         );
                         if !error.is_retryable_establishment() {
-                            abort_all(&mut tasks).await;
+                            abort_all(&mut tasks);
                             return Err(error);
                         }
                         last_error = Some(error);
@@ -258,7 +251,7 @@ impl FastFallbackDialer {
             }
         }
 
-        abort_all(&mut tasks).await;
+        abort_all(&mut tasks);
         Err(last_error.unwrap_or_else(|| {
             WireError::route_exhausted("no fast-fallback route could be connected")
         }))
@@ -356,7 +349,6 @@ enum FastFallbackMessage {
 
 struct RaceTask {
     abort: AbortHandle,
-    done: Option<oneshot::Receiver<()>>,
 }
 
 fn next_connect_race_id() -> u64 {
@@ -370,14 +362,13 @@ fn route_family_label(family: RouteFamily) -> String {
     }
 }
 
-async fn cleanup_losers(
+fn cleanup_losers(
     ctx: &CallContext,
     connect_plan: &mut ConnectPlan,
     race_id: u64,
     winner_index: usize,
     route_count: usize,
     tasks: &mut [RaceTask],
-    rx: &mut mpsc::UnboundedReceiver<FastFallbackMessage>,
 ) {
     let mut canceled_routes = vec![false; route_count];
     for (index, task) in tasks.iter_mut().enumerate() {
@@ -395,26 +386,6 @@ async fn cleanup_losers(
             index,
             &mut canceled_routes,
         );
-    }
-    abort_all(tasks).await;
-
-    while let Some(message) = rx.next().await {
-        if let FastFallbackMessage::Finished {
-            route_index,
-            result: Ok(stream),
-        } = message
-        {
-            drop(stream);
-            emit_canceled_loss_if_needed(
-                ctx,
-                connect_plan,
-                race_id,
-                winner_index,
-                route_count,
-                route_index,
-                &mut canceled_routes,
-            );
-        }
     }
 }
 
@@ -452,14 +423,9 @@ fn emit_canceled_loss_if_needed(
     }
 }
 
-async fn abort_all(tasks: &mut [RaceTask]) {
+fn abort_all(tasks: &mut [RaceTask]) {
     for task in tasks.iter_mut() {
         task.abort.abort();
-    }
-    for task in tasks.iter_mut() {
-        if let Some(done) = task.done.take() {
-            let _ = done.await;
-        }
     }
 }
 
@@ -835,7 +801,16 @@ mod tests {
         // Loser may have started TLS before abort; 1 or 2 calls are both valid.
         assert!(tls.calls.load(Ordering::Relaxed) >= 1);
         assert!(tls.calls.load(Ordering::Relaxed) <= 2);
-        assert_eq!(tcp.drops.load(Ordering::Relaxed), 2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if tcp.drops.load(Ordering::Relaxed) == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loser stream should be dropped after winner selection");
     }
 
     #[tokio::test]

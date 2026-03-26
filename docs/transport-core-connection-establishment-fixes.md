@@ -225,6 +225,9 @@ Structural changes:
   the full establishment path end-to-end.
 - The controller loop no longer calls `finalize(...)` inline. `Finished(Ok())`
   means the route is fully established and can win immediately.
+- Winner and fatal-error return paths no longer wait for loser task teardown.
+  Loser cleanup happens asynchronously after cancellation so a stalled loser
+  cannot delay the winner response or fatal error propagation.
 - `Finished(Err(error))` must classify failures with `failure_stage(&error)`.
   After this refactor, the error may come from TCP, proxy tunnel, or TLS. Do
   not keep the current TCP-only handling in that branch.
