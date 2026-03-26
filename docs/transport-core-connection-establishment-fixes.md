@@ -108,7 +108,8 @@ loop {
         match self.connector.route_plan(ctx.clone(), prepared.address()).await {
             Ok(plan) => route_plan = Some(plan),
             Err(error)
-                if waitable_pooled_connection
+                if error.kind() == WireErrorKind::Dns
+                    && waitable_pooled_connection
                     && !self.connection_limiter.can_acquire(prepared.address()) =>
             {
                 tracing::debug!(...);
@@ -156,6 +157,9 @@ Key details:
   - a same-address pooled connection is already in use and could become
     reusable
   - the limiter says a fresh connection cannot be opened right now
+- Non-DNS `route_plan` failures still surface immediately. Route-planner
+  misconfiguration and internal planning errors must not be converted into a
+  pooled-wait fallback.
 - If the limiter can admit a new connection, surface the DNS error. In that
   case the request was legitimately on the fresh-connect path.
 - This preserves the current coalesced fast path and only changes the failure
@@ -247,10 +251,10 @@ Test changes:
   assert!(tls.calls.load(Ordering::Relaxed) <= 2);
   ```
 
-- Re-verify `non_retryable_tls_failure_stops_fast_fallback_continuation`. With
-  the current timing, route 2 should still be in TCP when route 1 fails TLS, so
-  `tls.calls == 1` should remain valid. Keep the assertion if the timing still
-  holds after refactor.
+- Re-verify `non_retryable_tls_failure_stops_fast_fallback_continuation`. The
+  controller must still stop on the non-retryable TLS failure, but route 2 may
+  already have entered TLS on some schedulers before the failure is observed,
+  so allow either one or two TLS starts.
 - Keep the existing
   `connect_proxy_fast_fallback_continues_after_proxy_tunnel_failure`
   integration test.

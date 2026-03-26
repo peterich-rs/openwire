@@ -15,10 +15,10 @@ use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
 use openwire::{
-    AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DnsResolver,
-    EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
-    ResponseBody, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url, WireError,
-    WireErrorKind,
+    AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DefaultRoutePlanner,
+    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
+    ResponseBody, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
+    TlsConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_core::WireExecutor;
@@ -532,6 +532,51 @@ async fn connection_limit_per_host_tolerates_dns_failure_when_busy_connection_ca
     assert_eq!(body, "reused after dns failure");
     assert_eq!(connector.attempts(), 1);
     assert_eq!(resolver.calls(), 2);
+}
+
+#[tokio::test]
+async fn connection_limit_per_host_does_not_suppress_non_dns_route_plan_failure() {
+    let server =
+        spawn_http1(|_request| async move { ok_text("reused after planner failure") }).await;
+    let connector = AttemptCountingTcpConnector::default();
+    let planner = ScriptedRoutePlanner::fail_on_plan_call(2);
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .route_planner(planner.clone())
+        .tcp_connector(connector.clone())
+        .max_requests_total(2)
+        .max_connections_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/resource",
+            server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(planner.calls(), 1);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.execute(empty_request(format!(
+            "http://openwire.test:{}/resource",
+            server.addr().port()
+        ))),
+    )
+    .await
+    .expect("non-dns route-plan failure should surface without waiting")
+    .expect_err("second response should fail");
+
+    assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+    assert_eq!(error.message(), "scripted route planner failure");
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(planner.calls(), 2);
+
+    let body = first.into_body().text().await.expect("first body");
+    assert_eq!(body, "reused after planner failure");
 }
 
 #[tokio::test]
@@ -4523,6 +4568,46 @@ impl DnsResolver for MultiAddrResolver {
 struct ScriptedDnsResolver {
     scripts: Arc<Mutex<HashMap<String, VecDeque<DnsAttemptScript>>>>,
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct ScriptedRoutePlanner {
+    inner: DefaultRoutePlanner,
+    calls: Arc<AtomicUsize>,
+    fail_on_plan_call: usize,
+}
+
+impl ScriptedRoutePlanner {
+    fn fail_on_plan_call(fail_on_plan_call: usize) -> Self {
+        Self {
+            inner: DefaultRoutePlanner::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_on_plan_call,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RoutePlanner for ScriptedRoutePlanner {
+    fn dns_target(&self, address: &openwire::Address) -> (String, u16) {
+        self.inner.dns_target(address)
+    }
+
+    fn plan(
+        &self,
+        address: &openwire::Address,
+        resolved_addrs: Vec<SocketAddr>,
+    ) -> Result<RoutePlan, WireError> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call == self.fail_on_plan_call {
+            return Err(WireError::invalid_request("scripted route planner failure"));
+        }
+
+        self.inner.plan(address, resolved_addrs)
+    }
 }
 
 #[derive(Clone, Copy)]

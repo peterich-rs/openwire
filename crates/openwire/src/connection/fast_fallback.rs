@@ -881,6 +881,10 @@ mod tests {
 
         assert_eq!(error.kind(), WireErrorKind::Tls);
         assert!(!error.is_retryable_establishment());
-        assert_eq!(tls.calls.load(Ordering::Relaxed), 1);
+        // Route 2 may enter TLS before route 1's non-retryable failure reaches
+        // the controller; one or two TLS starts are both valid.
+        let tls_calls = tls.calls.load(Ordering::Relaxed);
+        assert!(tls_calls >= 1);
+        assert!(tls_calls <= 2);
     }
 }

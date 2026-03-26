@@ -6,7 +6,7 @@ use http::{Request, Response};
 use hyper::client::conn::{http1, http2};
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, Connection, ConnectionInfo, Exchange, HyperExecutor,
-    RequestBody, ResponseBody, SharedTimer, WireError, WireExecutor,
+    RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
 };
 use tower::Service;
 use tracing::instrument::WithSubscriber;
@@ -282,7 +282,8 @@ impl TransportService {
                 {
                     Ok(plan) => route_plan = Some(plan),
                     Err(error)
-                        if waitable_pooled_connection
+                        if error.kind() == WireErrorKind::Dns
+                            && waitable_pooled_connection
                             && !self.connection_limiter.can_acquire(prepared.address()) =>
                     {
                         tracing::debug!(
