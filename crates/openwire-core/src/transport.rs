@@ -3,29 +3,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hyper::Uri;
-use hyper_util::client::legacy::connect::Connection;
 use tower::util::BoxCloneSyncService;
 use tower::{Service, ServiceExt};
 
 use crate::{BoxFuture, CallContext, WireError};
-
-pub trait ConnectionIo:
-    hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static
-{
-}
-
-impl<T> ConnectionIo for T where
-    T: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static
-{
-}
-
-pub type BoxConnection = Box<dyn ConnectionIo>;
-
-impl Connection for BoxConnection {
-    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
-        (**self).connected()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -49,6 +30,87 @@ impl CoalescingInfo {
 
     pub fn is_empty(&self) -> bool {
         self.verified_server_names.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Connected {
+    info: Option<ConnectionInfo>,
+    coalescing: CoalescingInfo,
+    proxied: bool,
+    negotiated_h2: bool,
+}
+
+impl Connected {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn info(mut self, info: ConnectionInfo) -> Self {
+        self.info = Some(info);
+        self
+    }
+
+    pub fn coalescing(mut self, coalescing: CoalescingInfo) -> Self {
+        self.coalescing = coalescing;
+        self
+    }
+
+    pub fn proxy(mut self, proxied: bool) -> Self {
+        self.proxied = proxied;
+        self
+    }
+
+    pub fn negotiated_h2(mut self, negotiated_h2: bool) -> Self {
+        self.negotiated_h2 = negotiated_h2;
+        self
+    }
+
+    pub fn is_proxied(&self) -> bool {
+        self.proxied
+    }
+
+    pub fn is_negotiated_h2(&self) -> bool {
+        self.negotiated_h2
+    }
+
+    pub fn connection_info(&self) -> Option<&ConnectionInfo> {
+        self.info.as_ref()
+    }
+
+    pub fn connection_info_or_default(&self) -> ConnectionInfo {
+        self.info.clone().unwrap_or_else(|| ConnectionInfo {
+            id: crate::next_connection_id(),
+            remote_addr: None,
+            local_addr: None,
+            tls: false,
+        })
+    }
+
+    pub fn coalescing_info(&self) -> &CoalescingInfo {
+        &self.coalescing
+    }
+}
+
+pub trait Connection {
+    fn connected(&self) -> Connected;
+}
+
+pub trait ConnectionIo:
+    hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static
+{
+}
+
+impl<T> ConnectionIo for T where
+    T: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static
+{
+}
+
+pub type BoxConnection = Box<dyn ConnectionIo>;
+
+impl Connection for BoxConnection {
+    fn connected(&self) -> Connected {
+        (**self).connected()
     }
 }
 
@@ -337,14 +399,13 @@ mod tests {
 
     use http::Request;
     use hyper::Uri;
-    use hyper_util::client::legacy::connect::Connected;
-    use hyper_util::client::legacy::connect::Connection;
     use tower::{service_fn, Service, ServiceExt};
 
     use super::{
-        BoxConnection, DnsRequest, DnsResolver, DnsResolverService, TcpConnectRequest,
-        TcpConnector, TcpConnectorService, TlsConnectRequest, TlsConnector, TlsConnectorService,
-        TowerDnsResolver, TowerTcpConnector, TowerTlsConnector,
+        BoxConnection, Connected, Connection, ConnectionInfo, DnsRequest, DnsResolver,
+        DnsResolverService, TcpConnectRequest, TcpConnector, TcpConnectorService,
+        TlsConnectRequest, TlsConnector, TlsConnectorService, TowerDnsResolver, TowerTcpConnector,
+        TowerTlsConnector,
     };
     use crate::{CallContext, NoopEventListenerFactory, RequestBody, WireError};
 
@@ -398,6 +459,40 @@ mod tests {
         fn connected(&self) -> Connected {
             Connected::new()
         }
+    }
+
+    #[test]
+    fn connected_negotiated_h2_tracks_requested_state() {
+        assert!(Connected::new().negotiated_h2(true).is_negotiated_h2());
+        assert!(!Connected::new().negotiated_h2(false).is_negotiated_h2());
+    }
+
+    #[test]
+    fn connected_connection_info_or_default_preserves_explicit_metadata() {
+        let info = ConnectionInfo {
+            id: crate::next_connection_id(),
+            remote_addr: Some(([192, 0, 2, 10], 443).into()),
+            local_addr: Some(([192, 0, 2, 20], 50000).into()),
+            tls: true,
+        };
+
+        let actual = Connected::new()
+            .info(info.clone())
+            .connection_info_or_default();
+
+        assert_eq!(actual.id, info.id);
+        assert_eq!(actual.remote_addr, info.remote_addr);
+        assert_eq!(actual.local_addr, info.local_addr);
+        assert_eq!(actual.tls, info.tls);
+    }
+
+    #[test]
+    fn connected_connection_info_or_default_falls_back_to_placeholder() {
+        let actual = Connected::new().connection_info_or_default();
+
+        assert_eq!(actual.remote_addr, None);
+        assert_eq!(actual.local_addr, None);
+        assert!(!actual.tls);
     }
 
     #[tokio::test]

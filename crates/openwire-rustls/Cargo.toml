@@ -16,7 +16,6 @@ bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
-hyper-util.workspace = true
 openwire-core = { path = "../openwire-core" }
 openwire-tokio = { path = "../openwire-tokio" }
 pin-project-lite.workspace = true

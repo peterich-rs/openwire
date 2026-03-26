@@ -15,10 +15,9 @@ use http::header::HOST;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use hyper::rt::Timer;
 use hyper::Uri;
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    AuthKind, BoxConnection, CallContext, DnsResolver, RequestBody, SharedTimer, TcpConnector,
-    TlsConnector, WireError, WireExecutor,
+    AuthKind, BoxConnection, CallContext, Connected, Connection, DnsResolver, RequestBody,
+    SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
@@ -1300,5 +1299,66 @@ impl hyper::rt::Write for ProxiedConnection {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use openwire_core::{BoxConnection, Connected, Connection};
+
+    use super::ProxiedConnection;
+
+    struct TestConnection;
+
+    impl Connection for TestConnection {
+        fn connected(&self) -> Connected {
+            Connected::new()
+        }
+    }
+
+    impl hyper::rt::Read for TestConnection {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl hyper::rt::Write for TestConnection {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn proxied_connection_marks_stream_as_proxied() {
+        let stream = ProxiedConnection {
+            inner: Box::new(TestConnection) as BoxConnection,
+        };
+
+        assert!(stream.connected().is_proxied());
     }
 }

@@ -14,7 +14,6 @@ use http::header::{HeaderValue, CONNECTION};
 use http::{HeaderMap, Method, Request};
 use hyper::rt::{Read, ReadBuf, Write};
 use hyper::Uri;
-use hyper_util::client::legacy::connect::Connected;
 use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
 use tracing::field::{Field, Visit};
 use tracing::{Id, Subscriber};
@@ -23,8 +22,9 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
 use openwire_core::{
-    AuthContext, Authenticator, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, DnsResolver,
-    NoopEventListener, RequestBody, SharedTimer, TaskHandle, TcpConnector, WireError, WireExecutor,
+    AuthContext, Authenticator, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, Connected,
+    Connection, DnsResolver, NoopEventListener, RequestBody, SharedTimer, TaskHandle, TcpConnector,
+    WireError, WireExecutor,
 };
 
 use super::bindings::ConnectionTaskRegistry;
@@ -261,7 +261,7 @@ impl DuplexConnection {
     }
 }
 
-impl hyper_util::client::legacy::connect::Connection for DuplexConnection {
+impl Connection for DuplexConnection {
     fn connected(&self) -> Connected {
         Connected::new()
     }
@@ -319,7 +319,7 @@ impl ScriptedConnection {
     }
 }
 
-impl hyper_util::client::legacy::connect::Connection for ScriptedConnection {
+impl Connection for ScriptedConnection {
     fn connected(&self) -> Connected {
         Connected::new()
     }

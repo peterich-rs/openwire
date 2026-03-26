@@ -6,10 +6,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use hyper::rt::{Executor, Sleep, Timer};
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use openwire_core::{
-    next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, ConnectionInfo,
-    DnsResolver, TaskHandle, TcpConnector, WireError, WireExecutor,
+    next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, Connected,
+    Connection, ConnectionInfo, DnsResolver, TaskHandle, TcpConnector, WireError, WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
@@ -360,7 +359,7 @@ struct TcpConnection {
 
 impl Connection for TcpConnection {
     fn connected(&self) -> Connected {
-        Connected::new().extra(self.info.clone())
+        Connected::new().info(self.info.clone())
     }
 }
 

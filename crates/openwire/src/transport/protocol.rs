@@ -2,9 +2,8 @@ use http::header::CONNECTION;
 use http::{HeaderMap, HeaderValue, Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
-use hyper_util::client::legacy::connect::Connected;
 use openwire_core::{
-    next_connection_id, BoxConnection, CoalescingInfo, ConnectionInfo, HyperExecutor, RequestBody,
+    BoxConnection, CoalescingInfo, Connected, ConnectionInfo, HyperExecutor, RequestBody,
     SharedTimer, WireError,
 };
 
@@ -204,20 +203,9 @@ fn find_wire_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&
 }
 
 pub(super) fn connection_info_from_connected(connected: &Connected) -> ConnectionInfo {
-    let mut extensions = http::Extensions::new();
-    connected.get_extras(&mut extensions);
-    extensions
-        .remove::<ConnectionInfo>()
-        .unwrap_or(ConnectionInfo {
-            id: next_connection_id(),
-            remote_addr: None,
-            local_addr: None,
-            tls: false,
-        })
+    connected.connection_info_or_default()
 }
 
 pub(super) fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
-    let mut extensions = http::Extensions::new();
-    connected.get_extras(&mut extensions);
-    extensions.remove::<CoalescingInfo>().unwrap_or_default()
+    connected.coalescing_info().clone()
 }

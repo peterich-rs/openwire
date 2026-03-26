@@ -18,7 +18,6 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
-hyper-util.workspace = true
 pin-project-lite.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
