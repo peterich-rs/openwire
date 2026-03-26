@@ -853,6 +853,7 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
         target_uri: &target_uri,
         stream: initial_stream,
         tcp_connector: Arc::new(retry_connector.clone()),
+        initial_proxy_credentials: None,
         proxy_authenticator: Some(authenticator.clone()),
         max_proxy_auth_attempts: 1,
         budget: ConnectBudget::new(Some(Duration::from_millis(80)), None),

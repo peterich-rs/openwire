@@ -14,6 +14,7 @@ platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 json = ["openwire-core/json"]
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 cookie = "0.18.0"
 cookie_store = { version = "0.21.1", default-features = false, features = ["public_suffix"] }
