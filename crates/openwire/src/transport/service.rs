@@ -230,10 +230,18 @@ impl TransportService {
         loop {
             let wait_for_availability = self.connection_availability.listen();
             let mut waitable_pooled_connection = false;
+            let mut pooled_in_use_hint = None;
 
             let connection = match exact_candidate.take() {
                 Some(connection) => Some(connection),
-                None => self.exchange_finder.pool().acquire(prepared.address()),
+                None => {
+                    let (connection, has_in_use) = self
+                        .exchange_finder
+                        .pool()
+                        .acquire_with_in_use_hint(prepared.address());
+                    pooled_in_use_hint = connection.is_none().then_some(has_in_use);
+                    connection
+                }
             };
             if let Some(connection) = connection {
                 match self.bindings.acquire(connection.id()) {
@@ -259,10 +267,11 @@ impl TransportService {
             }
 
             if !waitable_pooled_connection {
-                waitable_pooled_connection = self
-                    .exchange_finder
-                    .pool()
-                    .has_in_use_connection(prepared.address());
+                waitable_pooled_connection = pooled_in_use_hint.unwrap_or_else(|| {
+                    self.exchange_finder
+                        .pool()
+                        .has_in_use_connection(prepared.address())
+                });
             }
 
             if route_plan.is_none() {
@@ -272,10 +281,18 @@ impl TransportService {
                     .await
                 {
                     Ok(plan) => route_plan = Some(plan),
-                    Err(_error)
+                    Err(error)
                         if waitable_pooled_connection
                             && !self.connection_limiter.can_acquire(prepared.address()) =>
                     {
+                        tracing::debug!(
+                            call_id = ctx.call_id().as_u64(),
+                            host = prepared.address().authority().host(),
+                            port = prepared.address().authority().port(),
+                            error_kind = %error.kind(),
+                            error_message = %error.message(),
+                            "DNS failure suppressed; waiting for in-use pooled connection",
+                        );
                         wait_for_availability.await;
                         continue;
                     }

@@ -240,6 +240,7 @@ impl ConnectionLimiter {
         })
     }
 
+    /// Non-consuming heuristic; result may be stale by the time the caller acts on it.
     pub(crate) fn can_acquire(&self, address: &Address) -> bool {
         let Some(inner) = &self.inner else {
             return true;

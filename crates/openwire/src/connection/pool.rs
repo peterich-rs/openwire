@@ -81,20 +81,36 @@ impl ConnectionPool {
         connections.iter().find(|conn| conn.try_acquire()).cloned()
     }
 
+    pub(crate) fn acquire_with_in_use_hint(
+        &self,
+        address: &Address,
+    ) -> (Option<RealConnection>, bool) {
+        let mut state = lock_mutex(&self.state);
+        if !prune_address(&self.settings, &mut state, address) {
+            return (None, false);
+        }
+
+        let Some(connections) = state.by_address.get_mut(address) else {
+            return (None, false);
+        };
+        let connection = connections.iter().find(|conn| conn.try_acquire()).cloned();
+        let has_in_use = has_in_use_connection_unpruned(
+            connections,
+            connection.as_ref().map(RealConnection::id),
+        );
+        (connection, has_in_use)
+    }
+
     pub(crate) fn has_in_use_connection(&self, address: &Address) -> bool {
         let mut state = lock_mutex(&self.state);
         if !prune_address(&self.settings, &mut state, address) {
             return false;
         }
 
-        state.by_address.get(address).is_some_and(|connections| {
-            connections.iter().any(|connection| {
-                matches!(
-                    connection.snapshot().allocation,
-                    ConnectionAllocationState::InUse { .. }
-                )
-            })
-        })
+        state
+            .by_address
+            .get(address)
+            .is_some_and(|connections| has_in_use_connection_unpruned(connections, None))
     }
 
     pub(crate) fn acquire_coalesced(
@@ -319,6 +335,19 @@ fn prune_connections(
         connections,
     ));
     removed
+}
+
+fn has_in_use_connection_unpruned(
+    connections: &[RealConnection],
+    excluded_id: Option<ConnectionId>,
+) -> bool {
+    connections.iter().any(|connection| {
+        excluded_id != Some(connection.id())
+            && matches!(
+                connection.snapshot().allocation,
+                ConnectionAllocationState::InUse { .. }
+            )
+    })
 }
 
 fn idle_connection_expired(connection: &RealConnection, timeout: Duration) -> bool {
@@ -1112,6 +1141,42 @@ mod tests {
 
         assert!(connection.release());
         assert!(!pool.has_in_use_connection(&address));
+    }
+
+    #[test]
+    fn pool_acquire_with_in_use_hint_reuses_the_same_pruned_snapshot() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let busy = make_connection(address.clone(), 62);
+        let idle = make_connection(address.clone(), 63);
+        pool.insert(busy.clone());
+        pool.insert(idle.clone());
+
+        assert!(busy.try_acquire());
+
+        let (acquired, has_in_use) = pool.acquire_with_in_use_hint(&address);
+
+        assert_eq!(acquired.map(|connection| connection.id()), Some(idle.id()));
+        assert!(has_in_use);
+    }
+
+    #[test]
+    fn pool_acquire_with_in_use_hint_excludes_the_selected_connection() {
+        let address = address_with_proxy(None);
+        let pool = ConnectionPool::new(PoolSettings::default());
+        let connection =
+            make_connection_with_protocol(address.clone(), 64, ConnectionProtocol::Http2);
+        pool.insert(connection.clone());
+
+        assert!(connection.try_acquire());
+
+        let (acquired, has_in_use) = pool.acquire_with_in_use_hint(&address);
+
+        assert_eq!(
+            acquired.map(|selected| selected.id()),
+            Some(connection.id())
+        );
+        assert!(!has_in_use);
     }
 
     #[test]

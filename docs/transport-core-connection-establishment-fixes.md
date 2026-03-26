@@ -44,11 +44,20 @@ connection cannot be opened, while keeping coalesced-before-permit intact:
 - Add a non-consuming `ConnectionLimiter::can_acquire(&Address) -> bool`
   helper. Do not probe with `try_acquire(...).is_some()` just to inspect
   availability; that would briefly take and drop a permit and create avoidable
-  wakeups.
+  wakeups. Document it as a heuristic because permit availability can change
+  after the check.
 - Add a lightweight pooled-state helper such as
   `ConnectionPool::has_in_use_connection(&Address) -> bool` that reuses the
   pool's pruning logic and returns whether the address currently has any
   healthy, in-use pooled connection.
+- When the same loop iteration already touched the pool for same-address reuse,
+  take the reusable connection candidate and the "has in-use connection" hint
+  from the same pruned snapshot, excluding the selected candidate from the
+  hint, so the address is not pruned twice before DNS and stale candidates do
+  not self-report as waitable pooled work.
+- When DNS failure is suppressed into the pooled-wait fallback, emit a
+  `tracing::debug!` event with the call id, target host/port, and DNS error
+  details so the degraded path is visible in production logs.
 
 Restructured `acquire_connection` logic:
 
@@ -56,11 +65,19 @@ Restructured `acquire_connection` logic:
 loop {
     let wait_for_availability = self.connection_availability.listen();
     let mut waitable_pooled_connection = false;
+    let mut pooled_in_use_hint = None;
 
     // Step 1: exact reserved connection or same-address pooled reuse.
     let connection = match exact_candidate.take() {
         Some(connection) => Some(connection),
-        None => self.exchange_finder.pool().acquire(prepared.address()),
+        None => {
+            let (connection, has_in_use) = self
+                .exchange_finder
+                .pool()
+                .acquire_with_in_use_hint(prepared.address());
+            pooled_in_use_hint = connection.is_none().then_some(has_in_use);
+            connection
+        }
     };
     if let Some(connection) = connection {
         match self.bindings.acquire(connection.id()) {
@@ -77,10 +94,11 @@ loop {
     }
 
     if !waitable_pooled_connection {
-        waitable_pooled_connection = self
-            .exchange_finder
-            .pool()
-            .has_in_use_connection(prepared.address());
+        waitable_pooled_connection = pooled_in_use_hint.unwrap_or_else(|| {
+            self.exchange_finder
+                .pool()
+                .has_in_use_connection(prepared.address())
+        });
     }
 
     // Step 2: route planning stays before coalesced, but DNS failure is only
@@ -93,6 +111,7 @@ loop {
                 if waitable_pooled_connection
                     && !self.connection_limiter.can_acquire(prepared.address()) =>
             {
+                tracing::debug!(...);
                 wait_for_availability.await;
                 continue;
             }
@@ -205,6 +224,10 @@ Structural changes:
 - `Finished(Err(error))` must classify failures with `failure_stage(&error)`.
   After this refactor, the error may come from TCP, proxy tunnel, or TLS. Do
   not keep the current TCP-only handling in that branch.
+- `connect_race_lost` now fires for every failed route outcome that reaches the
+  controller, including TCP establishment failures, instead of only finalize
+  failures. Downstream listeners and metrics must treat it as a generic
+  fast-fallback loss signal across TCP, tunnel, and TLS stages.
 - `dial_route_plan` remains generic over the connect intermediate type `I`,
   because `connect` still returns `I` and `finalize` still consumes it inside
   the route task.
@@ -219,6 +242,7 @@ Test changes:
   or two TLS starts:
 
   ```rust
+  // Loser may have started TLS before abort; 1 or 2 calls are both valid.
   assert!(tls.calls.load(Ordering::Relaxed) >= 1);
   assert!(tls.calls.load(Ordering::Relaxed) <= 2);
   ```

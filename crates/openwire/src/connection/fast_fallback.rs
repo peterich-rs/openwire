@@ -832,6 +832,7 @@ mod tests {
             .expect("dial should succeed");
 
         drop(stream);
+        // Loser may have started TLS before abort; 1 or 2 calls are both valid.
         assert!(tls.calls.load(Ordering::Relaxed) >= 1);
         assert!(tls.calls.load(Ordering::Relaxed) <= 2);
         assert_eq!(tcp.drops.load(Ordering::Relaxed), 2);
