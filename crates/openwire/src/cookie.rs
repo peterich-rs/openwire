@@ -22,10 +22,13 @@ impl Jar {
 
     /// Adds a single cookie string for the given URL.
     pub fn add_cookie_str(&self, cookie: &str, url: &url::Url) {
-        let cookies = cookie_crate::Cookie::parse(cookie)
-            .ok()
-            .map(cookie_crate::Cookie::into_owned)
-            .into_iter();
+        let cookies = match cookie_crate::Cookie::parse(cookie) {
+            Ok(cookie) => Some(cookie.into_owned()).into_iter(),
+            Err(error) => {
+                tracing::debug!(%error, cookie, "dropping invalid cookie string");
+                None.into_iter()
+            }
+        };
         write_rwlock(&self.0).store_response_cookies(cookies, url);
     }
 }
@@ -33,11 +36,20 @@ impl Jar {
 impl CookieJar for Jar {
     fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url) {
         let cookies = cookie_headers.filter_map(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|value| cookie_crate::Cookie::parse(value).ok())
-                .map(cookie_crate::Cookie::into_owned)
+            let value = match value.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(%error, "dropping non-UTF8 Set-Cookie header");
+                    return None;
+                }
+            };
+            match cookie_crate::Cookie::parse(value) {
+                Ok(cookie) => Some(cookie.into_owned()),
+                Err(error) => {
+                    tracing::debug!(%error, value, "dropping invalid Set-Cookie header");
+                    None
+                }
+            }
         });
         write_rwlock(&self.0).store_response_cookies(cookies, url);
     }

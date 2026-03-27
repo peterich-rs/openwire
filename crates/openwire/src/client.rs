@@ -32,6 +32,7 @@ use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
 use crate::proxy::{system_proxies_from_env, Proxy, ProxySelector};
+use crate::sync_util::lock_mutex;
 use crate::transport::{ConnectorStack, TransportService};
 
 #[derive(Clone)]
@@ -479,7 +480,7 @@ impl PoolReaperController {
         timer: SharedTimer,
         pool: Weak<ConnectionPool>,
     ) {
-        let mut state = self.state.lock().expect("pool reaper state lock");
+        let mut state = lock_mutex(&self.state);
         if state.handle.is_some() {
             return;
         }
@@ -488,17 +489,14 @@ impl PoolReaperController {
             return;
         };
 
-        state.handle = spawn_pool_reaper(executor, timer, &pool).ok().flatten();
+        match spawn_pool_reaper(executor, timer, &pool) {
+            Ok(handle) => state.handle = handle,
+            Err(error) => tracing::warn!(%error, "failed to start pool reaper task"),
+        }
     }
 
     fn abort(&self) {
-        if let Some(handle) = self
-            .state
-            .lock()
-            .expect("pool reaper state lock")
-            .handle
-            .take()
-        {
+        if let Some(handle) = lock_mutex(&self.state).handle.take() {
             handle.abort();
         }
     }

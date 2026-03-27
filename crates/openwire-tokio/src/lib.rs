@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use hyper::rt::{Executor, Sleep, Timer};
 use openwire_core::{
     next_connection_id, BoxConnection, BoxFuture, BoxTaskHandle, CallContext, Connected,
-    Connection, ConnectionInfo, DnsResolver, TaskHandle, TcpConnector, WireError, WireExecutor,
+    Connection, ConnectionInfo, DnsResolver, EstablishmentStage, TaskHandle, TcpConnector,
+    WireError, WireErrorKind, WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
@@ -311,9 +312,13 @@ impl TcpConnector for TokioTcpConnector {
                     Ok(result) => {
                         result.map_err(|error| WireError::tcp_connect("TCP connect failed", error))
                     }
-                    Err(_error) => Err(WireError::connect_timeout(format!(
-                        "connection timed out after {timeout:?}"
-                    ))),
+                    Err(error) => Err(WireError::with_source(
+                        WireErrorKind::Timeout,
+                        format!("connection timed out after {timeout:?}"),
+                        error,
+                    )
+                    .with_establishment(EstablishmentStage::Tcp, true)
+                    .with_connect_timeout()),
                 },
                 None => connect
                     .await

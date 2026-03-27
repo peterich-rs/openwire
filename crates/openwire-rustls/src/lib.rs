@@ -94,8 +94,17 @@ impl RustlsTlsConnectorBuilder {
         for error in native.errors {
             tracing::debug!(?error, "native root load error");
         }
+        let mut native_root_failures = 0usize;
         for cert in native.certs {
-            let _ = roots.add(cert);
+            if roots.add(cert).is_err() {
+                native_root_failures += 1;
+            }
+        }
+        if native_root_failures > 0 {
+            tracing::warn!(
+                failed = native_root_failures,
+                "some native root certificates failed to load"
+            );
         }
         for cert in self.custom_roots {
             roots
@@ -140,15 +149,21 @@ impl TlsConnector for RustlsTlsConnector {
 
             ctx.listener().tls_start(&ctx, &host);
 
-            let server_name = ServerName::try_from(host.clone())
-                .map_err(|_| WireError::invalid_request("invalid TLS server name"))?;
+            let server_name = ServerName::try_from(host.clone()).map_err(|error| {
+                WireError::with_source(
+                    openwire_core::WireErrorKind::InvalidRequest,
+                    format!("invalid TLS server name: {host}"),
+                    error,
+                )
+                .with_authority_from_uri(&uri)
+            })?;
             let connection_info = connection_info_from_stream(&*stream);
             let connector = tokio_rustls::TlsConnector::from(config);
 
             let tls_stream = match connector.connect(server_name, TokioIo::new(stream)).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let error = classify_tls_handshake_error(error);
+                    let error = classify_tls_handshake_error(error).with_authority_from_uri(&uri);
                     ctx.listener().tls_failed(&ctx, &host, &error);
                     return Err(error);
                 }

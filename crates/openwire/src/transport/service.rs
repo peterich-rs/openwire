@@ -63,30 +63,37 @@ impl SelectedConnection {
 
     fn into_send_parts(
         mut self,
-    ) -> (
-        RealConnection,
-        AcquiredBinding,
-        bool,
-        Arc<ExchangeFinder>,
-        Arc<ConnectionBindings>,
-        ConnectionAvailability,
-    ) {
-        let connection = self
-            .connection
-            .take()
-            .expect("selected connection should contain a connection");
-        let binding = self
-            .binding
-            .take()
-            .expect("selected connection should contain a binding");
+    ) -> Result<
         (
+            RealConnection,
+            AcquiredBinding,
+            bool,
+            Arc<ExchangeFinder>,
+            Arc<ConnectionBindings>,
+            ConnectionAvailability,
+        ),
+        WireError,
+    > {
+        let connection = self.connection.take().ok_or_else(|| {
+            WireError::internal(
+                "selected connection missing connection",
+                io::Error::other("selected connection lost connection state"),
+            )
+        })?;
+        let binding = self.binding.take().ok_or_else(|| {
+            WireError::internal(
+                "selected connection missing binding",
+                io::Error::other("selected connection lost binding state"),
+            )
+        })?;
+        Ok((
             connection,
             binding,
             self.reused,
             self.exchange_finder.clone(),
             self.bindings.clone(),
             self.availability.clone(),
-        )
+        ))
     }
 }
 
@@ -190,7 +197,12 @@ impl TransportService {
                 .extensions()
                 .get::<ConnectionInfo>()
                 .cloned()
-                .expect("owned response should carry connection info");
+                .ok_or_else(|| {
+                    WireError::internal(
+                        "response missing connection info",
+                        io::Error::other("owned response missing connection info"),
+                    )
+                })?;
             ctx.listener()
                 .connection_acquired(&ctx, connection_info.id, response.reused);
             let span = tracing::Span::current();
@@ -300,9 +312,10 @@ impl TransportService {
                     Err(error) => return Err(error),
                 }
             }
-            if let Some(selected) = self
-                .try_acquire_coalesced(prepared.address(), route_plan.as_ref().expect("route plan"))
-            {
+            let route_plan_ref = route_plan.as_ref().ok_or_else(|| {
+                WireError::internal("route plan missing", io::Error::other("route plan missing"))
+            })?;
+            if let Some(selected) = self.try_acquire_coalesced(prepared.address(), route_plan_ref) {
                 return Ok(selected);
             }
 
@@ -320,7 +333,12 @@ impl TransportService {
                     request,
                     ctx,
                     span,
-                    route_plan.take().expect("route plan"),
+                    route_plan.take().ok_or_else(|| {
+                        WireError::internal(
+                            "route plan missing before fresh bind",
+                            io::Error::other("route plan missing before fresh bind"),
+                        )
+                    })?,
                     connection_permit,
                 )
                 .await;
@@ -608,7 +626,7 @@ async fn send_bound_request(
     tasks: ConnectionTaskRegistry,
 ) -> Result<BoundResponse, WireError> {
     let (connection, binding, reused, exchange_finder, bindings, availability) =
-        selected.into_send_parts();
+        selected.into_send_parts()?;
     let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
 
     match binding {
