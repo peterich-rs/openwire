@@ -22,10 +22,18 @@ impl Jar {
 
     /// Adds a single cookie string for the given URL.
     pub fn add_cookie_str(&self, cookie: &str, url: &url::Url) {
-        let cookies = cookie_crate::Cookie::parse(cookie)
-            .ok()
-            .map(cookie_crate::Cookie::into_owned)
-            .into_iter();
+        let cookies = match cookie_crate::Cookie::parse(cookie) {
+            Ok(cookie) => Some(cookie.into_owned()).into_iter(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    cookie_name = cookie_name_hint(cookie).unwrap_or("<unknown>"),
+                    cookie_len = cookie.len(),
+                    "dropping invalid cookie string"
+                );
+                None.into_iter()
+            }
+        };
         write_rwlock(&self.0).store_response_cookies(cookies, url);
     }
 }
@@ -33,11 +41,25 @@ impl Jar {
 impl CookieJar for Jar {
     fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url) {
         let cookies = cookie_headers.filter_map(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|value| cookie_crate::Cookie::parse(value).ok())
-                .map(cookie_crate::Cookie::into_owned)
+            let value = match value.to_str() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(%error, "dropping non-UTF8 Set-Cookie header");
+                    return None;
+                }
+            };
+            match cookie_crate::Cookie::parse(value) {
+                Ok(cookie) => Some(cookie.into_owned()),
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        cookie_name = cookie_name_hint(value).unwrap_or("<unknown>"),
+                        header_len = value.len(),
+                        "dropping invalid Set-Cookie header"
+                    );
+                    None
+                }
+            }
         });
         write_rwlock(&self.0).store_response_cookies(cookies, url);
     }
@@ -63,11 +85,42 @@ impl CookieJar for Jar {
     }
 }
 
+fn cookie_name_hint(value: &str) -> Option<&str> {
+    let name = value.split_once('=')?.0.trim();
+    if name.is_empty() || !is_safe_cookie_name(name) {
+        return None;
+    }
+    Some(name)
+}
+
+fn is_safe_cookie_name(name: &str) -> bool {
+    name.bytes().all(is_cookie_name_byte)
+}
+
+fn is_cookie_name_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'..=b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'a'..=b'z'
+            | b'|'
+            | b'~'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{self, AssertUnwindSafe};
 
-    use super::{CookieJar, Jar};
+    use super::{cookie_name_hint, CookieJar, Jar};
 
     #[test]
     fn jar_recovers_after_rwlock_poisoning() {
@@ -82,5 +135,19 @@ mod tests {
         jar.add_cookie_str("session=abc; Path=/", &url);
         let cookies = jar.cookies(&url).expect("cookies");
         assert_eq!(cookies.to_str().ok(), Some("session=abc"));
+    }
+
+    #[test]
+    fn cookie_name_hint_extracts_safe_cookie_names() {
+        assert_eq!(cookie_name_hint("session=abc; Path=/"), Some("session"));
+        assert_eq!(cookie_name_hint("theme=light"), Some("theme"));
+        assert_eq!(cookie_name_hint("Path=/"), Some("Path"));
+    }
+
+    #[test]
+    fn cookie_name_hint_rejects_missing_or_unsafe_names() {
+        assert_eq!(cookie_name_hint(""), None);
+        assert_eq!(cookie_name_hint("session id=abc"), None);
+        assert_eq!(cookie_name_hint(" =abc"), None);
     }
 }

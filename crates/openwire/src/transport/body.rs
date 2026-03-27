@@ -12,7 +12,9 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::rt::Timer;
-use openwire_core::{CallContext, RequestBody, ResponseBody, SharedTimer, WireError, WireExecutor};
+use openwire_core::{
+    CallContext, FailurePhase, RequestBody, ResponseBody, SharedTimer, WireError, WireExecutor,
+};
 
 use crate::connection::{ConnectionAvailability, ExchangeFinder, RealConnection};
 
@@ -172,6 +174,7 @@ impl ObservedIncomingBody {
                 call_id = self.ctx.call_id().as_u64(),
                 attempt = self.attempt,
                 error_kind = %error.kind(),
+                error_phase = %error.phase(),
                 error_message = %error.message(),
                 bytes_read = self.bytes_read,
                 "response body failed",
@@ -203,12 +206,14 @@ impl ObservedIncomingBody {
             }
         }
 
-        let deadline = self
-            .ctx
-            .deadline()
-            .expect("deadline signal exists only when call timeout is configured");
+        let deadline = self.ctx.deadline().ok_or_else(|| {
+            WireError::internal(
+                "body deadline signal missing call deadline",
+                std::io::Error::other("deadline invariant violated"),
+            )
+        })?;
         let timeout = deadline.saturating_duration_since(self.ctx.created_at());
-        let error = WireError::timeout(format!("call timed out after {timeout:?}"));
+        let error = WireError::body_timeout(format!("call timed out after {timeout:?}"));
         self.finish_with_error(&error);
         Poll::Ready(Some(Err(error)))
     }
@@ -388,7 +393,9 @@ impl Body for ObservedIncomingBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
-                let error = WireError::from(error);
+                let error = WireError::from(error)
+                    .with_phase(FailurePhase::ResponseBody)
+                    .with_request_committed();
                 this.finish_with_error(&error);
                 Poll::Ready(Some(Err(error)))
             }

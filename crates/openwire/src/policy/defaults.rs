@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use openwire_core::{
-    EstablishmentStage, RedirectContext, RedirectDecision, RedirectPolicy, RetryContext,
-    RetryPolicy, WireError, WireErrorKind,
+    EstablishmentStage, FailurePhase, RedirectContext, RedirectDecision, RedirectPolicy,
+    RetryContext, RetryPolicy, WireError, WireErrorKind,
 };
 
 #[derive(Clone, Default)]
@@ -87,6 +87,42 @@ impl RetryPolicy for DefaultRetryPolicy {
         }
 
         let error = ctx.error();
+        if error.request_committed() && !ctx.request_method().is_idempotent() {
+            return None;
+        }
+
+        match (error.kind(), error.phase()) {
+            (WireErrorKind::Dns, FailurePhase::Dns) if self.retry_on_connection_failure => {
+                return Some("dns");
+            }
+            (WireErrorKind::Connect, FailurePhase::Tcp)
+                if self.retry_on_connection_failure && !error.is_non_retryable_connect() =>
+            {
+                return Some("connect");
+            }
+            (WireErrorKind::Connect, FailurePhase::ProxyTunnel)
+                if self.retry_on_connection_failure && error.is_retryable_establishment() =>
+            {
+                return Some("connect");
+            }
+            (WireErrorKind::Tls, FailurePhase::Tls)
+                if self.retry_on_connection_failure && error.is_retryable_establishment() =>
+            {
+                return Some("tls");
+            }
+            (WireErrorKind::Protocol, FailurePhase::ProtocolBinding)
+                if self.retry_on_connection_failure && error.is_retryable_establishment() =>
+            {
+                return Some("connect");
+            }
+            (WireErrorKind::Timeout, FailurePhase::Tcp | FailurePhase::ProxyTunnel)
+                if self.retry_on_connection_failure =>
+            {
+                return Some("connect_timeout");
+            }
+            _ => {}
+        }
+
         match error.establishment_stage() {
             Some(EstablishmentStage::Dns) if error.is_retryable_establishment() => {
                 return self.retry_on_connection_failure.then_some("dns");
@@ -217,21 +253,24 @@ impl RedirectPolicy for DefaultRedirectPolicy {
         }
 
         if ctx.redirect_count() as usize >= self.max_redirects {
-            return RedirectDecision::Error(WireError::redirect(format!(
-                "too many redirects (max {})",
-                self.max_redirects
-            )));
+            return RedirectDecision::Error(
+                WireError::redirect(format!("too many redirects (max {})", self.max_redirects))
+                    .with_response_status(ctx.response_status()),
+            );
         }
 
         if !self.allow_insecure_redirects
             && ctx.request_uri().scheme_str() == Some("https")
             && ctx.location().scheme_str() == Some("http")
         {
-            return RedirectDecision::Error(WireError::redirect(format!(
-                "refusing insecure redirect from {} to {}",
-                ctx.request_uri(),
-                ctx.location()
-            )));
+            return RedirectDecision::Error(
+                WireError::redirect(format!(
+                    "refusing insecure redirect from {} to {}",
+                    ctx.request_uri(),
+                    ctx.location()
+                ))
+                .with_response_status(ctx.response_status()),
+            );
         }
 
         RedirectDecision::Follow
@@ -265,8 +304,9 @@ mod tests {
         policy.set_retry_canceled_requests(true);
 
         let canceled = WireError::new(WireErrorKind::Canceled, "canceled");
-        let first = RetryContext::new(&canceled, 0, true);
-        let second = RetryContext::new(&canceled, 1, true);
+        let method = Method::GET;
+        let first = RetryContext::new(&canceled, 0, true, &method);
+        let second = RetryContext::new(&canceled, 1, true, &method);
 
         assert_eq!(policy.should_retry(&first), Some("canceled"));
         assert_eq!(policy.should_retry(&second), None);

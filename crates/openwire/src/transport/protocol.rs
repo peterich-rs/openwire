@@ -181,14 +181,7 @@ pub(super) fn map_hyper_error(error: hyper::Error) -> WireError {
         return source.clone();
     }
 
-    if error.is_canceled() {
-        return WireError::canceled("request canceled");
-    }
-    if error.is_timeout() {
-        return WireError::timeout("request timed out");
-    }
-
-    WireError::protocol("transport request failed", error)
+    WireError::from(error)
 }
 
 fn find_wire_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a WireError> {

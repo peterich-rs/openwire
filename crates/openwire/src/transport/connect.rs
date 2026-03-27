@@ -16,8 +16,9 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use hyper::rt::Timer;
 use hyper::Uri;
 use openwire_core::{
-    AuthKind, BoxConnection, CallContext, Connected, Connection, DnsResolver, RequestBody,
-    SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
+    AuthKind, BoxConnection, CallContext, Connected, Connection, DnsResolver, EstablishmentStage,
+    FailurePhase, RequestBody, SharedTimer, TcpConnector, TlsConnector, WireError, WireErrorKind,
+    WireExecutor,
 };
 use pin_project_lite::pin_project;
 use tracing::instrument::WithSubscriber;
@@ -486,6 +487,7 @@ async fn connect_target_tls_if_needed(
             "HTTPS requested but no TLS connector is configured",
             io::Error::new(io::ErrorKind::Unsupported, "missing TLS connector"),
         )
+        .with_authority_from_uri(&target_uri)
     })?;
     tls_connector.connect(ctx, target_uri, stream).await
 }
@@ -503,8 +505,15 @@ pub(super) async fn establish_connect_tunnel(
     let mut auth_count = 0u32;
     let mut connect_headers = HeaderMap::new();
     if let Some(credentials) = &params.initial_proxy_credentials {
-        let value = HeaderValue::from_str(&credentials.basic_auth_header_value())
-            .expect("proxy basic auth header should be valid ASCII");
+        let value =
+            HeaderValue::from_str(&credentials.basic_auth_header_value()).map_err(|error| {
+                WireError::with_source(
+                    WireErrorKind::InvalidRequest,
+                    "proxy basic auth header is not valid ASCII",
+                    error,
+                )
+                .with_proxy_addr(params.proxy_addr)
+            })?;
         connect_headers.insert(http::header::PROXY_AUTHORIZATION, value);
     }
 
@@ -551,7 +560,16 @@ pub(super) async fn establish_connect_tunnel(
                     },
                 );
 
-                let Some(request) = authenticator.authenticate(auth_ctx).await? else {
+                let Some(request) =
+                    authenticator
+                        .authenticate(auth_ctx)
+                        .await
+                        .map_err(|error| {
+                            error
+                                .with_response_status(head.status)
+                                .with_proxy_addr(params.proxy_addr)
+                        })?
+                else {
                     return Err(proxy_connect_status_error(&head.status_line));
                 };
 
@@ -794,7 +812,13 @@ async fn read_connect_response(
             timeout,
             read_connect_response_inner(stream),
             |timeout| {
-                WireError::connect_timeout(format!("proxy CONNECT timed out after {timeout:?}"))
+                WireError::new(
+                    WireErrorKind::Timeout,
+                    format!("proxy CONNECT timed out after {timeout:?}"),
+                )
+                .with_phase(FailurePhase::ProxyTunnel)
+                .with_establishment(EstablishmentStage::ProxyTunnel, true)
+                .with_connect_timeout()
             },
         )
         .await;
@@ -1086,7 +1110,13 @@ async fn socks5_timeout<T>(
 ) -> Result<T, WireError> {
     if let Some(timeout) = timeout {
         return timeout_future(timer, timeout, future, |timeout| {
-            WireError::connect_timeout(format!("SOCKS5 handshake timed out after {timeout:?}"))
+            WireError::new(
+                WireErrorKind::Timeout,
+                format!("SOCKS5 handshake timed out after {timeout:?}"),
+            )
+            .with_phase(FailurePhase::ProxyTunnel)
+            .with_establishment(EstablishmentStage::ProxyTunnel, true)
+            .with_connect_timeout()
         })
         .await;
     }

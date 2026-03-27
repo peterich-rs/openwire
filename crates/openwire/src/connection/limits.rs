@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -8,6 +9,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit as TokioOwnedSemaphorePermit, Sem
 use openwire_core::WireError;
 
 use super::Address;
+use crate::sync_util::lock_mutex;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestAdmissionLimiter {
@@ -156,7 +158,7 @@ impl RequestAdmissionLimiter {
             }
             (Some(global), None) => Ok(RequestAdmissionPermit {
                 global: Some(RequestGlobalPermit {
-                    permit: Some(global.acquire_owned().await),
+                    permit: Some(global.acquire_owned().await?),
                 }),
                 per_address: None,
             }),
@@ -279,7 +281,7 @@ impl AddressSemaphoreSet {
 
     async fn acquire(&self, key: Address) -> Result<AddressSemaphorePermit, WireError> {
         let semaphore = self.semaphore_for(&key);
-        let permit = semaphore.acquire_owned().await;
+        let permit = semaphore.acquire_owned().await?;
         Ok(AddressSemaphorePermit {
             key,
             owner: self.clone(),
@@ -301,25 +303,23 @@ impl AddressSemaphoreSet {
     }
 
     fn semaphore_for(&self, key: &Address) -> Arc<AsyncSemaphore> {
-        let mut semaphores = self
-            .inner
-            .semaphores
-            .lock()
-            .expect("address semaphore lock");
+        let mut semaphores = lock_mutex(&self.inner.semaphores);
         semaphores
             .entry(key.clone())
             .or_insert_with(|| {
-                limit_semaphore(self.inner.limit)
-                    .expect("address semaphore sets are only created with finite limits")
+                limit_semaphore(self.inner.limit).unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "address semaphore sets are only created with finite limits"
+                    );
+                    Arc::new(AsyncSemaphore::new(self.inner.limit))
+                })
             })
             .clone()
     }
 
     fn can_acquire(&self, key: &Address) -> bool {
-        self.inner
-            .semaphores
-            .lock()
-            .expect("address semaphore lock")
+        lock_mutex(&self.inner.semaphores)
             .get(key)
             .map_or(true, |semaphore| semaphore.can_acquire())
     }
@@ -343,12 +343,7 @@ impl Drop for AddressSemaphorePermit {
             return;
         }
 
-        let mut semaphores = self
-            .owner
-            .inner
-            .semaphores
-            .lock()
-            .expect("address semaphore lock");
+        let mut semaphores = lock_mutex(&self.owner.inner.semaphores);
         let remove_entry = semaphores
             .get(&self.key)
             .is_some_and(|current| Arc::ptr_eq(current, &self.semaphore))
@@ -383,7 +378,7 @@ impl AsyncSemaphore {
             return Poll::Ready(());
         }
 
-        let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+        let mut waiters = lock_mutex(&self.waiters);
         if self.can_acquire() {
             return Poll::Ready(());
         }
@@ -407,22 +402,22 @@ impl AsyncSemaphore {
             })
     }
 
-    async fn acquire_owned(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore should not close");
-        OwnedSemaphorePermit {
+    async fn acquire_owned(self: &Arc<Self>) -> Result<OwnedSemaphorePermit, WireError> {
+        let permit = self.semaphore.clone().acquire_owned().await.map_err(|_| {
+            WireError::internal(
+                "request semaphore closed unexpectedly",
+                io::Error::other("semaphore closed unexpectedly"),
+            )
+        })?;
+        Ok(OwnedSemaphorePermit {
             semaphore: self.clone(),
             permit: Some(permit),
-        }
+        })
     }
 
     fn wake_waiters(&self) {
         let waiters = {
-            let mut waiters = self.waiters.lock().expect("semaphore waiters lock");
+            let mut waiters = lock_mutex(&self.waiters);
             std::mem::take(&mut *waiters)
         };
         for waiter in waiters {

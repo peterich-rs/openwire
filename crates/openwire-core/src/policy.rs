@@ -21,14 +21,21 @@ pub struct RetryContext<'a> {
     error: &'a WireError,
     attempt: u32,
     is_body_replayable: bool,
+    request_method: &'a Method,
 }
 
 impl<'a> RetryContext<'a> {
-    pub fn new(error: &'a WireError, attempt: u32, is_body_replayable: bool) -> Self {
+    pub fn new(
+        error: &'a WireError,
+        attempt: u32,
+        is_body_replayable: bool,
+        request_method: &'a Method,
+    ) -> Self {
         Self {
             error,
             attempt,
             is_body_replayable,
+            request_method,
         }
     }
 
@@ -42,6 +49,10 @@ impl<'a> RetryContext<'a> {
 
     pub fn is_body_replayable(&self) -> bool {
         self.is_body_replayable
+    }
+
+    pub fn request_method(&self) -> &'a Method {
+        self.request_method
     }
 }
 

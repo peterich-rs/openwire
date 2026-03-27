@@ -10,6 +10,10 @@ observability.
 This document is the current architecture reference. Completed plan and closure
 docs are intentionally removed once their behavior is absorbed into the code.
 
+Related roadmap docs:
+
+- `docs/error-handling-roadmap.md`
+
 ## 1. Design Priorities
 
 - keep policy and transport clearly separated

@@ -206,8 +206,12 @@ impl Service<Exchange> for FollowUpPolicyService {
                         attempt = next_attempt;
                     }
                     Err(error) => {
-                        let retry_ctx =
-                            RetryContext::new(&error, retries, snapshot.is_replayable());
+                        let retry_ctx = RetryContext::new(
+                            &error,
+                            retries,
+                            snapshot.is_replayable(),
+                            &snapshot.method,
+                        );
                         let Some(reason) = config.retry.policy().should_retry(&retry_ctx) else {
                             return Err(error);
                         };
@@ -299,7 +303,11 @@ async fn authenticate_response(
         },
     );
 
-    if let Some(mut request) = authenticator.authenticate(ctx).await? {
+    if let Some(mut request) = authenticator
+        .authenticate(ctx)
+        .await
+        .map_err(|error| error.with_response_status(response.status()))?
+    {
         let next_auth_count = auths + 1;
         request.extensions_mut().insert(PolicyTraceContext {
             retry_count: retries,
@@ -371,7 +379,12 @@ impl RequestSnapshot {
             .body
             .as_ref()
             .and_then(RequestBody::try_clone)
-            .expect("captured replayable body must remain replayable");
+            .ok_or_else(|| {
+                WireError::internal(
+                    "captured replayable body is no longer cloneable",
+                    std::io::Error::other("body clone failed on retry"),
+                )
+            })?;
         let mut request = Request::builder()
             .method(self.method.clone())
             .uri(self.uri.clone())
@@ -523,7 +536,11 @@ impl OriginKey {
         let port = uri.port_u16().unwrap_or(match scheme {
             "http" => 80,
             "https" => 443,
-            _ => unreachable!("validated scheme"),
+            _ => {
+                return Err(WireError::invalid_request(format!(
+                    "unsupported scheme for origin comparison: {scheme}"
+                )))
+            }
         });
         Ok(Self { scheme, host, port })
     }

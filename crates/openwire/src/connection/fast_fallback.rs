@@ -110,7 +110,12 @@ impl FastFallbackDialer {
         for index in 0..route_count {
             let attempt = connect_plan
                 .attempt(index)
-                .expect("connect plan should contain every route")
+                .ok_or_else(|| {
+                    WireError::internal(
+                        "connect plan missing route attempt",
+                        io::Error::other("connect plan missing attempt"),
+                    )
+                })?
                 .clone();
             let ctx = ctx.clone();
             let uri = uri.clone();
@@ -126,22 +131,44 @@ impl FastFallbackDialer {
                             timer.sleep(attempt.scheduled_after()).await;
                         }
                         let route_family = route_family_label(attempt.route().family());
-                        let _ = tx.unbounded_send(FastFallbackMessage::Started {
-                            race_id,
-                            route_index: index,
-                            route_count,
-                            route_family,
-                        });
+                        if tx
+                            .unbounded_send(FastFallbackMessage::Started {
+                                race_id,
+                                route_index: index,
+                                route_count,
+                                route_family,
+                            })
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                call_id = ctx.call_id().as_u64(),
+                                connect_race_id = race_id,
+                                route_index = index,
+                                "fast fallback start event dropped because receiver was closed",
+                            );
+                        }
 
                         let route = attempt.route().clone();
                         let result = match connect(ctx.clone(), route.clone()).await {
-                            Ok(intermediate) => finalize(ctx, uri, route, intermediate).await,
+                            Ok(intermediate) => {
+                                finalize(ctx.clone(), uri, route, intermediate).await
+                            }
                             Err(error) => Err(error),
                         };
-                        let _ = tx.unbounded_send(FastFallbackMessage::Finished {
-                            route_index: index,
-                            result,
-                        });
+                        if tx
+                            .unbounded_send(FastFallbackMessage::Finished {
+                                route_index: index,
+                                result,
+                            })
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                call_id = ctx.call_id().as_u64(),
+                                connect_race_id = race_id,
+                                route_index = index,
+                                "fast fallback finish event dropped because receiver was closed",
+                            );
+                        }
                     },
                     abort_registration,
                 )
