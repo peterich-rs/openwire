@@ -42,6 +42,15 @@ struct SelectedConnection {
     availability: ConnectionAvailability,
 }
 
+type SelectedConnectionSendParts = (
+    RealConnection,
+    AcquiredBinding,
+    bool,
+    Arc<ExchangeFinder>,
+    Arc<ConnectionBindings>,
+    ConnectionAvailability,
+);
+
 impl SelectedConnection {
     fn new(
         connection: RealConnection,
@@ -61,19 +70,7 @@ impl SelectedConnection {
         }
     }
 
-    fn into_send_parts(
-        mut self,
-    ) -> Result<
-        (
-            RealConnection,
-            AcquiredBinding,
-            bool,
-            Arc<ExchangeFinder>,
-            Arc<ConnectionBindings>,
-            ConnectionAvailability,
-        ),
-        WireError,
-    > {
+    fn into_send_parts(mut self) -> Result<SelectedConnectionSendParts, WireError> {
         let connection = self.connection.take().ok_or_else(|| {
             WireError::internal(
                 "selected connection missing connection",
