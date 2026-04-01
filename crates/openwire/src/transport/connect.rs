@@ -171,13 +171,13 @@ impl ConnectorStack {
         self.route_planner.plan(address, resolved_addrs)
     }
 
-    pub(super) fn proxy_connect_deps(&self) -> ProxyConnectDeps {
+    pub(super) fn proxy_connect_deps(&self, connect_timeout: Option<Duration>) -> ProxyConnectDeps {
         ProxyConnectDeps {
             tcp_connector: self.tcp_connector.clone(),
             tls_connector: self.tls_connector.clone(),
             proxy_authenticator: self.proxy_authenticator.clone(),
             max_proxy_auth_attempts: self.max_proxy_auth_attempts,
-            connect_timeout: self.connect_timeout,
+            connect_timeout,
             executor: self.executor.clone(),
             timer: self.timer.clone(),
         }

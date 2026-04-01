@@ -16,8 +16,9 @@ use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
 use openwire::{
     AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DefaultRoutePlanner,
-    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
-    ResponseBody, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
+    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy,
+    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext,
+    RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
     TlsConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
@@ -73,6 +74,28 @@ async fn client_call_timeout_applies_to_requests() {
 }
 
 #[tokio::test]
+async fn per_request_call_timeout_overrides_client_default() {
+    let server = spawn_http1(|_request| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ok_text("slow ok")
+    })
+    .await;
+
+    let client = Client::builder()
+        .call_timeout(std::time::Duration::from_millis(250))
+        .build()
+        .expect("client");
+
+    let error = client
+        .new_call(empty_request(server.http_url("/slow")))
+        .call_timeout(std::time::Duration::from_millis(10))
+        .execute()
+        .await
+        .expect_err("per-request timeout should win");
+    assert_eq!(error.kind(), WireErrorKind::Timeout);
+}
+
+#[tokio::test]
 async fn call_timeout_uses_configured_timer() {
     let server = spawn_http1(|_request| async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -118,6 +141,67 @@ async fn follows_redirects_for_get_requests() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "redirect complete");
+}
+
+#[tokio::test]
+async fn per_request_follow_redirects_override_can_disable_redirects() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect complete"),
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .follow_redirects(true)
+        .build()
+        .expect("client");
+
+    let response = client
+        .new_call(empty_request(server.http_url("/redirect")))
+        .follow_redirects(false)
+        .execute()
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn per_request_redirect_overrides_do_not_disable_custom_redirect_policy() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect complete"),
+        }
+    })
+    .await;
+    let policy = StopRedirectPolicy::default();
+    let client = Client::builder()
+        .redirect_policy(policy.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .new_call(empty_request(server.http_url("/redirect")))
+        .follow_redirects(true)
+        .max_redirects(5)
+        .allow_insecure_redirects(true)
+        .execute()
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(policy.calls(), 1);
 }
 
 #[tokio::test]
@@ -686,6 +770,55 @@ async fn tokio_tcp_connector_emits_single_connect_failed_event_for_connection_re
 }
 
 #[tokio::test]
+async fn per_request_retry_override_can_disable_connection_retries() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .retry_on_connection_failure(true)
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let error = client
+        .new_call(empty_request(server.http_url("/retry-disabled")))
+        .retry_on_connection_failure(false)
+        .execute()
+        .await
+        .expect_err("per-request retry override should win");
+
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 1);
+}
+
+#[tokio::test]
+async fn per_request_retry_overrides_do_not_disable_custom_retry_policy() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let policy = NeverRetryPolicy::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .retry_policy(policy.clone())
+        .build()
+        .expect("client");
+
+    let error = client
+        .new_call(empty_request(server.http_url("/retry-custom")))
+        .retry_on_connection_failure(true)
+        .max_retries(3)
+        .retry_canceled_requests(true)
+        .execute()
+        .await
+        .expect_err("custom retry policy should remain authoritative");
+
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(policy.calls(), 1);
+}
+
+#[tokio::test]
 async fn authenticator_retries_replayable_requests_on_401() {
     let server = spawn_http1(|request: Request<Incoming>| async move {
         let auth = request
@@ -1022,6 +1155,28 @@ async fn connect_timeout_applies_to_proxy_connect_response_reads() {
         .expect_err("proxy CONNECT read should time out");
     assert_eq!(error.kind(), WireErrorKind::Timeout);
     assert!(error.is_connect_timeout(), "error = {error:?}");
+}
+
+#[tokio::test]
+async fn per_request_connect_timeout_overrides_client_default() {
+    let server = spawn_http1(|_request| async move { ok_text("connect ok") }).await;
+    let connector = RecordingTimeoutTcpConnector::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .connect_timeout(Duration::from_secs(1))
+        .build()
+        .expect("client");
+
+    let response = client
+        .new_call(empty_request(server.http_url("/connect-timeout")))
+        .connect_timeout(Duration::from_millis(25))
+        .execute()
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(connector.timeouts(), vec![Some(Duration::from_millis(25))]);
 }
 
 #[tokio::test]
@@ -4244,6 +4399,42 @@ fn normalize_env_key_for_platform(key: &str) -> String {
     }
 }
 
+#[derive(Clone, Default)]
+struct NeverRetryPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl NeverRetryPolicy {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RetryPolicy for NeverRetryPolicy {
+    fn should_retry(&self, _ctx: &RetryContext<'_>) -> Option<&'static str> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+#[derive(Clone, Default)]
+struct StopRedirectPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl StopRedirectPolicy {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RedirectPolicy for StopRedirectPolicy {
+    fn should_redirect(&self, _ctx: &RedirectContext<'_>) -> RedirectDecision {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        RedirectDecision::Stop
+    }
+}
+
 #[derive(Clone)]
 struct FailingTcpConnector {
     failures_remaining: Arc<Mutex<usize>>,
@@ -4491,6 +4682,32 @@ impl TcpConnector for AttemptCountingTcpConnector {
         let attempts = self.attempts.clone();
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::Relaxed);
+            TokioTcpConnector.connect(ctx, addr, timeout).await
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingTimeoutTcpConnector {
+    timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+}
+
+impl RecordingTimeoutTcpConnector {
+    fn timeouts(&self) -> Vec<Option<Duration>> {
+        self.timeouts.lock().expect("connector timeouts").clone()
+    }
+}
+
+impl TcpConnector for RecordingTimeoutTcpConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        addr: SocketAddr,
+        timeout: Option<std::time::Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let timeouts = self.timeouts.clone();
+        Box::pin(async move {
+            timeouts.lock().expect("connector timeouts").push(timeout);
             TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }

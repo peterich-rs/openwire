@@ -13,6 +13,14 @@ pub(crate) struct RetryPolicyConfig {
 }
 
 impl RetryPolicyConfig {
+    pub(crate) fn default_config(&self) -> &DefaultRetryPolicy {
+        &self.default
+    }
+
+    pub(crate) fn has_custom_policy(&self) -> bool {
+        self.custom.is_some()
+    }
+
     pub(crate) fn policy(&self) -> &dyn RetryPolicy {
         self.custom
             .as_deref()
@@ -175,6 +183,14 @@ pub(crate) struct RedirectPolicyConfig {
 }
 
 impl RedirectPolicyConfig {
+    pub(crate) fn default_config(&self) -> &DefaultRedirectPolicy {
+        &self.default
+    }
+
+    pub(crate) fn has_custom_policy(&self) -> bool {
+        self.custom.is_some()
+    }
+
     pub(crate) fn policy(&self) -> &dyn RedirectPolicy {
         self.custom
             .as_deref()

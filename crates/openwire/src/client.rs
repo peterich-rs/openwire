@@ -43,7 +43,7 @@ pub struct Client {
 struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
     timer: SharedTimer,
-    call_timeout: Option<Duration>,
+    request_config: EffectiveRequestConfig,
     service: BoxWireService,
     pool_reaper: Arc<PoolReaperController>,
 }
@@ -51,6 +51,7 @@ struct ClientInner {
 pub struct Call {
     client: Client,
     request: Request<RequestBody>,
+    options: CallOptions,
 }
 
 #[derive(Clone)]
@@ -66,12 +67,37 @@ pub(crate) struct TransportConfig {
     pub(crate) max_requests_per_host: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallOptions {
+    call_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    follow_redirects: Option<bool>,
+    max_redirects: Option<usize>,
+    retry_on_connection_failure: Option<bool>,
+    max_retries: Option<usize>,
+    retry_canceled_requests: Option<bool>,
+    allow_insecure_redirects: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EffectiveRequestConfig {
+    pub(crate) call_timeout: Option<Duration>,
+    pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) follow_redirects: bool,
+    pub(crate) max_redirects: usize,
+    pub(crate) retry_on_connection_failure: bool,
+    pub(crate) max_retries: usize,
+    pub(crate) retry_canceled_requests: bool,
+    pub(crate) allow_insecure_redirects: bool,
+}
+
 pub struct ClientBuilder {
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     event_listener_factory: SharedEventListenerFactory,
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
+    call_timeout: Option<Duration>,
     transport: TransportConfig,
     policy: PolicyConfig,
     dns_resolver: Arc<dyn DnsResolver>,
@@ -216,7 +242,7 @@ impl ClientBuilder {
     }
 
     pub fn call_timeout(mut self, timeout: Duration) -> Self {
-        self.policy.call_timeout = Some(timeout);
+        self.call_timeout = Some(timeout);
         self
     }
 
@@ -344,6 +370,12 @@ impl ClientBuilder {
             proxies.extend(system_proxies_from_env()?);
         }
 
+        let request_config = EffectiveRequestConfig::from_defaults(
+            self.call_timeout,
+            self.transport.connect_timeout,
+            &self.policy,
+        );
+
         let pool = Arc::new(ConnectionPool::new(PoolSettings {
             idle_timeout: self.transport.pool_idle_timeout,
             max_idle_per_address: self.transport.pool_max_idle_per_host,
@@ -399,7 +431,7 @@ impl ClientBuilder {
             inner: Arc::new(ClientInner {
                 event_listener_factory: self.event_listener_factory,
                 timer: self.timer,
-                call_timeout: self.policy.call_timeout,
+                request_config,
                 service,
                 pool_reaper,
             }),
@@ -415,6 +447,7 @@ impl Default for ClientBuilder {
             event_listener_factory: Arc::new(NoopEventListenerFactory),
             executor: Arc::new(TokioExecutor::new()),
             timer: SharedTimer::new(TokioTimer::new()),
+            call_timeout: None,
             transport: TransportConfig {
                 connect_timeout: None,
                 pool_idle_timeout: Some(Duration::from_secs(90)),
@@ -427,7 +460,6 @@ impl Default for ClientBuilder {
                 max_requests_per_host: usize::MAX,
             },
             policy: PolicyConfig {
-                call_timeout: None,
                 cookie_jar: None,
                 auth: AuthPolicyConfig {
                     authenticator: None,
@@ -456,6 +488,7 @@ impl Client {
         Call {
             client: self.clone(),
             request,
+            options: CallOptions::default(),
         }
     }
 
@@ -503,11 +536,63 @@ impl PoolReaperController {
 }
 
 impl Call {
-    pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
+    pub fn options(mut self, options: CallOptions) -> Self {
+        self.options.apply(options);
+        self
+    }
+
+    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+        self.options.call_timeout = Some(timeout);
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.options.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn follow_redirects(mut self, enabled: bool) -> Self {
+        self.options.follow_redirects = Some(enabled);
+        self
+    }
+
+    pub fn max_redirects(mut self, max_redirects: usize) -> Self {
+        self.options.max_redirects = Some(max_redirects);
+        self
+    }
+
+    pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
+        self.options.retry_on_connection_failure = Some(enabled);
+        self
+    }
+
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.options.max_retries = Some(max_retries);
+        self
+    }
+
+    pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
+        self.options.retry_canceled_requests = Some(enabled);
+        self
+    }
+
+    pub fn allow_insecure_redirects(mut self, enabled: bool) -> Self {
+        self.options.allow_insecure_redirects = Some(enabled);
+        self
+    }
+
+    pub async fn execute(mut self) -> Result<Response<ResponseBody>, WireError> {
+        let request_config = self
+            .client
+            .inner
+            .request_config
+            .with_overrides(self.options);
+        self.request.extensions_mut().insert(request_config);
+        self.request.extensions_mut().insert(self.options);
         let ctx = CallContext::from_factory(
             &self.client.inner.event_listener_factory,
             &self.request,
-            self.client.inner.call_timeout,
+            request_config.call_timeout,
         );
 
         let span = tracing::info_span!(
@@ -679,6 +764,121 @@ where
     }
 }
 
+impl CallOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = Some(timeout);
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn follow_redirects(mut self, enabled: bool) -> Self {
+        self.follow_redirects = Some(enabled);
+        self
+    }
+
+    pub fn max_redirects(mut self, max_redirects: usize) -> Self {
+        self.max_redirects = Some(max_redirects);
+        self
+    }
+
+    pub fn retry_on_connection_failure(mut self, enabled: bool) -> Self {
+        self.retry_on_connection_failure = Some(enabled);
+        self
+    }
+
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
+        self.retry_canceled_requests = Some(enabled);
+        self
+    }
+
+    pub fn allow_insecure_redirects(mut self, enabled: bool) -> Self {
+        self.allow_insecure_redirects = Some(enabled);
+        self
+    }
+
+    pub(crate) fn has_retry_overrides(self) -> bool {
+        self.retry_on_connection_failure.is_some()
+            || self.max_retries.is_some()
+            || self.retry_canceled_requests.is_some()
+    }
+
+    pub(crate) fn has_redirect_overrides(self) -> bool {
+        self.follow_redirects.is_some()
+            || self.max_redirects.is_some()
+            || self.allow_insecure_redirects.is_some()
+    }
+
+    fn apply(&mut self, other: Self) {
+        self.call_timeout = other.call_timeout.or(self.call_timeout);
+        self.connect_timeout = other.connect_timeout.or(self.connect_timeout);
+        self.follow_redirects = other.follow_redirects.or(self.follow_redirects);
+        self.max_redirects = other.max_redirects.or(self.max_redirects);
+        self.retry_on_connection_failure = other
+            .retry_on_connection_failure
+            .or(self.retry_on_connection_failure);
+        self.max_retries = other.max_retries.or(self.max_retries);
+        self.retry_canceled_requests = other
+            .retry_canceled_requests
+            .or(self.retry_canceled_requests);
+        self.allow_insecure_redirects = other
+            .allow_insecure_redirects
+            .or(self.allow_insecure_redirects);
+    }
+}
+
+impl EffectiveRequestConfig {
+    fn from_defaults(
+        call_timeout: Option<Duration>,
+        connect_timeout: Option<Duration>,
+        policy: &PolicyConfig,
+    ) -> Self {
+        let retry = policy.retry.default_config();
+        let redirect = policy.redirect.default_config();
+        Self {
+            call_timeout,
+            connect_timeout,
+            follow_redirects: redirect.follow_redirects(),
+            max_redirects: redirect.max_redirects(),
+            retry_on_connection_failure: retry.retry_on_connection_failure(),
+            max_retries: retry.max_retries(),
+            retry_canceled_requests: retry.retry_canceled_requests(),
+            allow_insecure_redirects: redirect.allow_insecure_redirects(),
+        }
+    }
+
+    fn with_overrides(self, options: CallOptions) -> Self {
+        Self {
+            call_timeout: options.call_timeout.or(self.call_timeout),
+            connect_timeout: options.connect_timeout.or(self.connect_timeout),
+            follow_redirects: options.follow_redirects.unwrap_or(self.follow_redirects),
+            max_redirects: options.max_redirects.unwrap_or(self.max_redirects),
+            retry_on_connection_failure: options
+                .retry_on_connection_failure
+                .unwrap_or(self.retry_on_connection_failure),
+            max_retries: options.max_retries.unwrap_or(self.max_retries),
+            retry_canceled_requests: options
+                .retry_canceled_requests
+                .unwrap_or(self.retry_canceled_requests),
+            allow_insecure_redirects: options
+                .allow_insecure_redirects
+                .unwrap_or(self.allow_insecure_redirects),
+        }
+    }
+}
+
 fn cache_request_address(
     request: &mut Request<RequestBody>,
     proxy_selector: &ProxySelector,
@@ -780,8 +980,8 @@ mod tests {
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
 
     use super::{
-        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, ConnectionPool,
-        PoolReaperController, PoolSettings,
+        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ConnectionPool,
+        EffectiveRequestConfig, PoolReaperController, PoolSettings,
     };
     use crate::connection::CachedAddress;
     use crate::proxy::ProxySelector;
@@ -920,6 +1120,59 @@ mod tests {
                 .map(|cached| &cached.0),
             Some(&address)
         );
+    }
+
+    #[test]
+    fn call_options_merge_prefers_newly_supplied_overrides() {
+        let mut options = CallOptions::new()
+            .call_timeout(Duration::from_millis(50))
+            .follow_redirects(true)
+            .max_retries(1);
+        options.apply(
+            CallOptions::new()
+                .call_timeout(Duration::from_millis(25))
+                .connect_timeout(Duration::from_millis(10))
+                .max_retries(3),
+        );
+
+        assert_eq!(options.call_timeout, Some(Duration::from_millis(25)));
+        assert_eq!(options.connect_timeout, Some(Duration::from_millis(10)));
+        assert_eq!(options.follow_redirects, Some(true));
+        assert_eq!(options.max_retries, Some(3));
+    }
+
+    #[test]
+    fn effective_request_config_applies_call_overrides() {
+        let defaults = EffectiveRequestConfig {
+            call_timeout: Some(Duration::from_secs(1)),
+            connect_timeout: Some(Duration::from_millis(250)),
+            follow_redirects: true,
+            max_redirects: 10,
+            retry_on_connection_failure: true,
+            max_retries: 1,
+            retry_canceled_requests: false,
+            allow_insecure_redirects: false,
+        };
+
+        let effective = defaults.with_overrides(
+            CallOptions::new()
+                .call_timeout(Duration::from_millis(25))
+                .follow_redirects(false)
+                .max_redirects(2)
+                .retry_on_connection_failure(false)
+                .max_retries(0)
+                .retry_canceled_requests(true)
+                .allow_insecure_redirects(true),
+        );
+
+        assert_eq!(effective.call_timeout, Some(Duration::from_millis(25)));
+        assert_eq!(effective.connect_timeout, Some(Duration::from_millis(250)));
+        assert!(!effective.follow_redirects);
+        assert_eq!(effective.max_redirects, 2);
+        assert!(!effective.retry_on_connection_failure);
+        assert_eq!(effective.max_retries, 0);
+        assert!(effective.retry_canceled_requests);
+        assert!(effective.allow_insecure_redirects);
     }
 
     #[test]

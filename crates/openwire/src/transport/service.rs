@@ -12,6 +12,7 @@ use tower::Service;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
+use crate::client::EffectiveRequestConfig;
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
     ExchangeFinder, RealConnection, Route, RoutePlan,
@@ -352,11 +353,16 @@ impl TransportService {
         connection_permit: ConnectionPermit,
     ) -> Result<SelectedConnection, WireError> {
         let connect_span = tracing::Span::current();
+        let connect_timeout = request
+            .extensions()
+            .get::<EffectiveRequestConfig>()
+            .map(|config| config.connect_timeout)
+            .unwrap_or(self.connector.connect_timeout);
         let stream = connect_route_plan(
             ctx,
             request.uri().clone(),
             route_plan,
-            self.connector.proxy_connect_deps(),
+            self.connector.proxy_connect_deps(connect_timeout),
         )
         .instrument(connect_span)
         .with_current_subscriber()
