@@ -258,14 +258,16 @@ fn apply_request_overrides(
         return;
     };
 
-    if request_options.has_retry_overrides() {
+    // Request-scoped scalar overrides only refine the built-in policies. A
+    // client-supplied custom policy remains authoritative for the call.
+    if request_options.has_retry_overrides() && !config.retry.has_custom_policy() {
         let retry = config.retry.default_mut();
         retry.set_retry_on_connection_failure(request_config.retry_on_connection_failure);
         retry.set_max_retries(request_config.max_retries);
         retry.set_retry_canceled_requests(request_config.retry_canceled_requests);
     }
 
-    if request_options.has_redirect_overrides() {
+    if request_options.has_redirect_overrides() && !config.redirect.has_custom_policy() {
         let redirect = config.redirect.default_mut();
         redirect.set_follow_redirects(request_config.follow_redirects);
         redirect.set_max_redirects(request_config.max_redirects);

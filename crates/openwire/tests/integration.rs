@@ -16,8 +16,9 @@ use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
 use openwire::{
     AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DefaultRoutePlanner,
-    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, RequestBody,
-    ResponseBody, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
+    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy,
+    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext,
+    RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
     TlsConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
@@ -169,6 +170,38 @@ async fn per_request_follow_redirects_override_can_disable_redirects() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn per_request_redirect_overrides_do_not_disable_custom_redirect_policy() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/redirect" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            _ => ok_text("redirect complete"),
+        }
+    })
+    .await;
+    let policy = StopRedirectPolicy::default();
+    let client = Client::builder()
+        .redirect_policy(policy.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .new_call(empty_request(server.http_url("/redirect")))
+        .follow_redirects(true)
+        .max_redirects(5)
+        .allow_insecure_redirects(true)
+        .execute()
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(policy.calls(), 1);
 }
 
 #[tokio::test]
@@ -757,6 +790,32 @@ async fn per_request_retry_override_can_disable_connection_retries() {
 
     assert_eq!(error.kind(), WireErrorKind::Connect);
     assert_eq!(connector.attempts(), 1);
+}
+
+#[tokio::test]
+async fn per_request_retry_overrides_do_not_disable_custom_retry_policy() {
+    let server = spawn_http1(|_request| async move { ok_text("retry ok") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let policy = NeverRetryPolicy::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .retry_policy(policy.clone())
+        .build()
+        .expect("client");
+
+    let error = client
+        .new_call(empty_request(server.http_url("/retry-custom")))
+        .retry_on_connection_failure(true)
+        .max_retries(3)
+        .retry_canceled_requests(true)
+        .execute()
+        .await
+        .expect_err("custom retry policy should remain authoritative");
+
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 1);
+    assert_eq!(policy.calls(), 1);
 }
 
 #[tokio::test]
@@ -4337,6 +4396,42 @@ fn normalize_env_key_for_platform(key: &str) -> String {
         key.to_ascii_lowercase()
     } else {
         key.to_owned()
+    }
+}
+
+#[derive(Clone, Default)]
+struct NeverRetryPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl NeverRetryPolicy {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RetryPolicy for NeverRetryPolicy {
+    fn should_retry(&self, _ctx: &RetryContext<'_>) -> Option<&'static str> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+#[derive(Clone, Default)]
+struct StopRedirectPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl StopRedirectPolicy {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RedirectPolicy for StopRedirectPolicy {
+    fn should_redirect(&self, _ctx: &RedirectContext<'_>) -> RedirectDecision {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        RedirectDecision::Stop
     }
 }
 
