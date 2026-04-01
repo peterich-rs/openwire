@@ -20,8 +20,8 @@ pub(crate) struct PoolSettings {
 impl Default for PoolSettings {
     fn default() -> Self {
         Self {
-            idle_timeout: Some(Duration::from_secs(90)),
-            max_idle_per_address: usize::MAX,
+            idle_timeout: Some(Duration::from_secs(300)),
+            max_idle_per_address: 5,
         }
     }
 }
