@@ -55,7 +55,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A[User API<br/>Client::execute / Call::execute] --> B[Create CallContext and EventListener]
+    A[User API<br/>Client::execute / Call::execute] --> B[Resolve effective request config<br/>Create CallContext and EventListener]
     B --> C[Application Interceptors]
     C --> D[FollowUpPolicyService]
     D --> E[Request Validation]

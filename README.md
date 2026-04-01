@@ -14,6 +14,7 @@ blocks, and stable observability hooks.
 ## What It Provides
 
 - `Client`, `ClientBuilder`, and one-shot `Call` over `http::Request<RequestBody>`
+- request-scoped timeout, retry, and redirect overrides through `Call`
 - application and network interceptors
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
@@ -58,6 +59,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Request-scoped overrides stay on the canonical execution path:
+
+```rust
+use std::time::Duration;
+
+let response = client
+    .new_call(request)
+    .call_timeout(Duration::from_secs(2))
+    .connect_timeout(Duration::from_millis(250))
+    .follow_redirects(false)
+    .execute()
+    .await?;
+```
+
+These per-request retry and redirect overrides target the built-in scalar policy
+knobs. Custom `RetryPolicy` and `RedirectPolicy` objects remain client-scoped.
 
 ## Current Status
 

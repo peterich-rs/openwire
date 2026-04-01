@@ -9,7 +9,7 @@ mod sync_util;
 mod trace;
 mod transport;
 
-pub use client::{Call, Client, ClientBuilder};
+pub use client::{Call, CallOptions, Client, ClientBuilder};
 pub use connection::{
     Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
     ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,

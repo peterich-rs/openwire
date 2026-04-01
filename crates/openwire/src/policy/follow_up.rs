@@ -1,5 +1,4 @@
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use http::header::{
     AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, PROXY_AUTHORIZATION,
@@ -17,13 +16,13 @@ use super::{RedirectPolicyConfig, RetryPolicyConfig};
 use crate::auth::{
     build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
+use crate::client::{CallOptions, EffectiveRequestConfig};
 use crate::cookie::SharedCookieJar;
 use crate::proxy::ProxySelector;
 use crate::trace::PolicyTraceContext;
 
 #[derive(Clone)]
 pub(crate) struct PolicyConfig {
-    pub(crate) call_timeout: Option<Duration>,
     pub(crate) cookie_jar: Option<SharedCookieJar>,
     pub(crate) auth: AuthPolicyConfig,
     pub(crate) retry: RetryPolicyConfig,
@@ -70,10 +69,20 @@ impl Service<Exchange> for FollowUpPolicyService {
     fn call(&mut self, exchange: Exchange) -> Self::Future {
         let replacement = self.network.clone();
         let mut network = std::mem::replace(&mut self.network, replacement);
-        let config = self.config.clone();
         let proxy_selector = self.proxy_selector.clone();
+        let mut config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, mut attempt) = exchange.into_parts();
+            let request_config = request
+                .extensions()
+                .get::<EffectiveRequestConfig>()
+                .copied();
+            let request_options = request
+                .extensions()
+                .get::<CallOptions>()
+                .copied()
+                .unwrap_or_default();
+            apply_request_overrides(&mut config, request_config, request_options);
             let mut policy_trace = request
                 .extensions()
                 .get::<PolicyTraceContext>()
@@ -237,6 +246,30 @@ impl Service<Exchange> for FollowUpPolicyService {
                 }
             }
         })
+    }
+}
+
+fn apply_request_overrides(
+    config: &mut PolicyConfig,
+    request_config: Option<EffectiveRequestConfig>,
+    request_options: CallOptions,
+) {
+    let Some(request_config) = request_config else {
+        return;
+    };
+
+    if request_options.has_retry_overrides() {
+        let retry = config.retry.default_mut();
+        retry.set_retry_on_connection_failure(request_config.retry_on_connection_failure);
+        retry.set_max_retries(request_config.max_retries);
+        retry.set_retry_canceled_requests(request_config.retry_canceled_requests);
+    }
+
+    if request_options.has_redirect_overrides() {
+        let redirect = config.redirect.default_mut();
+        redirect.set_follow_redirects(request_config.follow_redirects);
+        redirect.set_max_redirects(request_config.max_redirects);
+        redirect.set_allow_insecure_redirects(request_config.allow_insecure_redirects);
     }
 }
 
@@ -727,7 +760,6 @@ mod tests {
 
     fn default_policy_config() -> PolicyConfig {
         PolicyConfig {
-            call_timeout: None,
             cookie_jar: None,
             auth: AuthPolicyConfig {
                 authenticator: None,
