@@ -450,14 +450,14 @@ impl Default for ClientBuilder {
             call_timeout: None,
             transport: TransportConfig {
                 connect_timeout: None,
-                pool_idle_timeout: Some(Duration::from_secs(90)),
-                pool_max_idle_per_host: usize::MAX,
+                pool_idle_timeout: Some(Duration::from_secs(300)),
+                pool_max_idle_per_host: 5,
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
                 max_connections_total: usize::MAX,
                 max_connections_per_host: usize::MAX,
-                max_requests_total: usize::MAX,
-                max_requests_per_host: usize::MAX,
+                max_requests_total: 64,
+                max_requests_per_host: 5,
             },
             policy: PolicyConfig {
                 cookie_jar: None,
@@ -980,8 +980,8 @@ mod tests {
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
 
     use super::{
-        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ConnectionPool,
-        EffectiveRequestConfig, PoolReaperController, PoolSettings,
+        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ClientBuilder,
+        ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
     };
     use crate::connection::CachedAddress;
     use crate::proxy::ProxySelector;
@@ -1120,6 +1120,20 @@ mod tests {
                 .map(|cached| &cached.0),
             Some(&address)
         );
+    }
+
+    #[test]
+    fn client_builder_defaults_use_bounded_pool_and_request_limits() {
+        let builder = ClientBuilder::default();
+
+        assert_eq!(builder.transport.connect_timeout, None);
+        assert_eq!(
+            builder.transport.pool_idle_timeout,
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(builder.transport.pool_max_idle_per_host, 5);
+        assert_eq!(builder.transport.max_requests_total, 64);
+        assert_eq!(builder.transport.max_requests_per_host, 5);
     }
 
     #[test]

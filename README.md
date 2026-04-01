@@ -77,6 +77,19 @@ let response = client
 These per-request retry and redirect overrides target the built-in scalar policy
 knobs. Custom `RetryPolicy` and `RedirectPolicy` objects remain client-scoped.
 
+## Default Transport Settings
+
+`Client::builder()` currently defaults to:
+
+- pooled idle connection eviction after 5 minutes
+- at most 5 idle pooled connections per address
+- at most 64 in-flight requests across the client
+- at most 5 in-flight requests per address
+
+These request and pool limits are bounded by address, not only origin host. If a
+caller needs the previous unbounded request-admission or idle-pool behavior, set
+the corresponding knobs explicitly, for example with `usize::MAX`.
+
 ## Current Status
 
 Today the project includes:

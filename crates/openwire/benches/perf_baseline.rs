@@ -25,6 +25,7 @@ fn perf_baseline(c: &mut Criterion) {
 
     let http1_client = Client::builder().build().expect("http1 client");
     let h2_client = Client::builder()
+        .max_requests_per_host(usize::MAX)
         .tls_connector(tls_connector(&h2_server))
         .build()
         .expect("h2 client");
