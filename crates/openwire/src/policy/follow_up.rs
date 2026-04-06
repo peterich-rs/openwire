@@ -116,10 +116,12 @@ impl Service<Exchange> for FollowUpPolicyService {
                         if let Some((next_request, next_auth_count)) = authenticate_response(
                             &snapshot,
                             &response,
-                            attempt,
-                            retries,
-                            redirects,
-                            auths,
+                            AuthAttemptState {
+                                total_attempt: attempt,
+                                retry_count: retries,
+                                redirect_count: redirects,
+                                auth_count: auths,
+                            },
                             selected_proxy.clone(),
                             &config.auth,
                         )
@@ -289,10 +291,7 @@ fn apply_request_cookies(
 async fn authenticate_response(
     snapshot: &RequestSnapshot,
     response: &Response<ResponseBody>,
-    attempt: u32,
-    retries: u32,
-    redirects: u32,
-    auths: u32,
+    attempts: AuthAttemptState,
     selected_proxy: Option<SelectedProxy>,
     config: &AuthPolicyConfig,
 ) -> Result<Option<(Request<RequestBody>, u32)>, WireError> {
@@ -308,7 +307,7 @@ async fn authenticate_response(
         return Ok(None);
     };
 
-    if auths as usize >= config.max_auth_attempts || !snapshot.is_replayable() {
+    if attempts.auth_count as usize >= config.max_auth_attempts || !snapshot.is_replayable() {
         return Ok(None);
     }
 
@@ -323,12 +322,7 @@ async fn authenticate_response(
             snapshot.body.as_ref().and_then(RequestBody::try_clone),
         ),
         AuthResponseState::new(response.status(), response.headers().clone()),
-        AuthAttemptState {
-            total_attempt: attempt,
-            retry_count: retries,
-            redirect_count: redirects,
-            auth_count: auths,
-        },
+        attempts,
     );
 
     if let Some(mut request) = authenticator
@@ -337,10 +331,10 @@ async fn authenticate_response(
         .map_err(|error| error.with_response_status(response.status()))?
     {
         reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
-        let next_auth_count = auths + 1;
+        let next_auth_count = attempts.auth_count + 1;
         request.extensions_mut().insert(PolicyTraceContext {
-            retry_count: retries,
-            redirect_count: redirects,
+            retry_count: attempts.retry_count,
+            redirect_count: attempts.redirect_count,
             auth_count: next_auth_count,
         });
         return Ok(Some((request, next_auth_count)));

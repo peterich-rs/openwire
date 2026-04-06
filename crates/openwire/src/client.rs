@@ -36,7 +36,7 @@ use crate::proxy::{
     resolved_proxy_candidates, ProxyRules, ProxySelector, SelectedProxy, SharedProxySelector,
 };
 use crate::sync_util::lock_mutex;
-use crate::transport::{ConnectorStack, TransportService};
+use crate::transport::{ConnectorStack, TransportService, TransportServiceInit};
 
 #[derive(Clone)]
 pub struct Client {
@@ -404,16 +404,16 @@ impl ClientBuilder {
             max_proxy_auth_attempts: self.policy.auth.max_auth_attempts,
         };
 
-        let transport = TransportService::new(
+        let transport = TransportService::new(TransportServiceInit {
             connector,
-            self.transport.clone(),
-            self.executor.clone(),
-            self.timer.clone(),
+            config: self.transport.clone(),
+            executor: self.executor.clone(),
+            timer: self.timer.clone(),
             exchange_finder,
             request_admission,
-            proxy_selector.clone(),
+            proxy_selector: proxy_selector.clone(),
             on_pooled_connection_published,
-        );
+        });
         let service = build_service_chain(
             transport,
             self.application_interceptors,

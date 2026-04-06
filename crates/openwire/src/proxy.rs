@@ -49,7 +49,7 @@ pub struct ProxySelection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyChoice {
     Direct,
-    Proxy(Proxy),
+    Proxy(Box<Proxy>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,7 +240,7 @@ impl ProxySelection {
 
     /// Appends a proxied candidate.
     pub fn push_proxy(mut self, proxy: Proxy) -> Self {
-        self.choices.push(ProxyChoice::Proxy(proxy));
+        self.choices.push(ProxyChoice::Proxy(Box::new(proxy)));
         self
     }
 
@@ -254,7 +254,10 @@ impl ProxySelection {
 
     fn from_proxies(proxies: Vec<Proxy>) -> Self {
         Self {
-            choices: proxies.into_iter().map(ProxyChoice::Proxy).collect(),
+            choices: proxies
+                .into_iter()
+                .map(|proxy| ProxyChoice::Proxy(Box::new(proxy)))
+                .collect(),
         }
     }
 }
@@ -371,7 +374,7 @@ pub(crate) fn resolved_proxy_candidates(
     for choice in selection.iter() {
         let candidate = match choice {
             ProxyChoice::Direct => None,
-            ProxyChoice::Proxy(proxy) => Some(SelectedProxy::from_proxy(proxy)),
+            ProxyChoice::Proxy(proxy) => Some(SelectedProxy::from_proxy(proxy.as_ref())),
         };
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
