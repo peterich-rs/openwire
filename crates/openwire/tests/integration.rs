@@ -16,10 +16,10 @@ use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
 use openwire::{
     AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DefaultRoutePlanner,
-    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy,
-    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext,
-    RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector,
-    TlsConnector, Url, WireError, WireErrorKind,
+    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, ProxyRules,
+    ProxySelection, ProxySelector, RedirectContext, RedirectDecision, RedirectPolicy, RequestBody,
+    ResponseBody, RetryContext, RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector,
+    TaskHandle, TcpConnector, TlsConnector, Url, WireError, WireErrorKind,
 };
 use openwire_core::BoxConnection;
 use openwire_core::WireExecutor;
@@ -872,10 +872,10 @@ async fn https_requests_can_tunnel_through_http_proxy() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .tls_connector(tls)
         .build()
         .expect("client");
@@ -922,10 +922,10 @@ async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .tls_connector(tls)
         .build()
@@ -985,13 +985,13 @@ async fn https_proxy_connect_uses_url_embedded_credentials_on_initial_connect() 
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!(
                 "http://user:pass@proxy.test:{}",
                 proxy.addr().port()
             ))
             .expect("proxy config"),
-        )
+        ))
         .tls_connector(tls)
         .build()
         .expect("client");
@@ -1043,10 +1043,10 @@ async fn declining_proxy_authenticator_fails_connect_tunnel_on_407() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .tls_connector(tls)
         .build()
@@ -1095,10 +1095,10 @@ async fn connect_proxy_auth_attempts_are_limited() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .max_auth_attempts(1)
         .tls_connector(tls)
@@ -1136,10 +1136,10 @@ async fn connect_timeout_applies_to_proxy_connect_response_reads() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .connect_timeout(Duration::from_millis(25))
         .build()
         .expect("client");
@@ -1187,10 +1187,10 @@ async fn http_requests_can_route_through_http_proxy_without_origin_dns() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1222,10 +1222,10 @@ async fn http_requests_can_route_through_socks5_proxy_without_origin_dns() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1258,10 +1258,10 @@ async fn socks5_proxy_username_password_authentication_is_required_when_server_d
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1291,13 +1291,13 @@ async fn http_requests_can_route_through_socks5_proxy_with_username_password() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::socks5(format!(
                 "socks5://alice:secret@proxy.test:{}",
                 proxy.addr().port()
             ))
             .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1336,10 +1336,10 @@ async fn https_requests_can_tunnel_through_socks5_proxy_without_origin_dns() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::socks5(format!("socks5://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .tls_connector(tls)
         .build()
         .expect("client");
@@ -1391,10 +1391,10 @@ async fn http_proxy_routes_fast_fallback_across_proxy_ipv4_and_ipv6_endpoints() 
         .dns_resolver(resolver)
         .tcp_connector(connector.clone())
         .event_listener_factory(events.clone())
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1469,10 +1469,10 @@ async fn connect_proxy_fast_fallback_continues_after_proxy_tunnel_failure() {
         .tcp_connector(connector.clone())
         .tls_connector(tls.clone())
         .event_listener_factory(events.clone())
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", failing_proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1565,13 +1565,13 @@ async fn connect_proxy_fast_fallback_parallelizes_stalled_tunnel_finalization() 
         .dns_resolver(resolver)
         .tcp_connector(connector.clone())
         .tls_connector(tls.clone())
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!(
                 "http://proxy.test:{}",
                 stalling_proxy.addr().port()
             ))
             .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1618,11 +1618,11 @@ async fn no_proxy_exact_host_bypasses_proxy() {
             ("proxy.test".to_owned(), proxy.addr()),
             ("direct.test".to_owned(), server.addr()),
         ]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config")
                 .no_proxy(NoProxy::new().host("direct.test")),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1653,11 +1653,11 @@ async fn no_proxy_domain_suffix_bypasses_proxy() {
             ("proxy.test".to_owned(), proxy.addr()),
             ("api.internal.test".to_owned(), server.addr()),
         ]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config")
                 .no_proxy(NoProxy::new().domain("internal.test")),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1688,11 +1688,11 @@ async fn no_proxy_localhost_bypasses_proxy() {
             ("proxy.test".to_owned(), proxy.addr()),
             ("127.0.0.1".to_owned(), server.addr()),
         ]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config")
                 .no_proxy(NoProxy::new().localhost()),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -1730,7 +1730,7 @@ async fn system_http_proxy_from_env_is_applied() {
     ]);
 
     let client = Client::builder()
-        .use_system_proxy(true)
+        .proxy_selector(system_proxy_rules())
         .build()
         .expect("client");
 
@@ -1769,7 +1769,7 @@ async fn system_no_proxy_from_env_bypasses_proxy() {
             ("proxy.test".to_owned(), proxy.addr()),
             ("api.example.internal".to_owned(), server.addr()),
         ]))
-        .use_system_proxy(true)
+        .proxy_selector(system_proxy_rules())
         .build()
         .expect("client");
 
@@ -1811,14 +1811,17 @@ async fn explicit_proxy_rules_take_priority_over_system_proxy() {
             ("explicit-proxy.test".to_owned(), explicit_proxy.addr()),
             ("env-proxy.test".to_owned(), env_proxy.addr()),
         ]))
-        .proxy(
-            Proxy::http(format!(
-                "http://explicit-proxy.test:{}",
-                explicit_proxy.addr().port()
-            ))
-            .expect("explicit proxy"),
+        .proxy_selector(
+            ProxyRules::new()
+                .proxy(
+                    Proxy::http(format!(
+                        "http://explicit-proxy.test:{}",
+                        explicit_proxy.addr().port()
+                    ))
+                    .expect("explicit proxy"),
+                )
+                .use_system_proxy(true),
         )
-        .use_system_proxy(true)
         .build()
         .expect("client");
 
@@ -1843,19 +1846,22 @@ async fn proxy_rules_use_first_matching_entry() {
             ("proxy-one.test".to_owned(), first_proxy.addr()),
             ("proxy-two.test".to_owned(), second_proxy.addr()),
         ]))
-        .proxy(
-            Proxy::http(format!(
-                "http://proxy-one.test:{}",
-                first_proxy.addr().port()
-            ))
-            .expect("proxy one"),
-        )
-        .proxy(
-            Proxy::all(format!(
-                "http://proxy-two.test:{}",
-                second_proxy.addr().port()
-            ))
-            .expect("proxy two"),
+        .proxy_selector(
+            ProxyRules::new()
+                .proxy(
+                    Proxy::http(format!(
+                        "http://proxy-one.test:{}",
+                        first_proxy.addr().port()
+                    ))
+                    .expect("proxy one"),
+                )
+                .proxy(
+                    Proxy::all(format!(
+                        "http://proxy-two.test:{}",
+                        second_proxy.addr().port()
+                    ))
+                    .expect("proxy two"),
+                ),
         )
         .build()
         .expect("client");
@@ -1873,6 +1879,112 @@ async fn proxy_rules_use_first_matching_entry() {
 }
 
 #[tokio::test]
+async fn proxy_selector_is_re_evaluated_after_client_build() {
+    let first_proxy = spawn_plain_http_proxy_response("proxy one").await;
+    let second_proxy = spawn_plain_http_proxy_response("proxy two").await;
+    let selector = SwitchingProxySelector::new(Some(
+        Proxy::http(format!(
+            "http://proxy-one.test:{}",
+            first_proxy.addr().port()
+        ))
+        .expect("proxy one"),
+    ));
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("proxy-one.test".to_owned(), first_proxy.addr()),
+            ("proxy-two.test".to_owned(), second_proxy.addr()),
+        ]))
+        .proxy_selector(selector.clone())
+        .build()
+        .expect("client");
+
+    let first_response = client
+        .execute(empty_request("http://does-not-resolve.test/dynamic-first"))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first_response.into_body().text().await.expect("first body"),
+        "proxy one"
+    );
+    assert_eq!(first_proxy.requests().len(), 1);
+    assert!(second_proxy.requests().is_empty());
+
+    selector.set_proxy(Some(
+        Proxy::http(format!(
+            "http://proxy-two.test:{}",
+            second_proxy.addr().port()
+        ))
+        .expect("proxy two"),
+    ));
+
+    let second_response = client
+        .execute(empty_request("http://does-not-resolve.test/dynamic-second"))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second_response
+            .into_body()
+            .text()
+            .await
+            .expect("second body"),
+        "proxy two"
+    );
+    assert_eq!(first_proxy.requests().len(), 1);
+    assert_eq!(second_proxy.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn proxy_rules_try_next_proxy_after_connect_proxy_failure() {
+    let server = spawn_https_http1(|_request| async move { ok_text("proxy fallback") }).await;
+    let failing_proxy = spawn_rejecting_connect_proxy().await;
+    let working_proxy = spawn_connect_proxy().await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("failing-proxy.test".to_owned(), failing_proxy.addr()),
+            ("working-proxy.test".to_owned(), working_proxy.addr()),
+        ]))
+        .proxy_selector(
+            ProxyRules::new()
+                .proxy(
+                    Proxy::https(format!(
+                        "http://failing-proxy.test:{}",
+                        failing_proxy.addr().port()
+                    ))
+                    .expect("failing proxy"),
+                )
+                .proxy(
+                    Proxy::https(format!(
+                        "http://working-proxy.test:{}",
+                        working_proxy.addr().port()
+                    ))
+                    .expect("working proxy"),
+                ),
+        )
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://localhost:{}/proxy-candidate-fallback",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "proxy fallback");
+    assert_eq!(failing_proxy.requests().len(), 1);
+    assert_eq!(working_proxy.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn http_proxy_can_retry_requests_after_407_with_proxy_authenticator() {
     let proxy =
         spawn_proxy_requiring_authorization("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0").await;
@@ -1883,10 +1995,10 @@ async fn http_proxy_can_retry_requests_after_407_with_proxy_authenticator() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .build()
         .expect("client");
@@ -1920,10 +2032,10 @@ async fn http_proxy_redirects_keep_proxy_authorization_for_same_proxy() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .build()
         .expect("client");
@@ -2050,10 +2162,10 @@ async fn declining_proxy_authenticator_returns_407_response() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::http(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .proxy_authenticator(authenticator.clone())
         .build()
         .expect("client");
@@ -2076,10 +2188,10 @@ async fn proxy_connect_failures_return_connect_errors() {
             "proxy.test".to_owned(),
             proxy.addr(),
         )]))
-        .proxy(
+        .proxy_selector(proxy_rules(
             Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
                 .expect("proxy config"),
-        )
+        ))
         .build()
         .expect("client");
 
@@ -4314,6 +4426,43 @@ fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {
         .uri(uri.as_ref())
         .body(RequestBody::empty())
         .expect("request")
+}
+
+fn proxy_rules(proxy: Proxy) -> ProxyRules {
+    ProxyRules::new().proxy(proxy)
+}
+
+fn system_proxy_rules() -> ProxyRules {
+    ProxyRules::new().use_system_proxy(true)
+}
+
+#[derive(Clone, Default)]
+struct SwitchingProxySelector {
+    current: Arc<Mutex<Option<Proxy>>>,
+}
+
+impl SwitchingProxySelector {
+    fn new(proxy: Option<Proxy>) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(proxy)),
+        }
+    }
+
+    fn set_proxy(&self, proxy: Option<Proxy>) {
+        *self.current.lock().expect("switching proxy selector lock") = proxy;
+    }
+}
+
+impl ProxySelector for SwitchingProxySelector {
+    fn select(&self, _uri: &http::Uri) -> Result<ProxySelection, WireError> {
+        Ok(self
+            .current
+            .lock()
+            .expect("switching proxy selector lock")
+            .clone()
+            .map(|proxy| ProxySelection::new().push_proxy(proxy))
+            .unwrap_or_else(ProxySelection::direct))
+    }
 }
 
 fn default_user_agent() -> &'static str {

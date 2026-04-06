@@ -44,7 +44,7 @@ use crate::connection::{
     FastFallbackOutcome, PoolSettings, ProtocolPolicy, RealConnection, Route, RoutePlan,
     RoutePlanner, UriScheme,
 };
-use crate::proxy::ProxySelector;
+use crate::proxy::ProxyRules;
 
 #[derive(Clone, Debug)]
 struct CapturedSpan {
@@ -705,7 +705,7 @@ fn abandoned_http2_lease_does_not_poison_the_session() {
     assert!(connection.try_acquire());
     let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
         Arc::new(ConnectionPool::new(PoolSettings::default())),
-        ProxySelector::new(Vec::new()),
+        Arc::new(ProxyRules::new()),
     ));
     abandon_response_lease(Some(ResponseLease::http2(
         connection.clone(),
@@ -734,7 +734,7 @@ fn discarded_http2_lease_marks_connection_unhealthy() {
     assert!(connection.try_acquire());
     let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
         Arc::new(ConnectionPool::new(PoolSettings::default())),
-        ProxySelector::new(Vec::new()),
+        Arc::new(ProxyRules::new()),
     ));
     ResponseLease::http2(
         connection.clone(),

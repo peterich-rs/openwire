@@ -21,6 +21,9 @@ blocks, and stable observability hooks.
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
   including `socks5://user:pass@host:port` credentials and proxy-endpoint
   fast fallback
+- dynamic per-request proxy selection via `ProxySelector`, including ordered
+  proxy candidate fallback and `DIRECT`, with `ProxyRules` as the built-in
+  rule-based implementation
 - custom DNS, TCP, TLS, executor, and timer hooks
 - an owned connection core with route planning, pooling, and direct HTTP/1.1 /
   HTTP/2 protocol binding
@@ -76,6 +79,35 @@ let response = client
 
 These per-request retry and redirect overrides target the built-in scalar policy
 knobs. Custom `RetryPolicy` and `RedirectPolicy` objects remain client-scoped.
+
+Proxy routing is configured through a selector so the active proxy can change at
+execution time. A selector can return multiple candidates for one request; the
+transport tries them in order within the same logical attempt:
+
+```rust
+use openwire::{Client, Proxy, ProxySelection, ProxySelector};
+
+#[derive(Clone)]
+struct MobileSelector;
+
+impl ProxySelector for MobileSelector {
+    fn select(&self, _uri: &http::Uri) -> Result<ProxySelection, openwire::WireError> {
+        Ok(ProxySelection::new()
+            .push_proxy(Proxy::https("http://proxy-a.local:8080")?)
+            .push_proxy(Proxy::https("http://proxy-b.local:8080")?)
+            .push_direct())
+    }
+}
+
+let client = Client::builder()
+    .proxy_selector(MobileSelector)
+    .build()?;
+```
+
+`ProxyRules` remains available when a simple ordered rule list is enough.
+Once a proxied attempt succeeds, later auth and redirect follow-ups in the same
+logical call prefer that proxy first so proxy-authorization state stays bound
+to the proxy that actually handled the request.
 
 ## Default Transport Settings
 

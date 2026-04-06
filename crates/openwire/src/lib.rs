@@ -27,5 +27,5 @@ pub use openwire_core::{
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};
 pub use policy::{DefaultRedirectPolicy, DefaultRetryPolicy};
-pub use proxy::{NoProxy, Proxy};
+pub use proxy::{NoProxy, Proxy, ProxyChoice, ProxyRules, ProxySelection, ProxySelector};
 pub use url::Url;

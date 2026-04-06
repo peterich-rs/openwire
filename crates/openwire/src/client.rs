@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::{select, Either};
+use http::header::PROXY_AUTHORIZATION;
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -24,14 +25,16 @@ use tracing::Instrument;
 use crate::auth::SharedAuthenticator;
 use crate::bridge::BridgeInterceptor;
 use crate::connection::{
-    Address, CachedAddress, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
-    RequestAdmissionLimiter, RequestAdmissionPermit, RoutePlanner,
+    Address, CachedAddresses, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
+    RequestAdmissionLimiter, RequestAdmissionPermit, ResolvedAddress, RoutePlanner,
 };
 use crate::cookie::SharedCookieJar;
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
 };
-use crate::proxy::{system_proxies_from_env, Proxy, ProxySelector};
+use crate::proxy::{
+    resolved_proxy_candidates, ProxyRules, ProxySelector, SelectedProxy, SharedProxySelector,
+};
 use crate::sync_util::lock_mutex;
 use crate::transport::{ConnectorStack, TransportService};
 
@@ -104,8 +107,7 @@ pub struct ClientBuilder {
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     route_planner: Arc<dyn RoutePlanner>,
-    proxies: Vec<Proxy>,
-    use_system_proxy: bool,
+    proxy_selector: SharedProxySelector,
 }
 
 const MIN_POOL_REAPER_CADENCE: Duration = Duration::from_secs(5);
@@ -207,15 +209,12 @@ impl ClientBuilder {
         self
     }
 
-    /// Adds a proxy rule to the client.
-    pub fn proxy(mut self, proxy: Proxy) -> Self {
-        self.proxies.push(proxy);
-        self
-    }
-
-    /// Opts into reading proxy rules from standard environment variables.
-    pub fn use_system_proxy(mut self, enabled: bool) -> Self {
-        self.use_system_proxy = enabled;
+    /// Configures how proxies are resolved for each request attempt.
+    pub fn proxy_selector<S>(mut self, selector: S) -> Self
+    where
+        S: ProxySelector,
+    {
+        self.proxy_selector = Arc::new(selector);
         self
     }
 
@@ -365,11 +364,6 @@ impl ClientBuilder {
         #[cfg(not(feature = "tls-rustls"))]
         let tls_connector = self.tls_connector;
 
-        let mut proxies = self.proxies;
-        if self.use_system_proxy {
-            proxies.extend(system_proxies_from_env()?);
-        }
-
         let request_config = EffectiveRequestConfig::from_defaults(
             self.call_timeout,
             self.transport.connect_timeout,
@@ -392,7 +386,7 @@ impl ClientBuilder {
         } else {
             None
         };
-        let proxy_selector = ProxySelector::new(proxies);
+        let proxy_selector = self.proxy_selector;
         let request_admission = RequestAdmissionLimiter::new(
             self.transport.max_requests_total,
             self.transport.max_requests_per_host,
@@ -416,15 +410,15 @@ impl ClientBuilder {
             self.executor.clone(),
             self.timer.clone(),
             exchange_finder,
+            request_admission,
+            proxy_selector.clone(),
             on_pooled_connection_published,
         );
         let service = build_service_chain(
             transport,
-            request_admission,
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
-            proxy_selector.clone(),
         );
 
         Ok(Client {
@@ -473,8 +467,7 @@ impl Default for ClientBuilder {
             tcp_connector: Arc::new(TokioTcpConnector),
             tls_connector: None,
             route_planner: Arc::new(DefaultRoutePlanner::default()),
-            proxies: Vec::new(),
-            use_system_proxy: false,
+            proxy_selector: Arc::new(ProxyRules::new()),
         }
     }
 }
@@ -636,7 +629,7 @@ impl Call {
     }
 }
 
-fn attach_request_admission(
+pub(crate) fn attach_request_admission(
     response: Response<ResponseBody>,
     permit: RequestAdmissionPermit,
 ) -> Response<ResponseBody> {
@@ -655,16 +648,11 @@ fn attach_request_admission(
 
 fn build_service_chain(
     transport: TransportService,
-    request_admission: RequestAdmissionLimiter,
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     policy: PolicyConfig,
-    proxy_selector: ProxySelector,
 ) -> BoxWireService {
     let mut network: BoxWireService = BoxCloneSyncService::new(transport);
-    network = BoxCloneSyncService::new(
-        RequestAdmissionLayer::new(request_admission, proxy_selector.clone()).layer(network),
-    );
     for interceptor in network_interceptors.iter().rev() {
         network =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
@@ -674,94 +662,13 @@ fn build_service_chain(
     );
 
     let mut service: BoxWireService =
-        BoxCloneSyncService::new(FollowUpPolicyService::new(network, policy, proxy_selector));
+        BoxCloneSyncService::new(FollowUpPolicyService::new(network, policy));
     for interceptor in application_interceptors.iter().rev() {
         service =
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(service));
     }
 
     service
-}
-
-#[derive(Clone)]
-struct RequestAdmissionLayer {
-    limiter: RequestAdmissionLimiter,
-    proxy_selector: ProxySelector,
-}
-
-impl RequestAdmissionLayer {
-    fn new(limiter: RequestAdmissionLimiter, proxy_selector: ProxySelector) -> Self {
-        Self {
-            limiter,
-            proxy_selector,
-        }
-    }
-}
-
-impl<S> Layer<S> for RequestAdmissionLayer
-where
-    S: Service<Exchange, Response = Response<ResponseBody>, Error = WireError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    S::Future: Send + 'static,
-{
-    type Service = RequestAdmissionService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        RequestAdmissionService {
-            inner,
-            limiter: self.limiter.clone(),
-            proxy_selector: self.proxy_selector.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RequestAdmissionService<S> {
-    inner: S,
-    limiter: RequestAdmissionLimiter,
-    proxy_selector: ProxySelector,
-}
-
-impl<S> Service<Exchange> for RequestAdmissionService<S>
-where
-    S: Service<Exchange, Response = Response<ResponseBody>, Error = WireError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = Response<ResponseBody>;
-    type Error = WireError;
-    type Future = openwire_core::BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        match self.inner.poll_ready(cx) {
-            std::task::Poll::Ready(Ok(())) => self.limiter.poll_ready(cx),
-            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-
-    fn call(&mut self, exchange: Exchange) -> Self::Future {
-        let replacement = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, replacement);
-        let limiter = self.limiter.clone();
-        let proxy_selector = self.proxy_selector.clone();
-        Box::pin(async move {
-            let mut exchange = exchange;
-            let request_address = cache_request_address(exchange.request_mut(), &proxy_selector)?;
-            let permit = limiter.acquire(request_address).await?;
-            let response = inner.call(exchange).await?;
-            Ok(attach_request_admission(response, permit))
-        })
-    }
 }
 
 impl CallOptions {
@@ -879,15 +786,37 @@ impl EffectiveRequestConfig {
     }
 }
 
-fn cache_request_address(
+pub(crate) fn cache_request_addresses(
     request: &mut Request<RequestBody>,
-    proxy_selector: &ProxySelector,
-) -> Result<Address, WireError> {
-    let address = Address::from_uri(request.uri(), proxy_selector.select(request.uri()))?;
-    request
-        .extensions_mut()
-        .insert(CachedAddress(address.clone()));
-    Ok(address)
+    proxy_selector: &dyn ProxySelector,
+) -> Result<Arc<[ResolvedAddress]>, WireError> {
+    let previous_selected_proxy = request.extensions().get::<SelectedProxy>().cloned();
+    let candidates = resolved_proxy_candidates(
+        proxy_selector.select(request.uri())?,
+        previous_selected_proxy.clone(),
+    );
+    let next_selected_proxy = candidates.first().cloned().flatten();
+    if previous_selected_proxy.is_some() && previous_selected_proxy != next_selected_proxy {
+        request.headers_mut().remove(PROXY_AUTHORIZATION);
+    }
+
+    let mut addresses = Vec::new();
+    for candidate in candidates {
+        let resolved = ResolvedAddress::new(
+            Address::from_uri(request.uri(), candidate.as_ref())?,
+            candidate,
+        );
+        if !addresses.iter().any(|existing: &ResolvedAddress| {
+            existing.address() == resolved.address()
+                && existing.selected_proxy() == resolved.selected_proxy()
+        }) {
+            addresses.push(resolved);
+        }
+    }
+    let addresses = Arc::<[ResolvedAddress]>::from(addresses);
+    let extensions = request.extensions_mut();
+    extensions.insert(CachedAddresses(addresses.clone()));
+    Ok(addresses)
 }
 
 async fn with_call_deadline<F>(
@@ -976,15 +905,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use http::header::PROXY_AUTHORIZATION;
     use http::Request;
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
 
     use super::{
-        cache_request_address, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ClientBuilder,
-        ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
+        cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions,
+        ClientBuilder, ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
     };
-    use crate::connection::CachedAddress;
-    use crate::proxy::ProxySelector;
+    use crate::connection::CachedAddresses;
+    use crate::proxy::{Proxy, ProxyRules, SelectedProxy};
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
     }
@@ -1104,21 +1034,53 @@ mod tests {
     }
 
     #[test]
-    fn cache_request_address_inserts_cached_extension() {
+    fn cache_request_addresses_inserts_cached_extension() {
         let mut request = Request::builder()
             .uri("http://example.com/resource")
             .body(RequestBody::empty())
             .expect("request");
 
-        let address =
-            cache_request_address(&mut request, &ProxySelector::new(Vec::new())).expect("address");
+        let addresses =
+            cache_request_addresses(&mut request, &ProxyRules::new()).expect("addresses");
 
         assert_eq!(
             request
                 .extensions()
-                .get::<CachedAddress>()
-                .map(|cached| &cached.0),
-            Some(&address)
+                .get::<CachedAddresses>()
+                .map(|cached| cached.0.clone()),
+            Some(addresses)
+        );
+    }
+
+    #[test]
+    fn cache_request_addresses_preserve_sticky_proxy_authorization() {
+        let first_proxy = Proxy::http("http://first.test:8080").expect("first proxy");
+        let second_proxy = Proxy::http("http://second.test:8080").expect("second proxy");
+        let mut request = Request::builder()
+            .uri("http://example.com/resource")
+            .header(PROXY_AUTHORIZATION, "Basic cHJveHk6b2xk")
+            .body(RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(SelectedProxy::from_proxy(&first_proxy));
+
+        let addresses =
+            cache_request_addresses(&mut request, &ProxyRules::new().proxy(second_proxy.clone()))
+                .expect("addresses");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(PROXY_AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic cHJveHk6b2xk")
+        );
+        assert_eq!(
+            addresses
+                .first()
+                .and_then(|candidate| candidate.selected_proxy()),
+            Some(&SelectedProxy::from_proxy(&first_proxy))
         );
     }
 
