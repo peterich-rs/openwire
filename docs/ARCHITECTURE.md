@@ -117,7 +117,7 @@ These are the intended customization points:
 | Trait / Surface | Role |
 | --- | --- |
 | `Interceptor` | application or network request/response interception |
-| `EventListener` / `EventListenerFactory` | attempt-level and transport-level observability |
+| `EventListener` / `EventListenerFactory` | call-level and transport-level observability |
 | `CookieJar` | request cookie application and response cookie persistence |
 | `Authenticator` | origin and proxy authentication follow-ups |
 | `RetryPolicy` | retry decisions |
@@ -143,6 +143,8 @@ Default runtime stack from `ClientBuilder::default()`:
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
+- `Client::execute` owns final call completion and wraps the returned response
+  body so `call_end` / `call_failed` reflect the whole call.
 - `ResponseLease` and `ObservedIncomingBody` own final release bookkeeping.
 - HTTP/1.1 reuse is single-exchange and response-body-lifecycle-driven.
 - HTTP/2 multiplexing is governed by connection health, allocation tracking,

@@ -189,6 +189,9 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
+        self.ctx
+            .listener()
+            .response_body_end(&self.ctx, self.bytes_read);
         abandon_response_lease(self.release.take());
     }
 

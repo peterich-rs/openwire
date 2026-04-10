@@ -9,8 +9,21 @@ pub type SharedEventListener = Arc<dyn EventListener>;
 pub type SharedEventListenerFactory = Arc<dyn EventListenerFactory>;
 
 pub trait EventListener: Send + Sync + 'static {
+    /// Fired once when a call begins execution.
+    ///
+    /// Retries, redirects, and authentication follow-ups remain inside the same
+    /// `call_start` to `call_end` / `call_failed` pair.
     fn call_start(&self, _ctx: &CallContext, _request: &Request<RequestBody>) {}
-    fn call_end(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
+
+    /// Fired once when the entire call completes successfully.
+    ///
+    /// This includes delayed response-body consumption by the caller.
+    fn call_end(&self, _ctx: &CallContext) {}
+
+    /// Fired once when the entire call fails permanently.
+    ///
+    /// This may follow a body-phase callback such as `response_body_failed`
+    /// when the terminal failure happens during response-body consumption.
     fn call_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
     fn dns_start(&self, _ctx: &CallContext, _host: &str, _port: u16) {}
@@ -31,7 +44,14 @@ pub trait EventListener: Send + Sync + 'static {
 
     fn response_headers_start(&self, _ctx: &CallContext) {}
     fn response_headers_end(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
+
+    /// Fired when the response body is closed or exhausted successfully.
+    ///
+    /// If the caller abandons the body early, `bytes_read` is the number of
+    /// bytes delivered before close.
     fn response_body_end(&self, _ctx: &CallContext, _bytes_read: u64) {}
+
+    /// Fired when the response body cannot be read to the point it was closed.
     fn response_body_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
     fn pool_lookup(&self, _ctx: &CallContext, _hit: bool, _connection_id: Option<ConnectionId>) {}

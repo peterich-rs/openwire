@@ -140,8 +140,8 @@ impl EventListener for RecordingEventListener {
         self.push(format!("call_start {} {}", request.method(), request.uri()));
     }
 
-    fn call_end(&self, _ctx: &CallContext, response: &Response<ResponseBody>) {
-        self.push(format!("call_end {}", response.status()));
+    fn call_end(&self, _ctx: &CallContext) {
+        self.push("call_end");
     }
 
     fn call_failed(&self, _ctx: &CallContext, error: &WireError) {
