@@ -13,10 +13,14 @@ use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::client::EffectiveRequestConfig;
+use crate::client::{
+    attach_request_admission, cache_request_addresses, clear_proxy_authorization_if_proxy_changed,
+};
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
-    ExchangeFinder, RealConnection, Route, RoutePlan,
+    ExchangeFinder, RealConnection, ResolvedAddress, Route, RoutePlan,
 };
+use crate::proxy::{SelectedProxy, SharedProxySelector};
 use crate::trace::PolicyTraceContext;
 
 use super::bindings::{
@@ -35,17 +39,45 @@ use super::protocol::{
 };
 
 struct SelectedConnection {
+    address: Address,
+    selected_proxy: Option<SelectedProxy>,
     connection: Option<RealConnection>,
     binding: Option<AcquiredBinding>,
+    request_permit: Option<crate::connection::RequestAdmissionPermit>,
     reused: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
     availability: ConnectionAvailability,
 }
 
+struct SelectedConnectionInit {
+    address: Address,
+    selected_proxy: Option<SelectedProxy>,
+    connection: RealConnection,
+    binding: AcquiredBinding,
+    request_permit: crate::connection::RequestAdmissionPermit,
+    reused: bool,
+    exchange_finder: Arc<ExchangeFinder>,
+    bindings: Arc<ConnectionBindings>,
+    availability: ConnectionAvailability,
+}
+
+struct FreshConnectionArgs<'a> {
+    candidate: &'a ResolvedAddress,
+    request: &'a Request<RequestBody>,
+    ctx: CallContext,
+    span: tracing::Span,
+    route_plan: RoutePlan,
+    connection_permit: ConnectionPermit,
+    request_permit: crate::connection::RequestAdmissionPermit,
+}
+
 type SelectedConnectionSendParts = (
+    Address,
+    Option<SelectedProxy>,
     RealConnection,
     AcquiredBinding,
+    crate::connection::RequestAdmissionPermit,
     bool,
     Arc<ExchangeFinder>,
     Arc<ConnectionBindings>,
@@ -53,25 +85,23 @@ type SelectedConnectionSendParts = (
 );
 
 impl SelectedConnection {
-    fn new(
-        connection: RealConnection,
-        binding: AcquiredBinding,
-        reused: bool,
-        exchange_finder: Arc<ExchangeFinder>,
-        bindings: Arc<ConnectionBindings>,
-        availability: ConnectionAvailability,
-    ) -> Self {
+    fn new(init: SelectedConnectionInit) -> Self {
         Self {
-            connection: Some(connection),
-            binding: Some(binding),
-            reused,
-            exchange_finder,
-            bindings,
-            availability,
+            address: init.address,
+            selected_proxy: init.selected_proxy,
+            connection: Some(init.connection),
+            binding: Some(init.binding),
+            request_permit: Some(init.request_permit),
+            reused: init.reused,
+            exchange_finder: init.exchange_finder,
+            bindings: init.bindings,
+            availability: init.availability,
         }
     }
 
     fn into_send_parts(mut self) -> Result<SelectedConnectionSendParts, WireError> {
+        let address = self.address.clone();
+        let selected_proxy = self.selected_proxy.clone();
         let connection = self.connection.take().ok_or_else(|| {
             WireError::internal(
                 "selected connection missing connection",
@@ -84,9 +114,18 @@ impl SelectedConnection {
                 io::Error::other("selected connection lost binding state"),
             )
         })?;
+        let request_permit = self.request_permit.take().ok_or_else(|| {
+            WireError::internal(
+                "selected connection missing request permit",
+                io::Error::other("selected connection lost request permit"),
+            )
+        })?;
         Ok((
+            address,
+            selected_proxy,
             connection,
             binding,
+            request_permit,
             self.reused,
             self.exchange_finder.clone(),
             self.bindings.clone(),
@@ -121,6 +160,8 @@ pub(crate) struct TransportService {
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
     exchange_finder: Arc<ExchangeFinder>,
+    request_admission: crate::connection::RequestAdmissionLimiter,
+    proxy_selector: SharedProxySelector,
     on_pooled_connection_published: Option<Arc<dyn Fn() + Send + Sync>>,
     connection_limiter: ConnectionLimiter,
     connection_availability: ConnectionAvailability,
@@ -128,15 +169,29 @@ pub(crate) struct TransportService {
     connection_tasks: ConnectionTaskRegistry,
 }
 
+pub(crate) struct TransportServiceInit {
+    pub(crate) connector: ConnectorStack,
+    pub(crate) config: crate::client::TransportConfig,
+    pub(crate) executor: Arc<dyn WireExecutor>,
+    pub(crate) timer: SharedTimer,
+    pub(crate) exchange_finder: Arc<ExchangeFinder>,
+    pub(crate) request_admission: crate::connection::RequestAdmissionLimiter,
+    pub(crate) proxy_selector: SharedProxySelector,
+    pub(crate) on_pooled_connection_published: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
 impl TransportService {
-    pub(crate) fn new(
-        connector: ConnectorStack,
-        config: crate::client::TransportConfig,
-        executor: Arc<dyn WireExecutor>,
-        timer: SharedTimer,
-        exchange_finder: Arc<ExchangeFinder>,
-        on_pooled_connection_published: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> Self {
+    pub(crate) fn new(init: TransportServiceInit) -> Self {
+        let TransportServiceInit {
+            connector,
+            config,
+            executor,
+            timer,
+            exchange_finder,
+            request_admission,
+            proxy_selector,
+            on_pooled_connection_published,
+        } = init;
         let connection_availability = ConnectionAvailability::default();
         let connection_limiter = ConnectionLimiter::new(
             config.max_connections_total,
@@ -149,6 +204,8 @@ impl TransportService {
             executor,
             timer,
             exchange_finder,
+            request_admission,
+            proxy_selector,
             on_pooled_connection_published,
             connection_limiter,
             connection_availability,
@@ -161,7 +218,8 @@ impl TransportService {
         self,
         exchange: Exchange,
     ) -> Result<Response<ResponseBody>, WireError> {
-        let (request, ctx, attempt) = exchange.into_parts();
+        let (mut request, ctx, attempt) = exchange.into_parts();
+        cache_request_addresses(&mut request, &*self.proxy_selector)?;
         let prepared = self.exchange_finder.prepare(&request)?;
         let request_body_len = request.body().replayable_len();
         let policy_trace = request
@@ -178,7 +236,7 @@ impl TransportService {
             let selected = self
                 .acquire_connection(&prepared, &request, ctx.clone(), tracing::Span::current())
                 .await?;
-            let response = send_bound_request(
+            let (response, request_permit) = send_bound_request(
                 request,
                 selected,
                 ctx.clone(),
@@ -219,7 +277,8 @@ impl TransportService {
                 deadline_expired,
                 tracing::Span::current(),
             );
-            let response = Response::from_parts(parts, body);
+            let response =
+                attach_request_admission(Response::from_parts(parts, body), request_permit);
             ctx.listener().response_headers_end(&ctx, &response);
             Ok(response)
         }
@@ -234,7 +293,64 @@ impl TransportService {
         ctx: CallContext,
         span: tracing::Span,
     ) -> Result<SelectedConnection, WireError> {
+        let mut last_error = None;
+        let pooled_address = prepared.pooled_address().cloned();
         let mut exact_candidate = prepared.reserved_connection().cloned();
+
+        if let Some(candidate) = pooled_address.as_ref() {
+            match self
+                .acquire_connection_for_candidate(
+                    candidate,
+                    exact_candidate.take(),
+                    request,
+                    ctx.clone(),
+                    span.clone(),
+                )
+                .await
+            {
+                Ok(selected) => return Ok(selected),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        for candidate in prepared.addresses() {
+            if pooled_address
+                .as_ref()
+                .is_some_and(|pooled| pooled.address() == candidate.address())
+            {
+                continue;
+            }
+
+            match self
+                .acquire_connection_for_candidate(
+                    candidate,
+                    None,
+                    request,
+                    ctx.clone(),
+                    span.clone(),
+                )
+                .await
+            {
+                Ok(selected) => return Ok(selected),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            WireError::route_exhausted("proxy selection produced no usable address candidates")
+        }))
+    }
+
+    async fn acquire_connection_for_candidate(
+        &self,
+        candidate: &ResolvedAddress,
+        mut exact_candidate: Option<RealConnection>,
+        request: &Request<RequestBody>,
+        ctx: CallContext,
+        span: tracing::Span,
+    ) -> Result<SelectedConnection, WireError> {
+        let address = candidate.address();
+        let mut request_permit = Some(self.request_admission.acquire(address.clone()).await?);
         let mut route_plan = None;
 
         loop {
@@ -248,7 +364,7 @@ impl TransportService {
                     let (connection, has_in_use) = self
                         .exchange_finder
                         .pool()
-                        .acquire_with_in_use_hint(prepared.address());
+                        .acquire_with_in_use_hint(address);
                     pooled_in_use_hint = connection.is_none().then_some(has_in_use);
                     connection
                 }
@@ -256,14 +372,17 @@ impl TransportService {
             if let Some(connection) = connection {
                 match self.bindings.acquire(connection.id()) {
                     BindingAcquireResult::Acquired(binding) => {
-                        return Ok(SelectedConnection::new(
+                        return Ok(SelectedConnection::new(SelectedConnectionInit {
+                            address: address.clone(),
+                            selected_proxy: candidate.selected_proxy().cloned(),
                             connection,
                             binding,
-                            true,
-                            self.exchange_finder.clone(),
-                            self.bindings.clone(),
-                            self.connection_availability.clone(),
-                        ));
+                            request_permit: request_permit.take().expect("request permit"),
+                            reused: true,
+                            exchange_finder: self.exchange_finder.clone(),
+                            bindings: self.bindings.clone(),
+                            availability: self.connection_availability.clone(),
+                        }));
                     }
                     BindingAcquireResult::Busy => {
                         let _ = self.exchange_finder.release(&connection);
@@ -277,29 +396,22 @@ impl TransportService {
             }
 
             if !waitable_pooled_connection {
-                waitable_pooled_connection = pooled_in_use_hint.unwrap_or_else(|| {
-                    self.exchange_finder
-                        .pool()
-                        .has_in_use_connection(prepared.address())
-                });
+                waitable_pooled_connection = pooled_in_use_hint
+                    .unwrap_or_else(|| self.exchange_finder.pool().has_in_use_connection(address));
             }
 
             if route_plan.is_none() {
-                match self
-                    .connector
-                    .route_plan(ctx.clone(), prepared.address())
-                    .await
-                {
+                match self.connector.route_plan(ctx.clone(), address).await {
                     Ok(plan) => route_plan = Some(plan),
                     Err(error)
                         if error.kind() == WireErrorKind::Dns
                             && waitable_pooled_connection
-                            && !self.connection_limiter.can_acquire(prepared.address()) =>
+                            && !self.connection_limiter.can_acquire(address) =>
                     {
                         tracing::debug!(
                             call_id = ctx.call_id().as_u64(),
-                            host = prepared.address().authority().host(),
-                            port = prepared.address().authority().port(),
+                            host = address.authority().host(),
+                            port = address.authority().port(),
                             error_kind = %error.kind(),
                             error_message = %error.message(),
                             "DNS failure suppressed; waiting for in-use pooled connection",
@@ -313,55 +425,53 @@ impl TransportService {
             let route_plan_ref = route_plan.as_ref().ok_or_else(|| {
                 WireError::internal("route plan missing", io::Error::other("route plan missing"))
             })?;
-            if let Some(selected) = self.try_acquire_coalesced(prepared.address(), route_plan_ref) {
+            if let Some(selected) =
+                self.try_acquire_coalesced(candidate, route_plan_ref, &mut request_permit)
+            {
                 return Ok(selected);
             }
 
-            let Some(connection_permit) = self
-                .connection_limiter
-                .try_acquire(prepared.address().clone())
+            let Some(connection_permit) = self.connection_limiter.try_acquire(address.clone())
             else {
                 wait_for_availability.await;
                 continue;
             };
 
             return self
-                .bind_fresh_connection(
-                    prepared,
+                .bind_fresh_connection(FreshConnectionArgs {
+                    candidate,
                     request,
                     ctx,
                     span,
-                    route_plan.take().ok_or_else(|| {
+                    route_plan: route_plan.take().ok_or_else(|| {
                         WireError::internal(
                             "route plan missing before fresh bind",
                             io::Error::other("route plan missing before fresh bind"),
                         )
                     })?,
                     connection_permit,
-                )
+                    request_permit: request_permit.take().expect("request permit"),
+                })
                 .await;
         }
     }
 
     async fn bind_fresh_connection(
         &self,
-        prepared: &crate::connection::PreparedExchange,
-        request: &Request<RequestBody>,
-        ctx: CallContext,
-        span: tracing::Span,
-        route_plan: RoutePlan,
-        connection_permit: ConnectionPermit,
+        args: FreshConnectionArgs<'_>,
     ) -> Result<SelectedConnection, WireError> {
         let connect_span = tracing::Span::current();
-        let connect_timeout = request
+        let connect_timeout = args
+            .request
             .extensions()
             .get::<EffectiveRequestConfig>()
             .map(|config| config.connect_timeout)
             .unwrap_or(self.connector.connect_timeout);
+        let span = args.span.clone();
         let stream = connect_route_plan(
-            ctx,
-            request.uri().clone(),
-            route_plan,
+            args.ctx,
+            args.request.uri().clone(),
+            args.route_plan,
             self.connector.proxy_connect_deps(connect_timeout),
         )
         .instrument(connect_span)
@@ -370,13 +480,13 @@ impl TransportService {
         let connected = stream.connected();
         let info = connection_info_from_connected(&connected);
         let coalescing = coalescing_info_from_connected(&connected);
-        let protocol = determine_protocol(prepared.address(), &connected);
-        let route = Route::from_observed(prepared.address().clone(), info.remote_addr);
+        let protocol = determine_protocol(args.candidate.address(), &connected);
+        let route = Route::from_observed(args.candidate.address().clone(), info.remote_addr);
         let connection = RealConnection::with_id_permit_and_coalescing(
             info.id,
             route,
             protocol,
-            Some(connection_permit),
+            Some(args.connection_permit),
             coalescing,
         );
         let _ = connection.try_acquire();
@@ -398,7 +508,7 @@ impl TransportService {
                     }
                 };
                 self.exchange_finder.pool().insert(connection.clone());
-                if let Err(error) = self.spawn_http1_task(connection.clone(), task, span) {
+                if let Err(error) = self.spawn_http1_task(connection.clone(), task, span.clone()) {
                     self.bindings.remove(connection.id());
                     let _ = self.exchange_finder.pool().remove(connection.id());
                     self.connection_availability.notify();
@@ -429,7 +539,7 @@ impl TransportService {
                     }
                 };
                 self.exchange_finder.pool().insert(connection.clone());
-                if let Err(error) = self.spawn_http2_task(connection.clone(), task, span) {
+                if let Err(error) = self.spawn_http2_task(connection.clone(), task, span.clone()) {
                     self.bindings.remove(connection.id());
                     let _ = self.exchange_finder.pool().remove(connection.id());
                     self.connection_availability.notify();
@@ -440,35 +550,42 @@ impl TransportService {
             }
         };
 
-        Ok(SelectedConnection::new(
+        Ok(SelectedConnection::new(SelectedConnectionInit {
+            address: args.candidate.address().clone(),
+            selected_proxy: args.candidate.selected_proxy().cloned(),
             connection,
             binding,
-            false,
-            self.exchange_finder.clone(),
-            self.bindings.clone(),
-            self.connection_availability.clone(),
-        ))
+            request_permit: args.request_permit,
+            reused: false,
+            exchange_finder: self.exchange_finder.clone(),
+            bindings: self.bindings.clone(),
+            availability: self.connection_availability.clone(),
+        }))
     }
 
     fn try_acquire_coalesced(
         &self,
-        address: &Address,
+        candidate: &ResolvedAddress,
         route_plan: &RoutePlan,
+        request_permit: &mut Option<crate::connection::RequestAdmissionPermit>,
     ) -> Option<SelectedConnection> {
         let connection = self
             .exchange_finder
             .pool()
-            .acquire_coalesced(address, route_plan)?;
+            .acquire_coalesced(candidate.address(), route_plan)?;
         match self.bindings.acquire(connection.id()) {
             BindingAcquireResult::Acquired(binding) => {
-                return Some(SelectedConnection::new(
+                return Some(SelectedConnection::new(SelectedConnectionInit {
+                    address: candidate.address().clone(),
+                    selected_proxy: candidate.selected_proxy().cloned(),
                     connection,
                     binding,
-                    true,
-                    self.exchange_finder.clone(),
-                    self.bindings.clone(),
-                    self.connection_availability.clone(),
-                ));
+                    request_permit: request_permit.take().expect("request permit"),
+                    reused: true,
+                    exchange_finder: self.exchange_finder.clone(),
+                    bindings: self.bindings.clone(),
+                    availability: self.connection_availability.clone(),
+                }));
             }
             BindingAcquireResult::Busy => {
                 let _ = self.exchange_finder.release(&connection);
@@ -627,10 +744,24 @@ async fn send_bound_request(
     selected: SelectedConnection,
     ctx: CallContext,
     tasks: ConnectionTaskRegistry,
-) -> Result<BoundResponse, WireError> {
-    let (connection, binding, reused, exchange_finder, bindings, availability) =
-        selected.into_send_parts()?;
-    let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
+) -> Result<(BoundResponse, crate::connection::RequestAdmissionPermit), WireError> {
+    let (
+        _address,
+        selected_proxy,
+        connection,
+        binding,
+        request_permit,
+        reused,
+        exchange_finder,
+        bindings,
+        availability,
+    ) = selected.into_send_parts()?;
+    let request = prepare_request_for_send(
+        request,
+        selected_proxy.as_ref(),
+        connection.protocol(),
+        connection.route().kind(),
+    )?;
 
     match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
@@ -645,17 +776,23 @@ async fn send_bound_request(
             })?;
             let reusable = http1_exchange_allows_reuse(request_requests_close, &response);
             response.extensions_mut().insert(info);
-            Ok(BoundResponse {
-                response,
-                release: ResponseLease::http1(
-                    connection,
-                    bindings,
-                    sender,
-                    reusable,
-                    ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
-                ),
-                reused,
-            })
+            if let Some(selected_proxy) = selected_proxy {
+                response.extensions_mut().insert(selected_proxy);
+            }
+            Ok((
+                BoundResponse {
+                    response,
+                    release: ResponseLease::http1(
+                        connection,
+                        bindings,
+                        sender,
+                        reusable,
+                        ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
+                    ),
+                    reused,
+                },
+                request_permit,
+            ))
         }
         AcquiredBinding::Http2 { info, mut sender } => {
             sender.ready().await.map_err(|error| {
@@ -667,16 +804,32 @@ async fn send_bound_request(
                 map_hyper_error(error)
             })?;
             response.extensions_mut().insert(info);
-            Ok(BoundResponse {
-                response,
-                release: ResponseLease::http2(
-                    connection,
-                    ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
-                ),
-                reused,
-            })
+            if let Some(selected_proxy) = selected_proxy {
+                response.extensions_mut().insert(selected_proxy);
+            }
+            Ok((
+                BoundResponse {
+                    response,
+                    release: ResponseLease::http2(
+                        connection,
+                        ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
+                    ),
+                    reused,
+                },
+                request_permit,
+            ))
         }
     }
+}
+
+pub(super) fn prepare_request_for_send(
+    mut request: Request<RequestBody>,
+    selected_proxy: Option<&SelectedProxy>,
+    protocol: ConnectionProtocol,
+    route_kind: &crate::connection::RouteKind,
+) -> Result<Request<RequestBody>, WireError> {
+    clear_proxy_authorization_if_proxy_changed(&mut request, selected_proxy);
+    prepare_bound_request(request, protocol, route_kind)
 }
 
 fn cleanup_failed_request(

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use http::Uri;
 use url::Url;
 
 use crate::WireError;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proxy {
     target: Url,
     intercept: ProxyIntercept,
@@ -14,20 +15,50 @@ pub struct Proxy {
     credentials: Option<ProxyCredentials>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ProxyRuleId(usize);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProxySelection {
-    pub(crate) id: ProxyRuleId,
+/// Resolves the proxy configuration to use for a request URI.
+pub trait ProxySelector: Send + Sync + 'static {
+    fn select(&self, uri: &Uri) -> Result<ProxySelection, WireError>;
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProxySelector {
-    proxies: Arc<[Proxy]>,
+impl<T> ProxySelector for Arc<T>
+where
+    T: ProxySelector + ?Sized,
+{
+    fn select(&self, uri: &Uri) -> Result<ProxySelection, WireError> {
+        (**self).select(uri)
+    }
 }
 
+pub(crate) type SharedProxySelector = Arc<dyn ProxySelector>;
+
+/// Built-in proxy selector that applies explicit proxy rules first and can
+/// optionally fall back to standard environment variables.
 #[derive(Clone, Debug, Default)]
+pub struct ProxyRules {
+    proxies: Vec<Proxy>,
+    use_system_proxy: bool,
+}
+
+/// An ordered set of proxy candidates for a request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProxySelection {
+    choices: Vec<ProxyChoice>,
+}
+
+/// One proxy candidate in a selection. `Direct` means connect without a proxy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxyChoice {
+    Direct,
+    Proxy(Box<Proxy>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedProxy {
+    target: Url,
+    credentials: Option<ProxyCredentials>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NoProxy {
     matches_all: bool,
     exact_hosts: Vec<String>,
@@ -118,12 +149,67 @@ impl Proxy {
         )
     }
 
-    pub(crate) fn intercepts_http(&self) -> bool {
-        matches!(self.intercept, ProxyIntercept::Http | ProxyIntercept::All)
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> &Url {
+        &self.target
     }
 
-    pub(crate) fn intercepts_https(&self) -> bool {
-        matches!(self.intercept, ProxyIntercept::Https | ProxyIntercept::All)
+    #[cfg(test)]
+    pub(crate) fn credentials(&self) -> Option<&ProxyCredentials> {
+        self.credentials.as_ref()
+    }
+
+    pub(crate) fn selected_proxy(&self) -> SelectedProxy {
+        SelectedProxy {
+            target: self.target.clone(),
+            credentials: self.credentials.clone(),
+        }
+    }
+}
+
+impl ProxyRules {
+    /// Creates an empty selector that always connects directly unless proxy
+    /// rules or system proxy lookup are added.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a proxy rule to this selector. The first matching rule wins.
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxies.push(proxy);
+        self
+    }
+
+    /// Opts into reading proxy rules from standard environment variables when
+    /// no explicit rule matches.
+    pub fn use_system_proxy(mut self, enabled: bool) -> Self {
+        self.use_system_proxy = enabled;
+        self
+    }
+}
+
+impl ProxySelector for ProxyRules {
+    fn select(&self, uri: &Uri) -> Result<ProxySelection, WireError> {
+        let explicit = matching_proxies(&self.proxies, uri);
+        if !explicit.is_empty() {
+            return Ok(ProxySelection::from_proxies(explicit));
+        }
+
+        if self.use_system_proxy {
+            let system_proxies = system_proxies_from_env()?;
+            let system_matches = matching_proxies(&system_proxies, uri);
+            if !system_matches.is_empty() {
+                return Ok(ProxySelection::from_proxies(system_matches));
+            }
+        }
+
+        Ok(ProxySelection::direct())
+    }
+}
+
+impl SelectedProxy {
+    pub(crate) fn from_proxy(proxy: &Proxy) -> Self {
+        proxy.selected_proxy()
     }
 
     pub(crate) fn target(&self) -> &Url {
@@ -132,6 +218,47 @@ impl Proxy {
 
     pub(crate) fn credentials(&self) -> Option<&ProxyCredentials> {
         self.credentials.as_ref()
+    }
+}
+
+impl ProxySelection {
+    /// Creates an empty selection. Empty selections are treated as direct.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a selection that connects directly.
+    pub fn direct() -> Self {
+        Self::new().push_direct()
+    }
+
+    /// Appends a direct-connection candidate.
+    pub fn push_direct(mut self) -> Self {
+        self.choices.push(ProxyChoice::Direct);
+        self
+    }
+
+    /// Appends a proxied candidate.
+    pub fn push_proxy(mut self, proxy: Proxy) -> Self {
+        self.choices.push(ProxyChoice::Proxy(Box::new(proxy)));
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.choices.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ProxyChoice> {
+        self.choices.iter()
+    }
+
+    fn from_proxies(proxies: Vec<Proxy>) -> Self {
+        Self {
+            choices: proxies
+                .into_iter()
+                .map(|proxy| ProxyChoice::Proxy(Box::new(proxy)))
+                .collect(),
+        }
     }
 }
 
@@ -169,37 +296,6 @@ impl ProxyCredentials {
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", self.username, self.password));
         format!("Basic {encoded}")
-    }
-}
-
-impl ProxySelector {
-    pub(crate) fn new(proxies: Vec<Proxy>) -> Self {
-        Self {
-            proxies: Arc::<[Proxy]>::from(proxies),
-        }
-    }
-
-    pub(crate) fn first_match(&self, uri: &http::Uri) -> Option<(&Proxy, ProxySelection)> {
-        self.proxies
-            .iter()
-            .enumerate()
-            .find(|(_, proxy)| proxy.matches(uri))
-            .map(|(index, proxy)| {
-                (
-                    proxy,
-                    ProxySelection {
-                        id: ProxyRuleId(index),
-                    },
-                )
-            })
-    }
-
-    pub(crate) fn select(&self, uri: &http::Uri) -> Option<&Proxy> {
-        self.first_match(uri).map(|(proxy, _selection)| proxy)
-    }
-
-    pub(crate) fn selection_for(&self, uri: &http::Uri) -> Option<ProxySelection> {
-        self.first_match(uri).map(|(_proxy, selection)| selection)
     }
 }
 
@@ -263,6 +359,34 @@ impl NoProxy {
 
 fn parse_http_proxy_target(target: &str) -> Result<Url, WireError> {
     parse_proxy_target(target, &["http"], "only http proxy endpoints are supported")
+}
+
+pub(crate) fn resolved_proxy_candidates(selection: ProxySelection) -> Vec<Option<SelectedProxy>> {
+    let mut candidates = Vec::new();
+
+    for choice in selection.iter() {
+        let candidate = match choice {
+            ProxyChoice::Direct => None,
+            ProxyChoice::Proxy(proxy) => Some(SelectedProxy::from_proxy(proxy.as_ref())),
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    if candidates.is_empty() {
+        candidates.push(None);
+    }
+
+    candidates
+}
+
+fn matching_proxies(proxies: &[Proxy], uri: &Uri) -> Vec<Proxy> {
+    proxies
+        .iter()
+        .filter(|proxy| proxy.matches(uri))
+        .cloned()
+        .collect()
 }
 
 fn parse_socks5_proxy_target(target: &str) -> Result<Url, WireError> {
@@ -489,7 +613,11 @@ fn normalize_domain_suffix(suffix: &str) -> String {
 mod tests {
     use http::Request;
 
-    use super::{parse_no_proxy, system_proxies_from_iter, Proxy, ProxyIntercept, ProxySelector};
+    use super::{
+        parse_no_proxy, system_proxies_from_iter, Proxy, ProxyChoice, ProxyIntercept, ProxyRules,
+        ProxySelection, SelectedProxy,
+    };
+    use crate::proxy::ProxySelector;
 
     #[test]
     fn system_proxy_parser_uses_stable_variable_precedence() {
@@ -575,12 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn proxy_selector_prefers_first_matching_rule_and_honors_no_proxy() {
+    fn proxy_rules_prefer_first_matching_rule_and_honor_no_proxy() {
         let primary = Proxy::all("http://first.test:8080")
             .expect("first proxy")
             .no_proxy(parse_no_proxy("api.example.com").expect("no_proxy"));
         let fallback = Proxy::all("http://second.test:8080").expect("fallback proxy");
-        let selector = ProxySelector::new(vec![primary, fallback]);
+        let selector = ProxyRules::new().proxy(primary).proxy(fallback);
 
         let direct_uri = Request::builder()
             .uri("http://service.example.com/resource")
@@ -591,8 +719,15 @@ mod tests {
         assert_eq!(
             selector
                 .select(&direct_uri)
-                .map(|proxy| proxy.target().host_str()),
-            Some(Some("first.test"))
+                .expect("proxy selection")
+                .iter()
+                .map(|choice| match choice {
+                    ProxyChoice::Direct => "direct".to_owned(),
+                    ProxyChoice::Proxy(proxy) =>
+                        proxy.target().host_str().expect("proxy host").to_owned(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["first.test".to_owned(), "second.test".to_owned()]
         );
 
         let bypassed_uri = Request::builder()
@@ -604,20 +739,33 @@ mod tests {
         assert_eq!(
             selector
                 .select(&bypassed_uri)
-                .map(|proxy| proxy.target().host_str()),
-            Some(Some("second.test"))
+                .expect("proxy selection")
+                .iter()
+                .map(|choice| match choice {
+                    ProxyChoice::Direct => "direct".to_owned(),
+                    ProxyChoice::Proxy(proxy) =>
+                        proxy.target().host_str().expect("proxy host").to_owned(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["second.test".to_owned()]
         );
+    }
+
+    #[test]
+    fn empty_proxy_selection_defaults_to_direct_candidate() {
+        assert!(ProxySelection::new().is_empty());
         assert_eq!(
-            selector.selection_for(&direct_uri),
-            Some(super::ProxySelection {
-                id: super::ProxyRuleId(0),
-            })
+            super::resolved_proxy_candidates(ProxySelection::new()),
+            vec![None]
         );
+    }
+
+    #[test]
+    fn resolved_proxy_candidates_preserve_current_selection_order() {
+        let proxy = Proxy::http("http://proxy.test:8080").expect("proxy");
         assert_eq!(
-            selector.selection_for(&bypassed_uri),
-            Some(super::ProxySelection {
-                id: super::ProxyRuleId(1),
-            })
+            super::resolved_proxy_candidates(ProxySelection::direct().push_proxy(proxy.clone())),
+            vec![None, Some(SelectedProxy::from_proxy(&proxy))]
         );
     }
 }

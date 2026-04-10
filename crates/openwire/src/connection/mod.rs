@@ -8,7 +8,8 @@ mod pool;
 mod real_connection;
 
 pub(crate) use exchange_finder::{
-    CachedAddress, ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
+    CachedAddresses, ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
+    ResolvedAddress,
 };
 pub(crate) use fast_fallback::{
     DirectDialDeps, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,

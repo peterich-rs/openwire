@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::task::noop_waker_ref;
-use http::header::{HeaderValue, CONNECTION};
+use http::header::{HeaderValue, CONNECTION, PROXY_AUTHORIZATION};
 use http::{HeaderMap, Method, Request};
 use hyper::rt::{Read, ReadBuf, Write};
 use hyper::Uri;
@@ -37,14 +37,15 @@ use super::connect::{
     ConnectBudget, ConnectTunnelParams, PrefetchedTunnelBytes,
 };
 use super::protocol::connection_header_requests_close;
+use super::service::prepare_request_for_send;
 use crate::auth::SharedAuthenticator;
 use crate::connection::ConnectionPool;
 use crate::connection::{
     Address, AuthorityKey, ConnectionAvailability, ConnectionProtocol, DnsPolicy,
-    FastFallbackOutcome, PoolSettings, ProtocolPolicy, RealConnection, Route, RoutePlan,
+    FastFallbackOutcome, PoolSettings, ProtocolPolicy, RealConnection, Route, RouteKind, RoutePlan,
     RoutePlanner, UriScheme,
 };
-use crate::proxy::ProxySelector;
+use crate::proxy::{Proxy, ProxyRules, SelectedProxy};
 
 #[derive(Clone, Debug)]
 struct CapturedSpan {
@@ -224,6 +225,62 @@ fn connection_header_close_conservatively_rejects_malformed_members() {
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive;timeout=5"));
 
     assert!(connection_header_requests_close(&headers));
+}
+
+#[test]
+fn prepare_request_for_send_clears_proxy_authorization_when_selected_proxy_changes() {
+    let proxy = Proxy::http("http://proxy.test:8080").expect("proxy");
+    let mut request = Request::builder()
+        .uri("http://example.com/resource")
+        .header(PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")
+        .body(RequestBody::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(SelectedProxy::from_proxy(&proxy));
+
+    let request = prepare_request_for_send(
+        request,
+        None,
+        ConnectionProtocol::Http1,
+        &RouteKind::Direct {
+            target: ([127, 0, 0, 1], 80).into(),
+        },
+    )
+    .expect("prepared request");
+
+    assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
+}
+
+#[test]
+fn prepare_request_for_send_preserves_proxy_authorization_for_same_selected_proxy() {
+    let proxy = Proxy::http("http://proxy.test:8080").expect("proxy");
+    let selected_proxy = SelectedProxy::from_proxy(&proxy);
+    let mut request = Request::builder()
+        .uri("http://example.com/resource")
+        .header(PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")
+        .body(RequestBody::empty())
+        .expect("request");
+    request.extensions_mut().insert(selected_proxy.clone());
+
+    let request = prepare_request_for_send(
+        request,
+        Some(&selected_proxy),
+        ConnectionProtocol::Http1,
+        &RouteKind::HttpForwardProxy {
+            proxy: ([127, 0, 0, 1], 8080).into(),
+            credentials: None,
+        },
+    )
+    .expect("prepared request");
+
+    assert_eq!(
+        request
+            .headers()
+            .get(PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic cHJveHk6c2VjcmV0")
+    );
 }
 
 fn make_address() -> Address {
@@ -705,7 +762,7 @@ fn abandoned_http2_lease_does_not_poison_the_session() {
     assert!(connection.try_acquire());
     let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
         Arc::new(ConnectionPool::new(PoolSettings::default())),
-        ProxySelector::new(Vec::new()),
+        Arc::new(ProxyRules::new()),
     ));
     abandon_response_lease(Some(ResponseLease::http2(
         connection.clone(),
@@ -734,7 +791,7 @@ fn discarded_http2_lease_marks_connection_unhealthy() {
     assert!(connection.try_acquire());
     let exchange_finder = Arc::new(crate::connection::ExchangeFinder::new(
         Arc::new(ConnectionPool::new(PoolSettings::default())),
-        ProxySelector::new(Vec::new()),
+        Arc::new(ProxyRules::new()),
     ));
     ResponseLease::http2(
         connection.clone(),

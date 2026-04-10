@@ -6,7 +6,7 @@ use std::time::Duration;
 use hyper::Uri;
 use openwire_core::WireError;
 
-use crate::proxy::{Proxy, ProxyCredentials};
+use crate::proxy::{ProxyCredentials, SelectedProxy};
 
 const DEFAULT_FAST_FALLBACK_STAGGER: Duration = Duration::from_millis(250);
 
@@ -166,7 +166,7 @@ impl Address {
         }
     }
 
-    pub fn from_uri(uri: &Uri, proxy: Option<&Proxy>) -> Result<Self, WireError> {
+    pub(crate) fn from_uri(uri: &Uri, proxy: Option<&SelectedProxy>) -> Result<Self, WireError> {
         let scheme = match uri.scheme_str() {
             Some(scheme) if scheme.eq_ignore_ascii_case("https") => UriScheme::Https,
             Some(scheme) if scheme.eq_ignore_ascii_case("http") => UriScheme::Http,
@@ -228,7 +228,7 @@ impl Address {
 }
 
 impl ProxyConfig {
-    fn from_runtime_proxy(scheme: UriScheme, proxy: &Proxy) -> Result<Self, WireError> {
+    fn from_runtime_proxy(scheme: UriScheme, proxy: &SelectedProxy) -> Result<Self, WireError> {
         let endpoint_scheme = match proxy.target().scheme() {
             "http" => ProxyScheme::Http,
             "socks5" => ProxyScheme::Socks5,
@@ -254,19 +254,10 @@ impl ProxyConfig {
         };
 
         let mode = match (endpoint_scheme, scheme) {
-            (ProxyScheme::Http, UriScheme::Http) if proxy.intercepts_http() => ProxyMode::Forward,
-            (ProxyScheme::Http, UriScheme::Https) if proxy.intercepts_https() => ProxyMode::Connect,
-            (ProxyScheme::Socks5, UriScheme::Http) if proxy.intercepts_http() => {
-                ProxyMode::SocksTunnel
-            }
-            (ProxyScheme::Socks5, UriScheme::Https) if proxy.intercepts_https() => {
-                ProxyMode::SocksTunnel
-            }
-            _ => {
-                return Err(WireError::invalid_request(
-                    "proxy does not apply to the request scheme",
-                ));
-            }
+            (ProxyScheme::Http, UriScheme::Http) => ProxyMode::Forward,
+            (ProxyScheme::Http, UriScheme::Https) => ProxyMode::Connect,
+            (ProxyScheme::Socks5, UriScheme::Http) => ProxyMode::SocksTunnel,
+            (ProxyScheme::Socks5, UriScheme::Https) => ProxyMode::SocksTunnel,
         };
 
         Ok(Self::new(mode, endpoint))
@@ -919,7 +910,7 @@ mod tests {
             Proxy::socks5("socks5://alice:secret@proxy.internal:1080").expect("proxy config");
         let address = Address::from_uri(
             &"http://example.com/".parse::<Uri>().expect("uri"),
-            Some(&proxy),
+            Some(&crate::proxy::SelectedProxy::from_proxy(&proxy)),
         )
         .expect("address");
         let route = super::Route::socks_proxy(address, socket_v4(50));

@@ -1,8 +1,7 @@
 use std::task::{Context, Poll};
 
 use http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, PROXY_AUTHORIZATION,
-    SET_COOKIE,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
@@ -17,8 +16,9 @@ use crate::auth::{
     build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
 use crate::client::{CallOptions, EffectiveRequestConfig};
+use crate::connection::CachedAddresses;
 use crate::cookie::SharedCookieJar;
-use crate::proxy::ProxySelector;
+use crate::proxy::SelectedProxy;
 use crate::trace::PolicyTraceContext;
 
 #[derive(Clone)]
@@ -40,20 +40,11 @@ pub(crate) struct AuthPolicyConfig {
 pub(crate) struct FollowUpPolicyService {
     network: BoxWireService,
     config: PolicyConfig,
-    proxy_selector: ProxySelector,
 }
 
 impl FollowUpPolicyService {
-    pub(crate) fn new(
-        network: BoxWireService,
-        config: PolicyConfig,
-        proxy_selector: ProxySelector,
-    ) -> Self {
-        Self {
-            network,
-            config,
-            proxy_selector,
-        }
+    pub(crate) fn new(network: BoxWireService, config: PolicyConfig) -> Self {
+        Self { network, config }
     }
 }
 
@@ -69,7 +60,6 @@ impl Service<Exchange> for FollowUpPolicyService {
     fn call(&mut self, exchange: Exchange) -> Self::Future {
         let replacement = self.network.clone();
         let mut network = std::mem::replace(&mut self.network, replacement);
-        let proxy_selector = self.proxy_selector.clone();
         let mut config = self.config.clone();
         Box::pin(async move {
             let (mut request, ctx, mut attempt) = exchange.into_parts();
@@ -116,6 +106,7 @@ impl Service<Exchange> for FollowUpPolicyService {
 
                 match result {
                     Ok(response) => {
+                        let selected_proxy = response.extensions().get::<SelectedProxy>().cloned();
                         store_response_cookies(
                             &response,
                             &snapshot.uri,
@@ -125,10 +116,13 @@ impl Service<Exchange> for FollowUpPolicyService {
                         if let Some((next_request, next_auth_count)) = authenticate_response(
                             &snapshot,
                             &response,
-                            attempt,
-                            retries,
-                            redirects,
-                            auths,
+                            AuthAttemptState {
+                                total_attempt: attempt,
+                                retry_count: retries,
+                                redirect_count: redirects,
+                                auth_count: auths,
+                            },
+                            selected_proxy.clone(),
                             &config.auth,
                         )
                         .await?
@@ -209,7 +203,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                             response.status(),
                             next_uri,
                             policy_trace,
-                            &proxy_selector,
+                            selected_proxy,
                         )?;
                         redirects += 1;
                         attempt = next_attempt;
@@ -297,10 +291,8 @@ fn apply_request_cookies(
 async fn authenticate_response(
     snapshot: &RequestSnapshot,
     response: &Response<ResponseBody>,
-    attempt: u32,
-    retries: u32,
-    redirects: u32,
-    auths: u32,
+    attempts: AuthAttemptState,
+    selected_proxy: Option<SelectedProxy>,
     config: &AuthPolicyConfig,
 ) -> Result<Option<(Request<RequestBody>, u32)>, WireError> {
     let (kind, authenticator): (AuthKind, Option<&SharedAuthenticator>) = match response.status() {
@@ -315,7 +307,7 @@ async fn authenticate_response(
         return Ok(None);
     };
 
-    if auths as usize >= config.max_auth_attempts || !snapshot.is_replayable() {
+    if attempts.auth_count as usize >= config.max_auth_attempts || !snapshot.is_replayable() {
         return Ok(None);
     }
 
@@ -330,12 +322,7 @@ async fn authenticate_response(
             snapshot.body.as_ref().and_then(RequestBody::try_clone),
         ),
         AuthResponseState::new(response.status(), response.headers().clone()),
-        AuthAttemptState {
-            total_attempt: attempt,
-            retry_count: retries,
-            redirect_count: redirects,
-            auth_count: auths,
-        },
+        attempts,
     );
 
     if let Some(mut request) = authenticator
@@ -343,10 +330,11 @@ async fn authenticate_response(
         .await
         .map_err(|error| error.with_response_status(response.status()))?
     {
-        let next_auth_count = auths + 1;
+        reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
+        let next_auth_count = attempts.auth_count + 1;
         request.extensions_mut().insert(PolicyTraceContext {
-            retry_count: retries,
-            redirect_count: redirects,
+            retry_count: attempts.retry_count,
+            redirect_count: attempts.redirect_count,
             auth_count: next_auth_count,
         });
         return Ok(Some((request, next_auth_count)));
@@ -427,6 +415,8 @@ impl RequestSnapshot {
             .body(body)?;
         *request.headers_mut() = self.headers.clone();
         *request.extensions_mut() = self.extensions.clone();
+        let sticky_proxy = request.extensions().get::<SelectedProxy>().cloned();
+        reset_network_attempt_extensions(request.extensions_mut(), sticky_proxy);
         request.extensions_mut().insert(policy_trace);
         Ok(request)
     }
@@ -436,11 +426,9 @@ impl RequestSnapshot {
         status: StatusCode,
         next_uri: Uri,
         policy_trace: PolicyTraceContext,
-        proxy_selector: &ProxySelector,
+        selected_proxy: Option<SelectedProxy>,
     ) -> Result<Request<RequestBody>, WireError> {
         let same_origin = same_origin(&self.uri, &next_uri)?;
-        let same_proxy =
-            proxy_selector.selection_for(&self.uri) == proxy_selector.selection_for(&next_uri);
         let should_switch_to_get = matches!(
             status,
             StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
@@ -476,9 +464,6 @@ impl RequestSnapshot {
             headers.remove(AUTHORIZATION);
             headers.remove(COOKIE);
         }
-        if !same_proxy {
-            headers.remove(PROXY_AUTHORIZATION);
-        }
         if should_switch_to_get {
             headers.remove(CONTENT_LENGTH);
             headers.remove(CONTENT_TYPE);
@@ -491,8 +476,20 @@ impl RequestSnapshot {
             .body(body)?;
         *request.headers_mut() = headers;
         *request.extensions_mut() = self.extensions;
+        reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
         request.extensions_mut().insert(policy_trace);
         Ok(request)
+    }
+}
+
+fn reset_network_attempt_extensions(
+    extensions: &mut http::Extensions,
+    selected_proxy: Option<SelectedProxy>,
+) {
+    let _ = extensions.remove::<CachedAddresses>();
+    let _ = extensions.remove::<SelectedProxy>();
+    if let Some(selected_proxy) = selected_proxy {
+        extensions.insert(selected_proxy);
     }
 }
 
@@ -603,7 +600,6 @@ mod tests {
         RequestSnapshot,
     };
     use crate::policy::{RedirectPolicyConfig, RetryPolicyConfig};
-    use crate::proxy::{NoProxy, Proxy, ProxySelector};
     use crate::RequestBody;
 
     fn snapshot_with_headers(uri: &str, headers: &[(&http::HeaderName, &str)]) -> RequestSnapshot {
@@ -639,7 +635,7 @@ mod tests {
                 StatusCode::FOUND,
                 "http://example.com:80/next".parse().expect("redirect uri"),
                 PolicyTraceContext::default(),
-                &ProxySelector::new(Vec::new()),
+                None,
             )
             .expect("redirect request");
 
@@ -661,7 +657,7 @@ mod tests {
                 StatusCode::FOUND,
                 "http://target.test/next".parse().expect("redirect uri"),
                 PolicyTraceContext::default(),
-                &ProxySelector::new(Vec::new()),
+                None,
             )
             .expect("redirect request");
 
@@ -669,20 +665,17 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_redirect_through_same_proxy_preserves_proxy_authorization() {
+    fn cross_origin_redirect_preserves_proxy_authorization_for_late_proxy_resolution() {
         let snapshot = snapshot_with_headers(
             "http://source.test/start",
             &[(&PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")],
         );
-        let proxy_selector =
-            ProxySelector::new(vec![Proxy::http("http://proxy.test:8080").expect("proxy")]);
-
         let request = snapshot
             .into_redirect_request(
                 StatusCode::FOUND,
                 "http://target.test/next".parse().expect("redirect uri"),
                 PolicyTraceContext::default(),
-                &proxy_selector,
+                None,
             )
             .expect("redirect request");
 
@@ -693,31 +686,6 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Basic cHJveHk6c2VjcmV0")
         );
-    }
-
-    #[test]
-    fn cross_origin_redirect_to_different_proxy_drops_proxy_authorization() {
-        let snapshot = snapshot_with_headers(
-            "http://source.test/start",
-            &[(&PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")],
-        );
-        let proxy_selector = ProxySelector::new(vec![
-            Proxy::http("http://first.test:8080")
-                .expect("first proxy")
-                .no_proxy(NoProxy::new().domain("target.test")),
-            Proxy::http("http://second.test:8080").expect("second proxy"),
-        ]);
-
-        let request = snapshot
-            .into_redirect_request(
-                StatusCode::FOUND,
-                "http://target.test/next".parse().expect("redirect uri"),
-                PolicyTraceContext::default(),
-                &proxy_selector,
-            )
-            .expect("redirect request");
-
-        assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
     }
 
     struct ReadinessTrackingService {
@@ -790,11 +758,7 @@ mod tests {
             was_polled: false,
             is_clone: false,
         });
-        let mut service = FollowUpPolicyService::new(
-            network,
-            default_policy_config(),
-            ProxySelector::new(Vec::new()),
-        );
+        let mut service = FollowUpPolicyService::new(network, default_policy_config());
 
         let response = service
             .ready()

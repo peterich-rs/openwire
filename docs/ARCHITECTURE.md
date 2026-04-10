@@ -122,6 +122,7 @@ These are the intended customization points:
 | `Authenticator` | origin and proxy authentication follow-ups |
 | `RetryPolicy` | retry decisions |
 | `RedirectPolicy` | redirect decisions |
+| `ProxySelector` | per-attempt ordered proxy candidate resolution |
 | `DnsResolver` | host resolution |
 | `TcpConnector` | TCP transport establishment |
 | `TlsConnector` | TLS handshake / stream wrapping |
@@ -132,6 +133,7 @@ These are the intended customization points:
 Default runtime stack from `ClientBuilder::default()`:
 
 - Tokio executor and timer
+- direct connection proxy policy via an empty `ProxyRules`
 - system DNS resolver
 - Tokio TCP connector
 - Rustls TLS connector when the `tls-rustls` feature is enabled
