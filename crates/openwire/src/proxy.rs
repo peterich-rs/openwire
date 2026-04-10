@@ -361,15 +361,8 @@ fn parse_http_proxy_target(target: &str) -> Result<Url, WireError> {
     parse_proxy_target(target, &["http"], "only http proxy endpoints are supported")
 }
 
-pub(crate) fn resolved_proxy_candidates(
-    selection: ProxySelection,
-    sticky: Option<SelectedProxy>,
-) -> Vec<Option<SelectedProxy>> {
+pub(crate) fn resolved_proxy_candidates(selection: ProxySelection) -> Vec<Option<SelectedProxy>> {
     let mut candidates = Vec::new();
-
-    if let Some(sticky) = sticky {
-        candidates.push(Some(sticky));
-    }
 
     for choice in selection.iter() {
         let candidate = match choice {
@@ -622,7 +615,7 @@ mod tests {
 
     use super::{
         parse_no_proxy, system_proxies_from_iter, Proxy, ProxyChoice, ProxyIntercept, ProxyRules,
-        ProxySelection,
+        ProxySelection, SelectedProxy,
     };
     use crate::proxy::ProxySelector;
 
@@ -762,8 +755,17 @@ mod tests {
     fn empty_proxy_selection_defaults_to_direct_candidate() {
         assert!(ProxySelection::new().is_empty());
         assert_eq!(
-            super::resolved_proxy_candidates(ProxySelection::new(), None),
+            super::resolved_proxy_candidates(ProxySelection::new()),
             vec![None]
+        );
+    }
+
+    #[test]
+    fn resolved_proxy_candidates_preserve_current_selection_order() {
+        let proxy = Proxy::http("http://proxy.test:8080").expect("proxy");
+        assert_eq!(
+            super::resolved_proxy_candidates(ProxySelection::direct().push_proxy(proxy.clone())),
+            vec![None, Some(SelectedProxy::from_proxy(&proxy))]
         );
     }
 }

@@ -790,15 +790,8 @@ pub(crate) fn cache_request_addresses(
     request: &mut Request<RequestBody>,
     proxy_selector: &dyn ProxySelector,
 ) -> Result<Arc<[ResolvedAddress]>, WireError> {
-    let previous_selected_proxy = request.extensions().get::<SelectedProxy>().cloned();
-    let candidates = resolved_proxy_candidates(
-        proxy_selector.select(request.uri())?,
-        previous_selected_proxy.clone(),
-    );
-    let next_selected_proxy = candidates.first().cloned().flatten();
-    if previous_selected_proxy.is_some() && previous_selected_proxy != next_selected_proxy {
-        request.headers_mut().remove(PROXY_AUTHORIZATION);
-    }
+    let candidates = resolved_proxy_candidates(proxy_selector.select(request.uri())?);
+    clear_proxy_authorization_if_proxy_dropped_from_candidates(request, &candidates);
 
     let mut addresses = Vec::new();
     for candidate in candidates {
@@ -817,6 +810,30 @@ pub(crate) fn cache_request_addresses(
     let extensions = request.extensions_mut();
     extensions.insert(CachedAddresses(addresses.clone()));
     Ok(addresses)
+}
+
+pub(crate) fn clear_proxy_authorization_if_proxy_changed(
+    request: &mut Request<RequestBody>,
+    selected_proxy: Option<&SelectedProxy>,
+) {
+    let previous_selected_proxy = request.extensions().get::<SelectedProxy>().cloned();
+    if previous_selected_proxy.is_some() && previous_selected_proxy.as_ref() != selected_proxy {
+        request.headers_mut().remove(PROXY_AUTHORIZATION);
+    }
+}
+
+fn clear_proxy_authorization_if_proxy_dropped_from_candidates(
+    request: &mut Request<RequestBody>,
+    candidates: &[Option<SelectedProxy>],
+) {
+    let previous_selected_proxy = request.extensions().get::<SelectedProxy>().cloned();
+    if previous_selected_proxy.is_some()
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.as_ref() == previous_selected_proxy.as_ref())
+    {
+        request.headers_mut().remove(PROXY_AUTHORIZATION);
+    }
 }
 
 async fn with_call_deadline<F>(
@@ -914,7 +931,16 @@ mod tests {
         ClientBuilder, ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
     };
     use crate::connection::CachedAddresses;
-    use crate::proxy::{Proxy, ProxyRules, SelectedProxy};
+    use crate::proxy::{Proxy, ProxyRules, ProxySelection, ProxySelector, SelectedProxy};
+
+    #[derive(Clone)]
+    struct StaticProxySelector(ProxySelection);
+
+    impl ProxySelector for StaticProxySelector {
+        fn select(&self, _uri: &http::Uri) -> Result<ProxySelection, WireError> {
+            Ok(self.0.clone())
+        }
+    }
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
     }
@@ -1053,9 +1079,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_request_addresses_preserve_sticky_proxy_authorization() {
-        let first_proxy = Proxy::http("http://first.test:8080").expect("first proxy");
-        let second_proxy = Proxy::http("http://second.test:8080").expect("second proxy");
+    fn cache_request_addresses_preserve_proxy_authorization_when_current_candidates_still_include_proxy(
+    ) {
+        let proxy = Proxy::http("http://first.test:8080").expect("proxy");
         let mut request = Request::builder()
             .uri("http://example.com/resource")
             .header(PROXY_AUTHORIZATION, "Basic cHJveHk6b2xk")
@@ -1063,11 +1089,13 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(SelectedProxy::from_proxy(&first_proxy));
+            .insert(SelectedProxy::from_proxy(&proxy));
 
-        let addresses =
-            cache_request_addresses(&mut request, &ProxyRules::new().proxy(second_proxy.clone()))
-                .expect("addresses");
+        let addresses = cache_request_addresses(
+            &mut request,
+            &StaticProxySelector(ProxySelection::direct().push_proxy(proxy.clone())),
+        )
+        .expect("addresses");
 
         assert_eq!(
             request
@@ -1080,7 +1108,38 @@ mod tests {
             addresses
                 .first()
                 .and_then(|candidate| candidate.selected_proxy()),
-            Some(&SelectedProxy::from_proxy(&first_proxy))
+            None
+        );
+        assert_eq!(
+            addresses
+                .iter()
+                .find_map(|candidate| candidate.selected_proxy()),
+            Some(&SelectedProxy::from_proxy(&proxy))
+        );
+    }
+
+    #[test]
+    fn cache_request_addresses_clear_proxy_authorization_when_current_candidates_drop_proxy() {
+        let proxy = Proxy::http("http://first.test:8080").expect("proxy");
+        let mut request = Request::builder()
+            .uri("http://example.com/resource")
+            .header(PROXY_AUTHORIZATION, "Basic cHJveHk6b2xk")
+            .body(RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(SelectedProxy::from_proxy(&proxy));
+
+        let addresses =
+            cache_request_addresses(&mut request, &StaticProxySelector(ProxySelection::direct()))
+                .expect("addresses");
+
+        assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
+        assert_eq!(
+            addresses
+                .first()
+                .and_then(|candidate| candidate.selected_proxy()),
+            None
         );
     }
 

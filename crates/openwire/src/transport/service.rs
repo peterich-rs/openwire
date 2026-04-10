@@ -13,7 +13,9 @@ use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
 use crate::client::EffectiveRequestConfig;
-use crate::client::{attach_request_admission, cache_request_addresses};
+use crate::client::{
+    attach_request_admission, cache_request_addresses, clear_proxy_authorization_if_proxy_changed,
+};
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
     ExchangeFinder, RealConnection, ResolvedAddress, Route, RoutePlan,
@@ -754,7 +756,12 @@ async fn send_bound_request(
         bindings,
         availability,
     ) = selected.into_send_parts()?;
-    let request = prepare_bound_request(request, connection.protocol(), connection.route().kind())?;
+    let request = prepare_request_for_send(
+        request,
+        selected_proxy.as_ref(),
+        connection.protocol(),
+        connection.route().kind(),
+    )?;
 
     match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
@@ -813,6 +820,16 @@ async fn send_bound_request(
             ))
         }
     }
+}
+
+pub(super) fn prepare_request_for_send(
+    mut request: Request<RequestBody>,
+    selected_proxy: Option<&SelectedProxy>,
+    protocol: ConnectionProtocol,
+    route_kind: &crate::connection::RouteKind,
+) -> Result<Request<RequestBody>, WireError> {
+    clear_proxy_authorization_if_proxy_changed(&mut request, selected_proxy);
+    prepare_bound_request(request, protocol, route_kind)
 }
 
 fn cleanup_failed_request(
