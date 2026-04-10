@@ -3308,15 +3308,15 @@ async fn success_events_follow_stable_order() {
             "connection_acquired ",
             "response_headers_start",
             "response_headers_end 200 OK",
-            "call_end 200 OK",
             "response_body_end 7",
             "connection_released ",
+            "call_end",
         ],
     );
 }
 
 #[tokio::test]
-async fn dropping_response_body_without_consuming_it_does_not_emit_response_body_end() {
+async fn dropping_response_body_without_consuming_it_ends_the_body_and_call() {
     let server = spawn_http1(|_request| async move { ok_text("abandoned") }).await;
     let events = RecordingEventListenerFactory::default();
     let client = Client::builder()
@@ -3331,12 +3331,9 @@ async fn dropping_response_body_without_consuming_it_does_not_emit_response_body
     drop(response);
 
     let events = events.events();
-    assert_event_subsequence(&events, &["call_end 200 OK", "connection_released "]);
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.starts_with("response_body_end ")),
-        "events = {events:?}",
+    assert_event_subsequence(
+        &events,
+        &["response_body_end 0", "connection_released ", "call_end"],
     );
     assert!(
         !events
@@ -3347,7 +3344,7 @@ async fn dropping_response_body_without_consuming_it_does_not_emit_response_body
 }
 
 #[tokio::test]
-async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
+async fn response_body_failures_emit_call_failed_but_not_response_body_end() {
     let _trace_test_guard = trace_test_lock().lock().await;
     let server = spawn_raw_http1_response(
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc".to_vec(),
@@ -3387,19 +3384,15 @@ async fn response_body_failures_do_not_emit_response_body_end_or_call_failed() {
         &[
             "call_start GET",
             "response_headers_end 200 OK",
-            "call_end 200 OK",
             "response_body_failed protocol",
             "connection_released ",
+            "call_failed Protocol",
         ],
     );
     assert!(
         !events
             .iter()
             .any(|event| event.starts_with("response_body_end ")),
-        "events = {events:?}",
-    );
-    assert!(
-        !events.iter().any(|event| event.starts_with("call_failed ")),
         "events = {events:?}",
     );
 
@@ -3463,14 +3456,10 @@ async fn call_timeout_can_fail_during_body_read() {
         &[
             "call_start GET",
             "response_headers_end 200 OK",
-            "call_end 200 OK",
             "response_body_failed timeout",
             "connection_released ",
+            "call_failed Timeout",
         ],
-    );
-    assert!(
-        !events.iter().any(|event| event.starts_with("call_failed ")),
-        "events = {events:?}",
     );
     assert!(
         !events
@@ -3754,8 +3743,9 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
             "connection_released ",
             "connection_acquired ",
             "response_headers_end 200 OK",
-            "call_end 200 OK",
             "response_body_end 20",
+            "connection_released ",
+            "call_end",
         ],
     );
 

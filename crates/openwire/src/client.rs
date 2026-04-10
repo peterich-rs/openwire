@@ -613,10 +613,7 @@ impl Call {
                 with_call_deadline(self.client.inner.timer.clone(), ctx.deadline(), execute).await;
 
             match result {
-                Ok(response) => {
-                    ctx.listener().call_end(&ctx, &response);
-                    Ok(response)
-                }
+                Ok(response) => Ok(attach_call_lifecycle(response, ctx.clone())),
                 Err(error) => {
                     ctx.listener().call_failed(&ctx, &error);
                     Err(error)
@@ -643,6 +640,17 @@ pub(crate) fn attach_request_admission(
             }
             .boxed(),
         ),
+    )
+}
+
+fn attach_call_lifecycle(
+    response: Response<ResponseBody>,
+    ctx: CallContext,
+) -> Response<ResponseBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        ResponseBody::new(CallLifecycleBody::new(body, ctx).boxed()),
     )
 }
 
@@ -886,6 +894,99 @@ fn spawn_pool_reaper(
 
 fn pool_reaper_cadence(idle_timeout: Duration) -> Duration {
     (idle_timeout / 2).clamp(MIN_POOL_REAPER_CADENCE, MAX_POOL_REAPER_CADENCE)
+}
+
+struct CallLifecycleBody {
+    inner: Option<ResponseBody>,
+    ctx: CallContext,
+    finished: bool,
+}
+
+impl CallLifecycleBody {
+    fn new(inner: ResponseBody, ctx: CallContext) -> Self {
+        Self {
+            inner: Some(inner),
+            ctx,
+            finished: false,
+        }
+    }
+
+    fn finish_successfully(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let _ = self.inner.take();
+        self.ctx.listener().call_end(&self.ctx);
+    }
+
+    fn finish_with_error(&mut self, error: &WireError) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let _ = self.inner.take();
+        self.ctx.listener().call_failed(&self.ctx, error);
+    }
+
+    fn finish_abandoned(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        drop(self.inner.take());
+        self.ctx.listener().call_end(&self.ctx);
+    }
+}
+
+impl Drop for CallLifecycleBody {
+    fn drop(&mut self) {
+        self.finish_abandoned();
+    }
+}
+
+impl Body for CallLifecycleBody {
+    type Data = Bytes;
+    type Error = WireError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.finished {
+            return std::task::Poll::Ready(None);
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+
+        match std::pin::Pin::new(inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => std::task::Poll::Ready(Some(Ok(frame))),
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.finish_with_error(&error);
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.finish_successfully();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self.inner.as_ref() {
+            Some(inner) => inner.is_end_stream(),
+            None => true,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(SizeHint::default, http_body::Body::size_hint)
+    }
 }
 
 pin_project! {

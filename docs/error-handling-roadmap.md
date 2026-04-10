@@ -104,8 +104,8 @@ Current strengths:
 - HTTP status codes are not treated as transport exceptions
 - response-body failures surface during body consumption, not from
   `Client::execute`
-- event-listener hooks already separate `call_failed` from
-  `response_body_failed`
+- event-listener hooks expose both phase-local body failures and final
+  call-level termination
 - connect-stage retry behavior now uses phase-aware metadata in addition to
   establishment helpers
 - response-body timeout, generic pre-response call timeout, and connect timeout
@@ -274,7 +274,8 @@ These should remain body-consumption failures:
 - JSON decode failures
 
 Once a response object has been returned, the request execution contract should
-not report these through `call_failed`.
+not report these through `Client::execute`, even though event listeners may
+still observe `response_body_failed` followed by terminal `call_failed`.
 
 ### 5.5 Keep side-effect-only facilities best-effort by default
 
