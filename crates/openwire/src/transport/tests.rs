@@ -283,6 +283,40 @@ fn prepare_request_for_send_preserves_proxy_authorization_for_same_selected_prox
     );
 }
 
+#[test]
+fn prepare_request_for_send_preserves_proxy_authorization_for_same_proxy_endpoint() {
+    let previous_proxy = Proxy::http("http://proxy.test:8080").expect("previous proxy");
+    let current_proxy = Proxy::all("http://proxy.test:8080").expect("current proxy");
+    let selected_proxy = SelectedProxy::from_proxy(&current_proxy);
+    let mut request = Request::builder()
+        .uri("http://example.com/resource")
+        .header(PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")
+        .body(RequestBody::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(SelectedProxy::from_proxy(&previous_proxy));
+
+    let request = prepare_request_for_send(
+        request,
+        Some(&selected_proxy),
+        ConnectionProtocol::Http1,
+        &RouteKind::HttpForwardProxy {
+            proxy: ([127, 0, 0, 1], 8080).into(),
+            credentials: None,
+        },
+    )
+    .expect("prepared request");
+
+    assert_eq!(
+        request
+            .headers()
+            .get(PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic cHJveHk6c2VjcmV0")
+    );
+}
+
 fn make_address() -> Address {
     Address::new(
         UriScheme::Https,

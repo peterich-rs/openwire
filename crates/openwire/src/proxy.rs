@@ -55,6 +55,7 @@ pub enum ProxyChoice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedProxy {
     target: Url,
+    intercept: ProxyIntercept,
     credentials: Option<ProxyCredentials>,
 }
 
@@ -162,6 +163,7 @@ impl Proxy {
     pub(crate) fn selected_proxy(&self) -> SelectedProxy {
         SelectedProxy {
             target: self.target.clone(),
+            intercept: self.intercept,
             credentials: self.credentials.clone(),
         }
     }
@@ -218,6 +220,18 @@ impl SelectedProxy {
 
     pub(crate) fn credentials(&self) -> Option<&ProxyCredentials> {
         self.credentials.as_ref()
+    }
+
+    pub(crate) fn intercepts_http(&self) -> bool {
+        matches!(self.intercept, ProxyIntercept::Http | ProxyIntercept::All)
+    }
+
+    pub(crate) fn intercepts_https(&self) -> bool {
+        matches!(self.intercept, ProxyIntercept::Https | ProxyIntercept::All)
+    }
+
+    pub(crate) fn same_endpoint(&self, other: &SelectedProxy) -> bool {
+        self.target == other.target && self.credentials == other.credentials
     }
 }
 
@@ -361,7 +375,15 @@ fn parse_http_proxy_target(target: &str) -> Result<Url, WireError> {
     parse_proxy_target(target, &["http"], "only http proxy endpoints are supported")
 }
 
+#[cfg(test)]
 pub(crate) fn resolved_proxy_candidates(selection: ProxySelection) -> Vec<Option<SelectedProxy>> {
+    resolved_proxy_candidates_with_sticky(selection, None)
+}
+
+pub(crate) fn resolved_proxy_candidates_with_sticky(
+    selection: ProxySelection,
+    sticky_proxy: Option<&SelectedProxy>,
+) -> Vec<Option<SelectedProxy>> {
     let mut candidates = Vec::new();
 
     for choice in selection.iter() {
@@ -376,6 +398,19 @@ pub(crate) fn resolved_proxy_candidates(selection: ProxySelection) -> Vec<Option
 
     if candidates.is_empty() {
         candidates.push(None);
+    }
+
+    if let Some(sticky_index) = sticky_proxy.and_then(|sticky_proxy| {
+        candidates.iter().position(|candidate| {
+            candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.same_endpoint(sticky_proxy))
+        })
+    }) {
+        if sticky_index > 0 {
+            let sticky_candidate = candidates.remove(sticky_index);
+            candidates.insert(0, sticky_candidate);
+        }
     }
 
     candidates
@@ -614,8 +649,8 @@ mod tests {
     use http::Request;
 
     use super::{
-        parse_no_proxy, system_proxies_from_iter, Proxy, ProxyChoice, ProxyIntercept, ProxyRules,
-        ProxySelection, SelectedProxy,
+        parse_no_proxy, resolved_proxy_candidates_with_sticky, system_proxies_from_iter, Proxy,
+        ProxyChoice, ProxyIntercept, ProxyRules, ProxySelection, SelectedProxy,
     };
     use crate::proxy::ProxySelector;
 
@@ -766,6 +801,20 @@ mod tests {
         assert_eq!(
             super::resolved_proxy_candidates(ProxySelection::direct().push_proxy(proxy.clone())),
             vec![None, Some(SelectedProxy::from_proxy(&proxy))]
+        );
+    }
+
+    #[test]
+    fn resolved_proxy_candidates_prioritize_sticky_proxy_by_endpoint() {
+        let previous = Proxy::http("http://proxy.test:8080").expect("previous proxy");
+        let current = Proxy::https("http://proxy.test:8080").expect("current proxy");
+
+        assert_eq!(
+            resolved_proxy_candidates_with_sticky(
+                ProxySelection::direct().push_proxy(current.clone()),
+                Some(&SelectedProxy::from_proxy(&previous)),
+            ),
+            vec![Some(SelectedProxy::from_proxy(&current)), None]
         );
     }
 }
