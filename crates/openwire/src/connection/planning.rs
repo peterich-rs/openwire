@@ -254,10 +254,19 @@ impl ProxyConfig {
         };
 
         let mode = match (endpoint_scheme, scheme) {
-            (ProxyScheme::Http, UriScheme::Http) => ProxyMode::Forward,
-            (ProxyScheme::Http, UriScheme::Https) => ProxyMode::Connect,
-            (ProxyScheme::Socks5, UriScheme::Http) => ProxyMode::SocksTunnel,
-            (ProxyScheme::Socks5, UriScheme::Https) => ProxyMode::SocksTunnel,
+            (ProxyScheme::Http, UriScheme::Http) if proxy.intercepts_http() => ProxyMode::Forward,
+            (ProxyScheme::Http, UriScheme::Https) if proxy.intercepts_https() => ProxyMode::Connect,
+            (ProxyScheme::Socks5, UriScheme::Http) if proxy.intercepts_http() => {
+                ProxyMode::SocksTunnel
+            }
+            (ProxyScheme::Socks5, UriScheme::Https) if proxy.intercepts_https() => {
+                ProxyMode::SocksTunnel
+            }
+            _ => {
+                return Err(WireError::invalid_request(
+                    "proxy does not apply to the request scheme",
+                ));
+            }
         };
 
         Ok(Self::new(mode, endpoint))
@@ -924,6 +933,47 @@ mod tests {
         };
         assert_eq!(credentials.username(), "alice");
         assert_eq!(credentials.password(), "secret");
+    }
+
+    #[test]
+    fn http_only_proxy_is_rejected_for_https_requests() {
+        let proxy = Proxy::http("http://proxy.internal:8080").expect("proxy config");
+        let err = Address::from_uri(
+            &"https://example.com/".parse::<Uri>().expect("uri"),
+            Some(&crate::proxy::SelectedProxy::from_proxy(&proxy)),
+        )
+        .expect_err("https requests should reject http-only proxies");
+
+        assert_eq!(err.kind(), crate::WireErrorKind::InvalidRequest);
+        assert_eq!(err.message(), "proxy does not apply to the request scheme");
+    }
+
+    #[test]
+    fn https_only_proxy_is_rejected_for_http_requests() {
+        let proxy = Proxy::https("http://proxy.internal:8080").expect("proxy config");
+        let err = Address::from_uri(
+            &"http://example.com/".parse::<Uri>().expect("uri"),
+            Some(&crate::proxy::SelectedProxy::from_proxy(&proxy)),
+        )
+        .expect_err("http requests should reject https-only proxies");
+
+        assert_eq!(err.kind(), crate::WireErrorKind::InvalidRequest);
+        assert_eq!(err.message(), "proxy does not apply to the request scheme");
+    }
+
+    #[test]
+    fn all_proxy_supports_both_http_and_https_requests() {
+        let proxy = Proxy::all("http://proxy.internal:8080").expect("proxy config");
+        Address::from_uri(
+            &"http://example.com/".parse::<Uri>().expect("uri"),
+            Some(&crate::proxy::SelectedProxy::from_proxy(&proxy)),
+        )
+        .expect("http address");
+        Address::from_uri(
+            &"https://example.com/".parse::<Uri>().expect("uri"),
+            Some(&crate::proxy::SelectedProxy::from_proxy(&proxy)),
+        )
+        .expect("https address");
     }
 
     #[test]

@@ -4,7 +4,8 @@ use http::Request;
 use openwire_core::{ConnectionId, ConnectionInfo, RequestBody, WireError};
 
 use crate::proxy::{
-    ProxyChoice, ProxySelection, ProxySelector, SelectedProxy, SharedProxySelector,
+    resolved_proxy_candidates_with_sticky, ProxySelection, ProxySelector, SelectedProxy,
+    SharedProxySelector,
 };
 
 use super::{
@@ -131,7 +132,9 @@ impl ExchangeFinder {
         let addresses = if let Some(cached) = request.extensions().get::<CachedAddresses>() {
             cached.0.clone()
         } else {
-            Arc::<[ResolvedAddress]>::from(self.resolve_addresses(request.uri())?)
+            Arc::<[ResolvedAddress]>::from(
+                self.resolve_addresses(request.uri(), request.extensions().get::<SelectedProxy>())?,
+            )
         };
         let outcome = addresses
             .iter()
@@ -210,15 +213,16 @@ impl ExchangeFinder {
         self.proxy_selector.select(uri)
     }
 
-    fn resolve_addresses(&self, uri: &http::Uri) -> Result<Vec<ResolvedAddress>, WireError> {
-        let selection = self.proxy_selector.select(uri)?;
+    fn resolve_addresses(
+        &self,
+        uri: &http::Uri,
+        sticky_proxy: Option<&SelectedProxy>,
+    ) -> Result<Vec<ResolvedAddress>, WireError> {
+        let selection =
+            resolved_proxy_candidates_with_sticky(self.proxy_selector.select(uri)?, sticky_proxy);
         let mut addresses = Vec::new();
 
-        for choice in selection.iter() {
-            let selected_proxy = match choice {
-                ProxyChoice::Direct => None,
-                ProxyChoice::Proxy(proxy) => Some(SelectedProxy::from_proxy(proxy)),
-            };
+        for selected_proxy in selection {
             let resolved = ResolvedAddress::new(
                 Address::from_uri(uri, selected_proxy.as_ref())?,
                 selected_proxy,
