@@ -12,6 +12,7 @@ default = ["tls-rustls", "platform-verifier"]
 tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 json = ["openwire-core/json"]
+websocket = ["openwire-core/websocket", "dep:sha1"]
 
 [dependencies]
 base64.workspace = true
@@ -28,6 +29,7 @@ openwire-core = { path = "../openwire-core" }
 openwire-tokio = { path = "../openwire-tokio" }
 openwire-rustls = { path = "../openwire-rustls", optional = true, default-features = false }
 pin-project-lite.workspace = true
+sha1 = { workspace = true, optional = true }
 tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true

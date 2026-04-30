@@ -9,6 +9,9 @@ mod sync_util;
 mod trace;
 mod transport;
 
+#[cfg(feature = "websocket")]
+pub mod websocket;
+
 pub use client::{Call, CallOptions, Client, ClientBuilder};
 pub use connection::{
     Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
