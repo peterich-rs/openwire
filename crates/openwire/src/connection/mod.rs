@@ -25,7 +25,7 @@ pub use planning::{
 };
 pub(crate) use planning::{
     ConnectAttempt, ConnectAttemptState, ConnectFailure, ConnectFailureStage, ConnectPlan,
-    DnsResolution, RouteKind,
+    DnsResolution, RouteKind, RoutePreference,
 };
 pub(crate) use pool::{ConnectionPool, PoolSettings, PoolStats};
 pub(crate) use real_connection::{
