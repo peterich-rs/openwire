@@ -47,7 +47,7 @@ pub(crate) struct ConnectorStack {
 }
 
 #[derive(Clone)]
-pub(super) struct ProxyConnectDeps {
+pub(crate) struct ProxyConnectDeps {
     tcp_connector: Arc<dyn TcpConnector>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     proxy_authenticator: Option<SharedAuthenticator>,
@@ -158,7 +158,7 @@ where
 }
 
 impl ConnectorStack {
-    pub(super) async fn route_plan(
+    pub(crate) async fn route_plan(
         &self,
         ctx: CallContext,
         address: &Address,
@@ -171,7 +171,7 @@ impl ConnectorStack {
         self.route_planner.plan(address, resolved_addrs)
     }
 
-    pub(super) fn proxy_connect_deps(&self, connect_timeout: Option<Duration>) -> ProxyConnectDeps {
+    pub(crate) fn proxy_connect_deps(&self, connect_timeout: Option<Duration>) -> ProxyConnectDeps {
         ProxyConnectDeps {
             tcp_connector: self.tcp_connector.clone(),
             tls_connector: self.tls_connector.clone(),
@@ -184,7 +184,7 @@ impl ConnectorStack {
     }
 }
 
-pub(super) async fn connect_route_plan(
+pub(crate) async fn connect_route_plan(
     ctx: CallContext,
     uri: Uri,
     route_plan: RoutePlan,

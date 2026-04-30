@@ -99,6 +99,7 @@ pub struct WebSocket {
     pub(crate) sender: WebSocketSender,
     pub(crate) receiver: WebSocketReceiver,
     pub(crate) handshake: WebSocketHandshake,
+    pub(crate) _drop_guard: crate::websocket::writer::DropGuard,
 }
 
 impl WebSocket {

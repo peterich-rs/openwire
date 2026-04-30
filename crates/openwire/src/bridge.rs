@@ -23,7 +23,7 @@ impl Interceptor for BridgeInterceptor {
     }
 }
 
-fn normalize_request(request: &mut Request<RequestBody>) -> Result<(), WireError> {
+pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<(), WireError> {
     #[cfg(feature = "websocket")]
     {
         if request
