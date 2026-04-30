@@ -3,8 +3,8 @@ use http::{HeaderMap, HeaderValue, Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use openwire_core::{
-    BoxConnection, CoalescingInfo, Connected, ConnectionInfo, HyperExecutor, RequestBody,
-    SharedTimer, WireError,
+    BoxConnection, CoalescingInfo, Connected, Connection, ConnectionInfo, HyperExecutor,
+    RequestBody, SharedTimer, WireError,
 };
 
 use crate::connection::{Address, ConnectionProtocol, RouteKind, UriScheme};
@@ -46,6 +46,87 @@ pub(super) async fn bind_http2(
         .handshake(stream)
         .await
         .map_err(|error| WireError::protocol_binding("HTTP/2 client handshake failed", error))
+}
+
+#[cfg(feature = "websocket")]
+pub(crate) async fn bind_websocket_handshake(
+    io: BoxConnection,
+    request: Request<RequestBody>,
+) -> Result<(Response<()>, hyper::upgrade::Upgraded), WireError> {
+    let (mut send, conn) = http1::handshake(io)
+        .await
+        .map_err(|error| WireError::protocol_binding("HTTP/1.1 client handshake failed", error))?;
+
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+
+    let mut response = send
+        .send_request(request)
+        .await
+        .map_err(WireError::from)?;
+    let upgraded = hyper::upgrade::on(&mut response)
+        .await
+        .map_err(WireError::from)?;
+
+    let mut out = Response::new(());
+    *out.status_mut() = response.status();
+    *out.version_mut() = response.version();
+    *out.headers_mut() = response.headers().clone();
+    Ok((out, upgraded))
+}
+
+#[cfg(feature = "websocket")]
+pub(crate) fn upgraded_into_box_connection(upgraded: hyper::upgrade::Upgraded) -> BoxConnection {
+    Box::new(UpgradedConnection { inner: upgraded })
+}
+
+#[cfg(feature = "websocket")]
+struct UpgradedConnection {
+    inner: hyper::upgrade::Upgraded,
+}
+
+#[cfg(feature = "websocket")]
+impl Connection for UpgradedConnection {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl hyper::rt::Read for UpgradedConnection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl hyper::rt::Write for UpgradedConnection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 pub(super) fn determine_protocol(address: &Address, connected: &Connected) -> ConnectionProtocol {

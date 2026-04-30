@@ -1,7 +1,7 @@
 mod bindings;
 mod body;
 mod connect;
-mod protocol;
+pub(crate) mod protocol;
 mod service;
 
 pub(crate) use connect::ConnectorStack;
