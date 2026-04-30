@@ -12,7 +12,7 @@ default = ["tls-rustls", "platform-verifier"]
 tls-rustls = ["dep:openwire-rustls"]
 platform-verifier = ["tls-rustls", "openwire-rustls/platform-verifier"]
 json = ["openwire-core/json"]
-websocket = ["openwire-core/websocket", "dep:sha1"]
+websocket = ["openwire-core/websocket", "dep:sha1", "dep:getrandom"]
 
 [dependencies]
 base64.workspace = true
@@ -27,6 +27,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 openwire-core = { path = "../openwire-core" }
 openwire-tokio = { path = "../openwire-tokio" }
+getrandom = { workspace = true, optional = true }
 openwire-rustls = { path = "../openwire-rustls", optional = true, default-features = false }
 pin-project-lite.workspace = true
 sha1 = { workspace = true, optional = true }

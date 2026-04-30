@@ -1045,6 +1045,7 @@ dependencies = [
  "criterion",
  "futures-channel",
  "futures-util",
+ "getrandom 0.2.17",
  "http",
  "http-body",
  "http-body-util",
