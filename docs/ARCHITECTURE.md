@@ -138,6 +138,35 @@ Default runtime stack from `ClientBuilder::default()`:
 - Tokio TCP connector
 - Rustls TLS connector when the `tls-rustls` feature is enabled
 
+## 5a. WebSocket Upgrade Path (`feature = "websocket"`)
+
+`Client::new_websocket(request)` is the dedicated WebSocket entry point.
+It returns a `WebSocketCall` builder; `.execute()` performs the handshake
+and returns a `WebSocket` (sender + receiver halves).
+
+```mermaid
+flowchart TD
+    W[Client::new_websocket]
+    W --> WB[Bridge: inject Sec-WebSocket-* headers, force HTTP/1.1]
+    WB --> WC[ConnectorStack: route_plan + connect_route_plan]
+    WC --> WH[bind_websocket_handshake: HTTP/1.1 GET + hyper::upgrade]
+    WH --> WV[Validate 101 response]
+    WV --> WE[WebSocketEngine::upgrade]
+    WE --> WS[spawn_session: writer + reader + heartbeat]
+    WS --> WSOK[WebSocket: Sender + Receiver]
+```
+
+The WebSocket flow follows `bridge → ConnectorStack → bind_websocket_handshake`,
+diverging from the HTTP path at the binding step (it uses
+`http1::handshake(io).with_upgrades()` and `hyper::upgrade::on` instead
+of `bind_http1` / `bind_http2`). Engine selection is pluggable via
+`WebSocketEngine`; the bundled `NativeEngine` implements RFC 6455 directly.
+
+In v1 the WS path does not reuse `TransportService` or its application /
+network interceptors, and its connection is not pooled. See
+`docs/websocket-design.md` for the full specification and the v2
+follow-ups (pool reuse, interceptor chain integration).
+
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.

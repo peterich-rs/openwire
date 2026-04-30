@@ -1,6 +1,13 @@
 # WebSocket Support — Design
 
-Status: Proposed
+Status: Implemented (2026-04-30)
+
+> **v1 implementation note:** the WebSocket request follows a parallel
+> code path through `ConnectorStack` rather than the full
+> `TransportService` interceptor chain. Bridge normalization (URI scheme
+> rewrite, WS handshake headers, host/UA, HTTP/1.1 forcing) and proxy
+> selection still apply. Application/network interceptors and connection
+> pool reuse are not yet wired for WS — flagged for v2.
 
 This document specifies how WebSocket (RFC 6455) support is added to openwire. It
 preserves the layering described in `AGENTS.md`: `Client::execute` → application

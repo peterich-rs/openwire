@@ -30,6 +30,8 @@ blocks, and stable observability hooks.
 - `RequestBody::absent()` for typical no-body requests and
   `RequestBody::explicit_empty()` when zero-length framing must be explicit
 - optional JSON helpers behind the `json` feature
+- optional WebSocket (RFC 6455) client behind the `websocket` feature, with a
+  pluggable `WebSocketEngine` trait and a built-in native codec
 - `openwire-cache` as a separate application-layer cache crate
 
 ## Workspace
