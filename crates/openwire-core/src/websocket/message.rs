@@ -1,5 +1,7 @@
 use bytes::Bytes;
 
+use super::engine::EngineFrame;
+
 #[derive(Clone, Debug)]
 pub enum Message {
     Text(String),
@@ -35,6 +37,30 @@ impl Message {
             Message::Text(s) => s.len(),
             Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(),
             Message::Close { reason, .. } => 2 + reason.len(),
+        }
+    }
+}
+
+impl From<Message> for EngineFrame {
+    fn from(message: Message) -> Self {
+        match message {
+            Message::Text(text) => EngineFrame::Text(text),
+            Message::Binary(bytes) => EngineFrame::Binary(bytes),
+            Message::Ping(bytes) => EngineFrame::Ping(bytes),
+            Message::Pong(bytes) => EngineFrame::Pong(bytes),
+            Message::Close { code, reason } => EngineFrame::Close { code, reason },
+        }
+    }
+}
+
+impl From<EngineFrame> for Message {
+    fn from(frame: EngineFrame) -> Self {
+        match frame {
+            EngineFrame::Text(text) => Message::Text(text),
+            EngineFrame::Binary(bytes) => Message::Binary(bytes),
+            EngineFrame::Ping(bytes) => Message::Ping(bytes),
+            EngineFrame::Pong(bytes) => Message::Pong(bytes),
+            EngineFrame::Close { code, reason } => Message::Close { code, reason },
         }
     }
 }
