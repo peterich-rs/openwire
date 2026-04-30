@@ -7,6 +7,9 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+websocket = ["dep:tokio-tungstenite"]
+
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
@@ -19,4 +22,5 @@ rcgen.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tokio-tungstenite = { version = "0.24", optional = true }
 tracing.workspace = true

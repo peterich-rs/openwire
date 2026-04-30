@@ -38,9 +38,11 @@ url.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async_tokio"] }
-openwire-test = { path = "../openwire-test" }
+futures-util = { workspace = true, features = ["sink"] }
+openwire-test = { path = "../openwire-test", features = ["websocket"] }
 serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite = "0.24"
 tracing-subscriber.workspace = true
 
 [[bench]]
