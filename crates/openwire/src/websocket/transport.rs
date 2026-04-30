@@ -18,7 +18,7 @@ use crate::websocket::handshake::{
 };
 use crate::websocket::native::NativeEngine;
 use crate::websocket::public::{WebSocket, WebSocketReceiver, WebSocketSender};
-use crate::websocket::writer::spawn_session;
+use crate::websocket::writer::{spawn_session, HeartbeatConfig};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,8 +37,8 @@ pub(crate) async fn execute(
         max_frame_size,
         max_message_size,
         send_queue_size,
-        ping_interval: _ping_interval,
-        pong_timeout: _pong_timeout,
+        ping_interval,
+        pong_timeout,
         subprotocols,
         deliver_control_frames,
         engine,
@@ -124,7 +124,17 @@ pub(crate) async fn execute(
         validated.extensions,
     );
 
-    let session = spawn_session(channel, send_queue_size, deliver_control_frames, close_timeout);
+    let heartbeat = ping_interval.map(|interval| HeartbeatConfig {
+        interval,
+        pong_timeout: pong_timeout.unwrap_or(interval * 2),
+    });
+    let session = spawn_session(
+        channel,
+        send_queue_size,
+        deliver_control_frames,
+        close_timeout,
+        heartbeat,
+    );
     let sender = WebSocketSender::new(session.sender_tx);
     let receiver = WebSocketReceiver {
         rx: session.receiver_rx,

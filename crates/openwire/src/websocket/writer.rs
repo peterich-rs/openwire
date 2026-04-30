@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -83,6 +85,7 @@ pub(crate) async fn run_reader(
     deliver_control_frames: bool,
     out: mpsc::Sender<Result<Message, WebSocketError>>,
     auto_pong: mpsc::Sender<WriterCommand>,
+    pong_tracker: Option<PongTracker>,
 ) {
     while let Some(item) = stream.next().await {
         match item {
@@ -95,6 +98,9 @@ pub(crate) async fn run_reader(
                 }
             }
             Ok(EngineFrame::Pong(payload)) => {
+                if let Some(tracker) = pong_tracker.as_ref() {
+                    tracker.mark();
+                }
                 if deliver_control_frames {
                     let _ = out.send(Ok(Message::Pong(payload))).await;
                 }
@@ -154,10 +160,13 @@ pub(crate) fn spawn_session(
     queue_size: usize,
     deliver_control_frames: bool,
     close_timeout: Duration,
+    heartbeat: Option<HeartbeatConfig>,
 ) -> SessionHandles {
     let (sender_tx, sender_rx) = mpsc::channel::<WriterCommand>(queue_size);
     let (recv_tx, recv_rx) = mpsc::channel::<Result<Message, WebSocketError>>(queue_size);
     let auto_pong_tx = sender_tx.clone();
+
+    let pong_tracker = heartbeat.as_ref().map(|_| PongTracker::new());
 
     tokio::spawn(run_writer(
         channel.send,
@@ -170,7 +179,18 @@ pub(crate) fn spawn_session(
         deliver_control_frames,
         recv_tx,
         auto_pong_tx,
+        pong_tracker.clone(),
     ));
+
+    if let (Some(config), Some(tracker)) = (heartbeat, pong_tracker) {
+        let heartbeat_tx = sender_tx.clone();
+        tokio::spawn(run_heartbeat(
+            config.interval,
+            config.pong_timeout,
+            tracker,
+            heartbeat_tx,
+        ));
+    }
 
     SessionHandles {
         sender_tx: sender_tx.clone(),
@@ -178,6 +198,67 @@ pub(crate) fn spawn_session(
         _drop_guard: DropGuard {
             cancel_tx: sender_tx,
         },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeartbeatConfig {
+    pub interval: Duration,
+    pub pong_timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct PongTracker {
+    last_pong_ms: Arc<AtomicU64>,
+    start: Arc<Instant>,
+}
+
+impl PongTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_pong_ms: Arc::new(AtomicU64::new(0)),
+            start: Arc::new(Instant::now()),
+        }
+    }
+
+    pub(crate) fn mark(&self) {
+        self.last_pong_ms
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Release);
+    }
+
+    pub(crate) fn since_last_pong(&self) -> Duration {
+        let now = self.start.elapsed().as_millis() as u64;
+        let last = self.last_pong_ms.load(Ordering::Acquire);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
+pub(crate) async fn run_heartbeat(
+    interval: Duration,
+    pong_timeout: Duration,
+    tracker: PongTracker,
+    out: mpsc::Sender<WriterCommand>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick so we don't ping before the user can send.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if out.send(WriterCommand::Ping(Bytes::new())).await.is_err() {
+            return;
+        }
+        if tracker.since_last_pong() > pong_timeout {
+            let (ack_tx, _) = tokio::sync::oneshot::channel();
+            let _ = out
+                .send(WriterCommand::Close {
+                    code: 1011,
+                    reason: "ping timeout".into(),
+                    ack: ack_tx,
+                })
+                .await;
+            return;
+        }
     }
 }
 
