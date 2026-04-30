@@ -533,11 +533,6 @@ impl Client {
     pub(crate) fn event_listener_factory(&self) -> &SharedEventListenerFactory {
         &self.inner.event_listener_factory
     }
-
-    #[cfg(feature = "websocket")]
-    pub(crate) fn timer(&self) -> &SharedTimer {
-        &self.inner.timer
-    }
 }
 
 #[cfg(feature = "websocket")]

@@ -6,6 +6,7 @@ members = [
     "crates/openwire-tokio",
     "crates/openwire-rustls",
     "crates/openwire-test",
+    "crates/openwire-tungstenite",
 ]
 resolver = "2"
 

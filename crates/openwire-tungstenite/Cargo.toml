@@ -1,0 +1,22 @@
+[package]
+name = "openwire-tungstenite"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+openwire-core = { path = "../openwire-core", features = ["websocket"] }
+openwire-tokio = { path = "../openwire-tokio" }
+tokio.workspace = true
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+openwire = { path = "../openwire", features = ["websocket"] }
+openwire-test = { path = "../openwire-test", features = ["websocket"] }
+http.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
