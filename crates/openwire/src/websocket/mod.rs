@@ -6,4 +6,6 @@ pub(crate) mod writer;
 
 mod public;
 
-// Re-exports added once public types are populated (Task 18+).
+pub use public::{WebSocket, WebSocketReceiver, WebSocketSender};
+
+pub use openwire_core::websocket::WebSocketHandshake;
