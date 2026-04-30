@@ -28,7 +28,9 @@ impl NativeEngine {
     }
 
     /// Convenience constructor returning an `Arc`-wrapped engine handle, the
-    /// shape `WebSocketCall::engine` accepts.
+    /// shape `WebSocketCall::engine` accepts. Useful when you want to share
+    /// one engine across many calls.
+    #[allow(dead_code)]
     pub fn shared() -> Arc<Self> {
         Arc::new(Self)
     }
