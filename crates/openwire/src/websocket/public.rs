@@ -20,6 +20,15 @@ struct SenderInner {
     closed: AtomicBool,
 }
 
+impl Drop for SenderInner {
+    fn drop(&mut self) {
+        // Best-effort cancel signal so the writer task wakes up and flushes
+        // when the last sender clone goes out of scope. If the channel is
+        // already closed (writer already returned) the send is a no-op.
+        let _ = self.tx.try_send(WriterCommand::Cancel);
+    }
+}
+
 impl WebSocketSender {
     pub(crate) fn new(tx: mpsc::Sender<WriterCommand>) -> Self {
         Self {
@@ -99,7 +108,6 @@ pub struct WebSocket {
     pub(crate) sender: WebSocketSender,
     pub(crate) receiver: WebSocketReceiver,
     pub(crate) handshake: WebSocketHandshake,
-    pub(crate) _drop_guard: crate::websocket::writer::DropGuard,
 }
 
 impl WebSocket {

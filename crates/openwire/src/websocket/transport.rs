@@ -149,7 +149,6 @@ pub(crate) async fn execute(
         sender,
         receiver,
         handshake,
-        _drop_guard: session._drop_guard,
     })
 }
 
@@ -170,6 +169,14 @@ async fn run_handshake(
     let validated =
         validate_handshake_response(&response, &expected_accept, &offered_subprotocols)
             .map_err(|reason| WebSocketError::handshake(reason, Some(response.status())))?;
+    let upgraded = upgraded.ok_or_else(|| {
+        WebSocketError::handshake(
+            openwire_core::websocket::HandshakeFailure::Other(
+                "server returned 101 without an upgradable connection".into(),
+            ),
+            Some(response.status()),
+        )
+    })?;
 
     let cfg = WebSocketEngineConfig {
         role: Role::Client,

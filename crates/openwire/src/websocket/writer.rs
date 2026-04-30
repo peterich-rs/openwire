@@ -191,6 +191,7 @@ pub(crate) async fn run_reader(
                     listener.websocket_failed(ctx, &mapped);
                 }
                 let _ = out.send(Err(mapped)).await;
+                let _ = auto_pong.send(WriterCommand::Cancel).await;
                 return;
             }
             Err(other) => {
@@ -199,10 +200,14 @@ pub(crate) async fn run_reader(
                     listener.websocket_failed(ctx, &mapped);
                 }
                 let _ = out.send(Err(mapped)).await;
+                let _ = auto_pong.send(WriterCommand::Cancel).await;
                 return;
             }
         }
     }
+    // Stream ended (EOF). Wake the writer so any pending close handshake
+    // doesn't wait the full close_timeout when the peer never sent Close.
+    let _ = auto_pong.send(WriterCommand::Cancel).await;
 }
 
 fn map_engine_error(error: WebSocketEngineError) -> WebSocketError {
@@ -215,19 +220,6 @@ fn map_engine_error(error: WebSocketEngineError) -> WebSocketError {
 pub(crate) struct SessionHandles {
     pub sender_tx: mpsc::Sender<WriterCommand>,
     pub receiver_rx: mpsc::Receiver<Result<Message, WebSocketError>>,
-    pub _drop_guard: DropGuard,
-}
-
-/// Best-effort cancel signal sent to the writer when the user's `WebSocket`
-/// is dropped without explicitly calling `close`.
-pub(crate) struct DropGuard {
-    cancel_tx: mpsc::Sender<WriterCommand>,
-}
-
-impl Drop for DropGuard {
-    fn drop(&mut self) {
-        let _ = self.cancel_tx.try_send(WriterCommand::Cancel);
-    }
 }
 
 pub(crate) struct SessionConfig {
@@ -306,11 +298,8 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
     }
 
     SessionHandles {
-        sender_tx: sender_tx.clone(),
+        sender_tx,
         receiver_rx: recv_rx,
-        _drop_guard: DropGuard {
-            cancel_tx: sender_tx,
-        },
     }
 }
 

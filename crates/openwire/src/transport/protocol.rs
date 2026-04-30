@@ -52,7 +52,7 @@ pub(super) async fn bind_http2(
 pub(crate) async fn bind_websocket_handshake(
     io: BoxConnection,
     request: Request<RequestBody>,
-) -> Result<(Response<()>, hyper::upgrade::Upgraded), WireError> {
+) -> Result<(Response<()>, Option<hyper::upgrade::Upgraded>), WireError> {
     let (mut send, conn) = http1::handshake(io)
         .await
         .map_err(|error| WireError::protocol_binding("HTTP/1.1 client handshake failed", error))?;
@@ -65,9 +65,15 @@ pub(crate) async fn bind_websocket_handshake(
         .send_request(request)
         .await
         .map_err(WireError::from)?;
-    let upgraded = hyper::upgrade::on(&mut response)
-        .await
-        .map_err(WireError::from)?;
+    let upgraded = if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+        Some(
+            hyper::upgrade::on(&mut response)
+                .await
+                .map_err(WireError::from)?,
+        )
+    } else {
+        None
+    };
 
     let mut out = Response::new(());
     *out.status_mut() = response.status();
