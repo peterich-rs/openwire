@@ -63,6 +63,19 @@ pub enum ProtocolPolicy {
     Http1OrHttp2,
 }
 
+/// Per-request override placed in `request.extensions()` when a call must use a
+/// specific transport protocol. The default `Any` lets the existing
+/// [`Address::protocol_policy`] and ALPN result decide. WebSocket calls attach
+/// `Http1Only` so the binding step picks HTTP/1.1 even if the connection
+/// negotiated h2 — see `crate::websocket::handshake` (Task 9) for the writer
+/// and `crate::transport::service` (Task 23) for the reader.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum RoutePreference {
+    #[default]
+    Any,
+    Http1Only,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DnsPolicy {
     System,
@@ -799,8 +812,8 @@ mod tests {
     use super::{
         Address, AuthorityKey, ConnectAttemptState, ConnectFailure, ConnectFailureStage,
         ConnectPlan, DefaultRoutePlanner, DnsPolicy, DnsResolution, ProtocolPolicy, ProxyConfig,
-        ProxyEndpoint, ProxyMode, ProxyScheme, RouteFamily, RouteKind, RoutePlanner, TlsIdentity,
-        UriScheme,
+        ProxyEndpoint, ProxyMode, ProxyScheme, RouteFamily, RouteKind, RoutePlanner,
+        RoutePreference, TlsIdentity, UriScheme,
     };
     use crate::Proxy;
 
@@ -1096,6 +1109,12 @@ mod tests {
             connect.route(0).expect("connect route").kind(),
             RouteKind::ConnectProxy { .. }
         ));
+    }
+
+    #[test]
+    fn route_preference_defaults_to_any() {
+        assert_eq!(RoutePreference::default(), RoutePreference::Any);
+        assert_ne!(RoutePreference::Http1Only, RoutePreference::Any);
     }
 
     #[test]
