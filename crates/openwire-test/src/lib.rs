@@ -393,14 +393,13 @@ mod websocket {
                 let Ok(message) = message else {
                     return;
                 };
-                match message {
-                    TungMessage::Text(_) | TungMessage::Binary(_) => {
-                        if websocket.send(message).await.is_err() {
-                            return;
-                        }
-                    }
+                let echo = match message {
                     TungMessage::Close(_) => return,
-                    _ => {}
+                    msg @ (TungMessage::Text(_) | TungMessage::Binary(_)) => msg,
+                    _ => continue,
+                };
+                if websocket.send(echo).await.is_err() {
+                    return;
                 }
             }
         })
