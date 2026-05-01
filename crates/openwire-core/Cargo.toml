@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 json = ["dep:serde", "dep:serde_json"]
+websocket = ["futures-util/sink"]
 
 [dependencies]
 bytes.workspace = true

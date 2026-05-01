@@ -23,7 +23,17 @@ impl Interceptor for BridgeInterceptor {
     }
 }
 
-fn normalize_request(request: &mut Request<RequestBody>) -> Result<(), WireError> {
+pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<(), WireError> {
+    #[cfg(feature = "websocket")]
+    {
+        if request
+            .extensions()
+            .get::<crate::websocket::handshake::WebSocketRequestMarker>()
+            .is_some()
+        {
+            crate::websocket::handshake::inject_handshake(request)?;
+        }
+    }
     normalize_host_header(request)?;
     normalize_user_agent_header(request);
     normalize_body_headers(request);
@@ -130,6 +140,63 @@ mod tests {
             Some("0")
         );
         assert!(request.headers().get(TRANSFER_ENCODING).is_none());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn injects_websocket_handshake_headers() {
+        use crate::websocket::handshake::WebSocketRequestMarker;
+        use http::Method;
+
+        let mut request: Request<crate::RequestBody> = Request::builder()
+            .method(Method::GET)
+            .uri("ws://example.com/socket")
+            .body(crate::RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(WebSocketRequestMarker::new(vec!["chat".into()]));
+
+        super::normalize_request(&mut request).expect("normalize");
+
+        let headers = request.headers();
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert!(headers
+            .get("connection")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("upgrade"));
+        assert_eq!(headers.get("sec-websocket-version").unwrap(), "13");
+        assert!(headers.get("sec-websocket-key").is_some());
+        assert_eq!(headers.get("sec-websocket-protocol").unwrap(), "chat");
+        assert_eq!(request.uri().scheme_str(), Some("http"));
+        assert_eq!(request.version(), Version::HTTP_11);
+        let marker = request
+            .extensions()
+            .get::<WebSocketRequestMarker>()
+            .expect("marker preserved");
+        assert!(!marker.expected_accept.is_empty());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn rejects_websocket_request_with_non_get_method() {
+        use crate::websocket::handshake::WebSocketRequestMarker;
+        use http::Method;
+
+        let mut request: Request<crate::RequestBody> = Request::builder()
+            .method(Method::POST)
+            .uri("ws://example.com/socket")
+            .body(crate::RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(WebSocketRequestMarker::new(Vec::new()));
+
+        let err = super::normalize_request(&mut request).expect_err("must reject");
+        assert_eq!(err.kind(), crate::WireErrorKind::InvalidRequest);
     }
 
     #[test]

@@ -9,6 +9,9 @@ mod policy;
 mod runtime;
 mod transport;
 
+#[cfg(feature = "websocket")]
+pub mod websocket;
+
 use std::future::Future;
 use std::pin::Pin;
 

@@ -94,6 +94,62 @@ pub trait EventListener: Send + Sync + 'static {
 
     fn retry(&self, _ctx: &CallContext, _attempt: u32, _reason: &str) {}
     fn redirect(&self, _ctx: &CallContext, _attempt: u32, _location: &Uri) {}
+
+    // ─── WebSocket lifecycle (feature = "websocket") ───
+    /// Fired once when the 101 response has been validated and the engine has
+    /// taken ownership of the upgraded IO.
+    #[cfg(feature = "websocket")]
+    fn websocket_open(
+        &self,
+        _ctx: &CallContext,
+        _handshake: &crate::websocket::WebSocketHandshake,
+    ) {
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_message_sent(
+        &self,
+        _ctx: &CallContext,
+        _kind: crate::websocket::MessageKind,
+        _payload_len: usize,
+    ) {
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_message_received(
+        &self,
+        _ctx: &CallContext,
+        _kind: crate::websocket::MessageKind,
+        _payload_len: usize,
+    ) {
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_ping_sent(&self, _ctx: &CallContext) {}
+
+    #[cfg(feature = "websocket")]
+    fn websocket_pong_received(&self, _ctx: &CallContext) {}
+
+    /// Fired when a close frame is being sent or received. `initiator`
+    /// distinguishes user-initiated close from peer-initiated.
+    #[cfg(feature = "websocket")]
+    fn websocket_closing(
+        &self,
+        _ctx: &CallContext,
+        _code: u16,
+        _reason: &str,
+        _initiator: crate::websocket::CloseInitiator,
+    ) {
+    }
+
+    /// Fired once after the close handshake completes (or times out).
+    #[cfg(feature = "websocket")]
+    fn websocket_closed(&self, _ctx: &CallContext, _code: u16, _reason: &str) {}
+
+    /// Fired when the WebSocket session terminates with an error before a
+    /// graceful close handshake completes.
+    #[cfg(feature = "websocket")]
+    fn websocket_failed(&self, _ctx: &CallContext, _error: &crate::websocket::WebSocketError) {}
 }
 
 pub trait EventListenerFactory: Send + Sync + 'static {

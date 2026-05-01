@@ -50,6 +50,10 @@ struct ClientInner {
     request_config: EffectiveRequestConfig,
     service: BoxWireService,
     pool_reaper: Arc<PoolReaperController>,
+    #[cfg(feature = "websocket")]
+    connector: ConnectorStack,
+    #[cfg(feature = "websocket")]
+    proxy_selector: SharedProxySelector,
 }
 
 pub struct Call {
@@ -406,7 +410,7 @@ impl ClientBuilder {
         };
 
         let transport = TransportService::new(TransportServiceInit {
-            connector,
+            connector: connector.clone(),
             config: self.transport.clone(),
             executor: self.executor.clone(),
             timer: self.timer.clone(),
@@ -429,6 +433,10 @@ impl ClientBuilder {
                 request_config,
                 service,
                 pool_reaper,
+                #[cfg(feature = "websocket")]
+                connector,
+                #[cfg(feature = "websocket")]
+                proxy_selector,
             }),
         })
     }
@@ -491,6 +499,118 @@ impl Client {
         request: Request<RequestBody>,
     ) -> Result<Response<ResponseBody>, WireError> {
         self.new_call(request).execute().await
+    }
+
+    #[cfg(feature = "websocket")]
+    pub fn new_websocket(&self, request: Request<RequestBody>) -> WebSocketCall<'_> {
+        WebSocketCall {
+            client: self,
+            request,
+            handshake_timeout: None,
+            close_timeout: None,
+            max_frame_size: None,
+            max_message_size: None,
+            send_queue_size: None,
+            ping_interval: None,
+            pong_timeout: None,
+            subprotocols: Vec::new(),
+            deliver_control_frames: false,
+            engine: None,
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    pub(crate) fn ws_connector(&self) -> &ConnectorStack {
+        &self.inner.connector
+    }
+
+    #[cfg(feature = "websocket")]
+    pub(crate) fn ws_proxy_selector(&self) -> &SharedProxySelector {
+        &self.inner.proxy_selector
+    }
+
+    #[cfg(feature = "websocket")]
+    pub(crate) fn event_listener_factory(&self) -> &SharedEventListenerFactory {
+        &self.inner.event_listener_factory
+    }
+}
+
+#[cfg(feature = "websocket")]
+pub struct WebSocketCall<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) request: Request<RequestBody>,
+    pub(crate) handshake_timeout: Option<Duration>,
+    pub(crate) close_timeout: Option<Duration>,
+    pub(crate) max_frame_size: Option<usize>,
+    pub(crate) max_message_size: Option<usize>,
+    pub(crate) send_queue_size: Option<usize>,
+    pub(crate) ping_interval: Option<Duration>,
+    pub(crate) pong_timeout: Option<Duration>,
+    pub(crate) subprotocols: Vec<String>,
+    pub(crate) deliver_control_frames: bool,
+    pub(crate) engine: Option<openwire_core::websocket::SharedWebSocketEngine>,
+}
+
+#[cfg(feature = "websocket")]
+impl<'a> WebSocketCall<'a> {
+    pub fn handshake_timeout(mut self, value: Duration) -> Self {
+        self.handshake_timeout = Some(value);
+        self
+    }
+
+    pub fn close_timeout(mut self, value: Duration) -> Self {
+        self.close_timeout = Some(value);
+        self
+    }
+
+    pub fn max_frame_size(mut self, value: usize) -> Self {
+        self.max_frame_size = Some(value);
+        self
+    }
+
+    pub fn max_message_size(mut self, value: usize) -> Self {
+        self.max_message_size = Some(value);
+        self
+    }
+
+    pub fn send_queue_size(mut self, value: usize) -> Self {
+        self.send_queue_size = Some(value);
+        self
+    }
+
+    pub fn ping_interval(mut self, value: Duration) -> Self {
+        self.ping_interval = Some(value);
+        self
+    }
+
+    pub fn pong_timeout(mut self, value: Duration) -> Self {
+        self.pong_timeout = Some(value);
+        self
+    }
+
+    pub fn subprotocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subprotocols = protocols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn deliver_control_frames(mut self, on: bool) -> Self {
+        self.deliver_control_frames = on;
+        self
+    }
+
+    pub fn engine(mut self, engine: openwire_core::websocket::SharedWebSocketEngine) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
+    pub async fn execute(
+        self,
+    ) -> Result<crate::websocket::WebSocket, openwire_core::websocket::WebSocketError> {
+        crate::websocket::transport::execute(self).await
     }
 }
 

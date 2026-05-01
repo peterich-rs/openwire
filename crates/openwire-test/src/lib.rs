@@ -370,6 +370,85 @@ enum TestProtocol {
     Http2,
 }
 
+#[cfg(feature = "websocket")]
+pub use websocket::{spawn_websocket_echo, spawn_websocket_handler};
+
+#[cfg(feature = "websocket")]
+mod websocket {
+    use std::future::Future;
+    use std::sync::Arc;
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Message as TungMessage;
+
+    use super::TestServer;
+
+    /// Spawn a WebSocket server that echoes every Text/Binary message back to
+    /// the client. Pings/pongs are handled by tokio-tungstenite.
+    pub async fn spawn_websocket_echo() -> TestServer {
+        spawn_websocket_handler(|mut websocket| async move {
+            while let Some(message) = websocket.next().await {
+                let Ok(message) = message else {
+                    return;
+                };
+                let echo = match message {
+                    TungMessage::Close(_) => return,
+                    msg @ (TungMessage::Text(_) | TungMessage::Binary(_)) => msg,
+                    _ => continue,
+                };
+                if websocket.send(echo).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+    }
+
+    /// Spawn a custom WebSocket handler. The handler receives the upgraded
+    /// `WebSocketStream` and is expected to drive it to completion.
+    pub async fn spawn_websocket_handler<F, Fut>(handler: F) -> TestServer
+    where
+        F: Fn(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let handler = Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _peer)) = accepted else { break; };
+                        let handler = handler.clone();
+                        tokio::spawn(async move {
+                            match tokio_tungstenite::accept_async(stream).await {
+                                Ok(websocket) => handler(websocket).await,
+                                Err(error) => tracing::debug!(?error, "ws handshake failed"),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        TestServer {
+            addr,
+            shutdown: Some(shutdown_tx),
+            tls_root_pem: None,
+        }
+    }
+}
+
 fn tls_acceptor_with_alpn_and_hosts(
     alpn_protocols: Vec<Vec<u8>>,
     hosts: &[&str],
