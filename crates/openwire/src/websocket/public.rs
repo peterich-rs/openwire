@@ -61,11 +61,7 @@ impl WebSocketSender {
     /// Initiate a graceful close. Returns once the writer task has either
     /// observed the peer's close acknowledgement or the close timeout has
     /// fired. Subsequent calls are idempotent.
-    pub async fn close(
-        &self,
-        code: u16,
-        reason: impl Into<String>,
-    ) -> Result<(), WebSocketError> {
+    pub async fn close(&self, code: u16, reason: impl Into<String>) -> Result<(), WebSocketError> {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -84,7 +80,10 @@ impl WebSocketSender {
     }
 
     pub fn queue_size(&self) -> usize {
-        self.inner.tx.max_capacity().saturating_sub(self.inner.tx.capacity())
+        self.inner
+            .tx
+            .max_capacity()
+            .saturating_sub(self.inner.tx.capacity())
     }
 
     pub fn is_closed(&self) -> bool {

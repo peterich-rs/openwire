@@ -265,10 +265,7 @@ mod response_tests {
             .headers_mut()
             .insert("sec-websocket-protocol", HeaderValue::from_static("v2"));
         let err = validate_handshake_response(&response, "expected", &["v1".into()]).unwrap_err();
-        assert!(matches!(
-            err,
-            HandshakeFailure::SubprotocolMismatch { .. }
-        ));
+        assert!(matches!(err, HandshakeFailure::SubprotocolMismatch { .. }));
     }
 
     #[test]

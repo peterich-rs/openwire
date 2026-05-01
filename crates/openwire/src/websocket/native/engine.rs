@@ -48,7 +48,11 @@ impl WebSocketEngine for NativeEngine {
                     "native engine only supports client role in v1".into(),
                 ));
             }
-            if config.extensions.iter().any(|extension| !extension.is_empty()) {
+            if config
+                .extensions
+                .iter()
+                .any(|extension| !extension.is_empty())
+            {
                 return Err(WebSocketEngineError::UnsupportedExtension(
                     config.extensions.join(", "),
                 ));
@@ -84,10 +88,7 @@ impl NativeSink {
         }
     }
 
-    fn drain(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), WebSocketEngineError>> {
+    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketEngineError>> {
         while !self.buf.is_empty() {
             match Pin::new(&mut self.write).poll_write(cx, &self.buf[..]) {
                 Poll::Pending => return Poll::Pending,
@@ -110,13 +111,13 @@ impl NativeSink {
         match Pin::new(&mut self.write).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(WebSocketEngineError::Io(
-                WireError::with_source(
+            Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(WebSocketEngineError::Io(WireError::with_source(
                     openwire_core::WireErrorKind::Protocol,
                     "websocket flush failed",
                     error,
-                ),
-            ))),
+                ))))
+            }
         }
     }
 }
@@ -214,13 +215,13 @@ impl NativeStream {
                     Poll::Ready(Ok(false))
                 }
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(WebSocketEngineError::Io(
-                WireError::with_source(
+            Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(WebSocketEngineError::Io(WireError::with_source(
                     openwire_core::WireErrorKind::Protocol,
                     "websocket read failed",
                     error,
-                ),
-            ))),
+                ))))
+            }
         }
     }
 }

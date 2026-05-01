@@ -149,12 +149,7 @@ pub trait EventListener: Send + Sync + 'static {
     /// Fired when the WebSocket session terminates with an error before a
     /// graceful close handshake completes.
     #[cfg(feature = "websocket")]
-    fn websocket_failed(
-        &self,
-        _ctx: &CallContext,
-        _error: &crate::websocket::WebSocketError,
-    ) {
-    }
+    fn websocket_failed(&self, _ctx: &CallContext, _error: &crate::websocket::WebSocketError) {}
 }
 
 pub trait EventListenerFactory: Send + Sync + 'static {

@@ -99,10 +99,7 @@ where
 {
     type Error = WebSocketEngineError;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner).poll_ready(cx).map_err(map_error)
     }
 
@@ -113,17 +110,11 @@ where
             .map_err(map_error)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx).map_err(map_error)
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner).poll_close(cx).map_err(map_error)
     }
 }
@@ -156,7 +147,7 @@ where
 
 fn engine_to_tung(frame: EngineFrame) -> TungMessage {
     match frame {
-        EngineFrame::Text(text) => TungMessage::Text(text.into()),
+        EngineFrame::Text(text) => TungMessage::Text(text),
         EngineFrame::Binary(bytes) => TungMessage::Binary(bytes.to_vec()),
         EngineFrame::Ping(bytes) => TungMessage::Ping(bytes.to_vec()),
         EngineFrame::Pong(bytes) => TungMessage::Pong(bytes.to_vec()),
@@ -169,7 +160,7 @@ fn engine_to_tung(frame: EngineFrame) -> TungMessage {
 
 fn tung_to_engine(message: TungMessage) -> Option<EngineFrame> {
     Some(match message {
-        TungMessage::Text(text) => EngineFrame::Text(text.into()),
+        TungMessage::Text(text) => EngineFrame::Text(text),
         TungMessage::Binary(bytes) => EngineFrame::Binary(Bytes::from(bytes)),
         TungMessage::Ping(bytes) => EngineFrame::Ping(Bytes::from(bytes)),
         TungMessage::Pong(bytes) => EngineFrame::Pong(Bytes::from(bytes)),

@@ -137,9 +137,7 @@ pub(crate) async fn run_reader(
     while let Some(item) = stream.next().await {
         match item {
             Ok(EngineFrame::Ping(payload)) => {
-                let _ = auto_pong
-                    .send(WriterCommand::Pong(payload.clone()))
-                    .await;
+                let _ = auto_pong.send(WriterCommand::Pong(payload.clone())).await;
                 if deliver_control_frames {
                     let _ = out.send(Ok(Message::Ping(payload))).await;
                 }
@@ -177,11 +175,7 @@ pub(crate) async fn run_reader(
             }
             Ok(EngineFrame::Binary(bytes)) => {
                 if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_message_received(
-                        ctx,
-                        MessageKind::Binary,
-                        bytes.len(),
-                    );
+                    listener.websocket_message_received(ctx, MessageKind::Binary, bytes.len());
                 }
                 let _ = out.send(Ok(Message::Binary(bytes))).await;
             }

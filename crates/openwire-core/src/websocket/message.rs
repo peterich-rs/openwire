@@ -98,9 +98,6 @@ mod tests {
     #[test]
     fn payload_len_text_and_binary() {
         assert_eq!(Message::Text("hello".into()).payload_len(), 5);
-        assert_eq!(
-            Message::Binary(Bytes::from_static(b"abc")).payload_len(),
-            3
-        );
+        assert_eq!(Message::Binary(Bytes::from_static(b"abc")).payload_len(), 3);
     }
 }

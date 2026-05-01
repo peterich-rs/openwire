@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(selected) => println!("server selected: {selected}"),
         None => println!("server selected: <none>"),
     }
-    println!("server extensions: {:?}", websocket.handshake().extensions());
+    println!(
+        "server extensions: {:?}",
+        websocket.handshake().extensions()
+    );
 
     websocket.sender().close(1000, "demo done").await?;
     Ok(())

@@ -61,10 +61,7 @@ pub(crate) async fn bind_websocket_handshake(
         let _ = conn.with_upgrades().await;
     });
 
-    let mut response = send
-        .send_request(request)
-        .await
-        .map_err(WireError::from)?;
+    let mut response = send.send_request(request).await.map_err(WireError::from)?;
     let upgraded = if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
         Some(
             hyper::upgrade::on(&mut response)

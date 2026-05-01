@@ -26,9 +26,7 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_SEND_QUEUE_SIZE: usize = 32;
 
-pub(crate) async fn execute(
-    call: WebSocketCall<'_>,
-) -> Result<WebSocket, WebSocketError> {
+pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSocketError> {
     let WebSocketCall {
         client,
         mut request,
@@ -161,14 +159,12 @@ async fn run_handshake(
     max_frame_size: usize,
     max_message_size: usize,
 ) -> Result<(http::Response<()>, WebSocketChannel, ValidatedHandshake), WebSocketError> {
-    let (response, upgraded) =
-        crate::transport::protocol::bind_websocket_handshake(io, request)
-            .await
-            .map_err(WebSocketError::Io)?;
+    let (response, upgraded) = crate::transport::protocol::bind_websocket_handshake(io, request)
+        .await
+        .map_err(WebSocketError::Io)?;
 
-    let validated =
-        validate_handshake_response(&response, &expected_accept, &offered_subprotocols)
-            .map_err(|reason| WebSocketError::handshake(reason, Some(response.status())))?;
+    let validated = validate_handshake_response(&response, &expected_accept, &offered_subprotocols)
+        .map_err(|reason| WebSocketError::handshake(reason, Some(response.status())))?;
     let upgraded = upgraded.ok_or_else(|| {
         WebSocketError::handshake(
             openwire_core::websocket::HandshakeFailure::Other(

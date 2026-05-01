@@ -411,9 +411,7 @@ mod websocket {
     /// `WebSocketStream` and is expected to drive it to completion.
     pub async fn spawn_websocket_handler<F, Fut>(handler: F) -> TestServer
     where
-        F: Fn(
-                tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-            ) -> Fut
+        F: Fn(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
             + Send
             + Sync
             + 'static,

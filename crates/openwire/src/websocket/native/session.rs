@@ -105,10 +105,7 @@ impl ReassemblyState {
         }
     }
 
-    fn parse_control(
-        &self,
-        frame: DecodedFrame,
-    ) -> Result<EngineFrame, WebSocketEngineError> {
+    fn parse_control(&self, frame: DecodedFrame) -> Result<EngineFrame, WebSocketEngineError> {
         match frame.opcode {
             Opcode::Ping => Ok(EngineFrame::Ping(frame.payload)),
             Opcode::Pong => Ok(EngineFrame::Pong(frame.payload)),
@@ -181,23 +178,19 @@ mod tests {
         let err = session
             .feed(frame(true, Opcode::Binary, &[1, 2, 3]))
             .unwrap_err();
-        assert!(matches!(
-            err,
-            WebSocketEngineError::PayloadTooLarge { .. }
-        ));
+        assert!(matches!(err, WebSocketEngineError::PayloadTooLarge { .. }));
     }
 
     #[test]
     fn rejects_message_over_limit_during_reassembly() {
         let mut session = ReassemblyState::new(4);
-        session.feed(frame(false, Opcode::Binary, &[1, 2, 3])).unwrap();
+        session
+            .feed(frame(false, Opcode::Binary, &[1, 2, 3]))
+            .unwrap();
         let err = session
             .feed(frame(true, Opcode::Continuation, &[4, 5]))
             .unwrap_err();
-        assert!(matches!(
-            err,
-            WebSocketEngineError::PayloadTooLarge { .. }
-        ));
+        assert!(matches!(err, WebSocketEngineError::PayloadTooLarge { .. }));
     }
 
     #[test]
@@ -244,9 +237,7 @@ mod tests {
     fn rejects_nested_data_frame() {
         let mut session = ReassemblyState::new(1024);
         session.feed(frame(false, Opcode::Text, b"He")).unwrap();
-        let err = session
-            .feed(frame(true, Opcode::Binary, b"!"))
-            .unwrap_err();
+        let err = session.feed(frame(true, Opcode::Binary, b"!")).unwrap_err();
         assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
     }
 

@@ -71,7 +71,8 @@ async fn server_initiated_close_with_tungstenite_engine() {
         let _ = websocket
             .send(tokio_tungstenite::tungstenite::Message::Close(Some(
                 tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
                     reason: "server bye".into(),
                 },
             )))

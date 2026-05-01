@@ -64,7 +64,9 @@ async fn binary_message_round_trips() {
 
 #[tokio::test]
 async fn subprotocol_negotiated_successfully() {
-    use tokio_tungstenite::tungstenite::handshake::server::{Request as TRequest, Response as TResponse};
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as TRequest, Response as TResponse,
+    };
 
     let server = spawn_websocket_handler(|websocket| async move {
         // tokio-tungstenite's accept_async always echoes; we don't need the
@@ -96,12 +98,15 @@ async fn server_initiated_close_reaches_client() {
     let server = spawn_websocket_handler(|mut websocket| async move {
         // Send one message then close gracefully.
         let _ = websocket
-            .send(tokio_tungstenite::tungstenite::Message::Text("from server".into()))
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "from server".into(),
+            ))
             .await;
         let _ = websocket
             .send(tokio_tungstenite::tungstenite::Message::Close(Some(
                 tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
                     reason: "server done".into(),
                 },
             )))
@@ -176,7 +181,10 @@ async fn rejects_non_websocket_response() {
 
     let result = client.new_websocket(request).execute().await;
     match result {
-        Err(WebSocketError::Handshake { reason: HandshakeFailure::UnexpectedStatus, .. }) => {}
+        Err(WebSocketError::Handshake {
+            reason: HandshakeFailure::UnexpectedStatus,
+            ..
+        }) => {}
         Err(other) => panic!("expected UnexpectedStatus handshake failure, got {other:?}"),
         Ok(_) => panic!("plain HTTP response must not produce a websocket"),
     }
@@ -191,7 +199,7 @@ async fn handshake_timeout_fires_when_server_silent() {
     let _silent_listener = listener;
 
     let client = Client::builder().build().expect("client");
-    let request = ws_request(&format!("ws://{}/", addr));
+    let request = ws_request(&format!("ws://{addr}/"));
     let result = client
         .new_websocket(request)
         .handshake_timeout(Duration::from_millis(150))

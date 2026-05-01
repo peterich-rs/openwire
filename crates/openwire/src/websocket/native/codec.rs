@@ -34,9 +34,10 @@ impl Opcode {
 /// RFC 6455 §7.4 close codes accepted on the wire. The 1004/1005/1006 codes
 /// are reserved for in-process signaling and must not appear in close frames.
 pub(crate) fn close_code_is_valid(code: u16) -> bool {
-    matches!(code,
-        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011
-        | 3000..=4999)
+    matches!(
+        code,
+        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 3000..=4999
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,7 +197,12 @@ mod encode_tests {
 
     fn encode(opcode: Opcode, payload: &[u8], fin: bool, mask_key: [u8; 4]) -> Vec<u8> {
         let mut out = BytesMut::new();
-        encode_frame(&mut out, FrameHeader { fin, opcode }, payload, Some(mask_key));
+        encode_frame(
+            &mut out,
+            FrameHeader { fin, opcode },
+            payload,
+            Some(mask_key),
+        );
         out.to_vec()
     }
 
@@ -267,8 +273,7 @@ mod decode_tests {
 
     #[test]
     fn rejects_masked_server_frame() {
-        let mut buf =
-            BytesMut::from(&[0x81u8, 0x85, 1, 2, 3, 4, b'h', b'e', b'l', b'l', b'o'][..]);
+        let mut buf = BytesMut::from(&[0x81u8, 0x85, 1, 2, 3, 4, b'h', b'e', b'l', b'l', b'o'][..]);
         let err = decode_frame(&mut buf, 1024).unwrap_err();
         assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
     }
@@ -276,12 +281,9 @@ mod decode_tests {
     #[test]
     fn enforces_max_frame_size() {
         let mut buf = BytesMut::from(&[0x82u8, 126, 0, 200][..]);
-        buf.extend_from_slice(&vec![0u8; 200]);
+        buf.extend_from_slice(&[0u8; 200]);
         let err = decode_frame(&mut buf, 100).unwrap_err();
-        assert!(matches!(
-            err,
-            WebSocketEngineError::PayloadTooLarge { .. }
-        ));
+        assert!(matches!(err, WebSocketEngineError::PayloadTooLarge { .. }));
     }
 
     #[test]
@@ -294,7 +296,7 @@ mod decode_tests {
     #[test]
     fn rejects_oversized_control_frame() {
         let mut buf = BytesMut::from(&[0x89u8, 126, 0, 200][..]);
-        buf.extend_from_slice(&vec![0u8; 200]);
+        buf.extend_from_slice(&[0u8; 200]);
         let err = decode_frame(&mut buf, 1024).unwrap_err();
         assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
     }
