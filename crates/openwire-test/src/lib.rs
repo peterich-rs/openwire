@@ -256,6 +256,70 @@ impl EventListener for RecordingEventListener {
     fn redirect(&self, _ctx: &CallContext, attempt: u32, location: &http::Uri) {
         self.push(format!("redirect {attempt} {location}"));
     }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_open(
+        &self,
+        _ctx: &CallContext,
+        handshake: &openwire_core::websocket::WebSocketHandshake,
+    ) {
+        self.push(format!("websocket_open {}", handshake.status()));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_message_sent(
+        &self,
+        _ctx: &CallContext,
+        kind: openwire_core::websocket::MessageKind,
+        payload_len: usize,
+    ) {
+        self.push(format!("websocket_message_sent {:?} {payload_len}", kind));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_message_received(
+        &self,
+        _ctx: &CallContext,
+        kind: openwire_core::websocket::MessageKind,
+        payload_len: usize,
+    ) {
+        self.push(format!("websocket_message_received {:?} {payload_len}", kind));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_ping_sent(&self, _ctx: &CallContext) {
+        self.push("websocket_ping_sent");
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_pong_received(&self, _ctx: &CallContext) {
+        self.push("websocket_pong_received");
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_closing(
+        &self,
+        _ctx: &CallContext,
+        code: u16,
+        reason: &str,
+        initiator: openwire_core::websocket::CloseInitiator,
+    ) {
+        self.push(format!("websocket_closing {:?} {code} {reason}", initiator));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_closed(&self, _ctx: &CallContext, code: u16, reason: &str) {
+        self.push(format!("websocket_closed {code} {reason}"));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_failed(
+        &self,
+        _ctx: &CallContext,
+        error: &openwire_core::websocket::WebSocketError,
+    ) {
+        self.push(format!("websocket_failed {error}"));
+    }
 }
 
 #[derive(Clone)]

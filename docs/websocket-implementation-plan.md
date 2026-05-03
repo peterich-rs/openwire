@@ -8,7 +8,12 @@
 
 **Tech Stack:** Rust 2021, hyper 1.x, tower 0.5, tokio 1.x, http 1.x, bytes 1.x, base64 0.22, sha1 0.10 (new), thiserror 2.x.
 
-Reference spec: `docs/websocket-design.md` (Status: Proposed). Read it before starting.
+**Implementation status update (2026-05-03):**
+- The instrumentation wrapper and both adapter crates are now implemented in code.
+- v1 does **not** currently follow the `TransportService`-based architecture above end-to-end; the shipping implementation uses the parallel `ConnectorStack` execution path documented in `docs/websocket-design.md`.
+- Treat `docs/websocket-design.md` as the source of truth for current behavior. This plan remains useful as the original task breakdown, especially for the still-unfinished `TransportService` integration work.
+
+Reference spec: `docs/websocket-design.md` (Status: Implemented, with the v1 transport-path divergence called out explicitly). Read it before starting.
 
 ---
 
@@ -2848,7 +2853,7 @@ git commit -m "feat(openwire-tungstenite): WebSocketEngine adapter"
 
 **Files:** mirror Task 30 with `fastwebsockets` instead of `tokio-tungstenite`.
 
-`fastwebsockets` is built around `hyper::upgrade::Upgraded` directly. The adapter is shorter — `fastwebsockets::WebSocket::after_handshake(upgraded, Role::Client)` yields a raw stream; we wrap it in a `FragmentCollector` to get message-level reads.
+Implementation note: the current adapter keeps the uniform `BoxConnection` engine boundary by adapting `BoxConnection -> TokioIo -> fastwebsockets::WebSocket::after_handshake(...).split(tokio::io::split)`. The read half is wrapped in `FragmentCollectorRead`, while `auto_close` and `auto_pong` stay disabled so openwire's own session layer remains responsible for control-frame behavior.
 
 The `BoxConnection` we receive is what was returned from `upgraded_into_box_connection` in Task 17 — but `fastwebsockets` wants `Upgraded` directly. Two options:
 
@@ -2863,12 +2868,12 @@ Choose (b). Performance matters less than API uniformity; users who want maximum
 [dependencies]
 openwire-core = { path = "../openwire-core", features = ["websocket"] }
 openwire-tokio = { path = "../openwire-tokio" }
-fastwebsockets = { version = "0.10", default-features = false }
+fastwebsockets = { version = "0.10", features = ["unstable-split"] }
 futures-util.workspace = true
 bytes.workspace = true
 ```
 
-- [ ] **Step 2: Implement `FastWebSocketsEngine`** — full code, no `todo!()`. The reading path uses `FragmentCollector` to deliver one logical message per `Stream::poll_next`. Map control frames the same way as in tungstenite.
+- [ ] **Step 2: Implement `FastWebSocketsEngine`** — full code, no `todo!()`. The reading path uses `FragmentCollectorRead` over the split read half to deliver one logical message per `Stream::poll_next`. Map control frames the same way as in tungstenite.
 
 - [ ] **Step 3: Run integration tests against this engine; commit**
 

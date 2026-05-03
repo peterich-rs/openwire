@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,10 +7,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use openwire_core::websocket::{
-    BoxEngineSink, BoxEngineStream, CloseInitiator, EngineFrame, Message, MessageKind,
-    WebSocketChannel, WebSocketEngineError, WebSocketError,
+    BoxEngineSink, BoxEngineStream, CloseInitiator, EngineFrame, Message, WebSocketChannel,
+    WebSocketEngineError, WebSocketError,
 };
 use openwire_core::{CallContext, SharedEventListener};
+
+use crate::websocket::instrumented::instrument_channel;
 
 /// Command messages enqueued from `WebSocketSender` (and the heartbeat task)
 /// to the writer task. `Close` carries an oneshot so the caller can await the
@@ -30,18 +32,18 @@ pub(crate) enum WriterCommand {
 /// Drives the engine's outbound `Sink` from the `WriterCommand` channel.
 /// On `Close`, sends the close frame, then waits for `Cancel` from the
 /// reader (peer Close observed) or the timeout, whichever comes first.
-pub(crate) async fn run_writer(
+async fn run_writer(
     mut sink: BoxEngineSink,
     mut commands: mpsc::Receiver<WriterCommand>,
     close_timeout: Duration,
     receiver_tx: mpsc::Sender<Result<Message, WebSocketError>>,
     ctx: Option<CallContext>,
     listener: Option<SharedEventListener>,
+    session: SessionState,
 ) {
     while let Some(cmd) = commands.recv().await {
         match cmd {
             WriterCommand::Send(message) => {
-                emit_message_sent(ctx.as_ref(), listener.as_ref(), &message);
                 if let Err(error) = sink.send(message.into()).await {
                     let mapped = map_engine_error(error);
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
@@ -52,9 +54,6 @@ pub(crate) async fn run_writer(
                 }
             }
             WriterCommand::Ping(payload) => {
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_ping_sent(ctx);
-                }
                 if let Err(error) = sink.send(EngineFrame::Ping(payload)).await {
                     let mapped = map_engine_error(error);
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
@@ -75,6 +74,7 @@ pub(crate) async fn run_writer(
                 }
             }
             WriterCommand::Close { code, reason, ack } => {
+                session.mark_local_close_started();
                 if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                     listener.websocket_closing(ctx, code, &reason, CloseInitiator::Local);
                 }
@@ -91,8 +91,10 @@ pub(crate) async fn run_writer(
                 })
                 .await;
                 let _ = ack.send(());
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
+                if session.try_mark_closed() {
+                    if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                     listener.websocket_closed(ctx, final_code, &final_reason);
+                    }
                 }
                 return;
             }
@@ -104,28 +106,10 @@ pub(crate) async fn run_writer(
     }
 }
 
-fn emit_message_sent(
-    ctx: Option<&CallContext>,
-    listener: Option<&SharedEventListener>,
-    message: &Message,
-) {
-    if let (Some(ctx), Some(listener)) = (ctx, listener) {
-        match message {
-            Message::Text(text) => {
-                listener.websocket_message_sent(ctx, MessageKind::Text, text.len())
-            }
-            Message::Binary(bytes) => {
-                listener.websocket_message_sent(ctx, MessageKind::Binary, bytes.len())
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Drives the engine's inbound `Stream`, forwarding messages to the user's
 /// `WebSocketReceiver` and auto-responding to `Ping` frames. On `Close`,
 /// signals the writer task with `Cancel` so the close handshake can complete.
-pub(crate) async fn run_reader(
+async fn run_reader(
     mut stream: BoxEngineStream,
     deliver_control_frames: bool,
     out: mpsc::Sender<Result<Message, WebSocketError>>,
@@ -133,6 +117,7 @@ pub(crate) async fn run_reader(
     pong_tracker: Option<PongTracker>,
     ctx: Option<CallContext>,
     listener: Option<SharedEventListener>,
+    session: SessionState,
 ) {
     while let Some(item) = stream.next().await {
         match item {
@@ -146,17 +131,15 @@ pub(crate) async fn run_reader(
                 if let Some(tracker) = pong_tracker.as_ref() {
                     tracker.mark();
                 }
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_pong_received(ctx);
-                }
                 if deliver_control_frames {
                     let _ = out.send(Ok(Message::Pong(payload))).await;
                 }
             }
             Ok(EngineFrame::Close { code, reason }) => {
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_closing(ctx, code, &reason, CloseInitiator::Remote);
-                    listener.websocket_closed(ctx, code, &reason);
+                if !session.local_close_started() && session.try_mark_closed() {
+                    if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
+                        listener.websocket_closed(ctx, code, &reason);
+                    }
                 }
                 let _ = out
                     .send(Err(WebSocketError::ClosedByPeer {
@@ -168,15 +151,9 @@ pub(crate) async fn run_reader(
                 return;
             }
             Ok(EngineFrame::Text(text)) => {
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_message_received(ctx, MessageKind::Text, text.len());
-                }
                 let _ = out.send(Ok(Message::Text(text))).await;
             }
             Ok(EngineFrame::Binary(bytes)) => {
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_message_received(ctx, MessageKind::Binary, bytes.len());
-                }
                 let _ = out.send(Ok(Message::Binary(bytes))).await;
             }
             Err(WebSocketEngineError::Io(error)) => {
@@ -238,6 +215,12 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
     let (sender_tx, sender_rx) = mpsc::channel::<WriterCommand>(queue_size);
     let (recv_tx, recv_rx) = mpsc::channel::<Result<Message, WebSocketError>>(queue_size);
     let auto_pong_tx = sender_tx.clone();
+    let session = SessionState::default();
+
+    let channel = match (ctx.clone(), listener.clone()) {
+        (Some(ctx), Some(listener)) => instrument_channel(channel, ctx, listener),
+        _ => channel,
+    };
 
     let pong_tracker = heartbeat.as_ref().map(|_| PongTracker::new());
     let writer_span = tracing::info_span!("websocket_writer");
@@ -248,10 +231,11 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
         let ctx = ctx.clone();
         let listener = listener.clone();
         let recv_tx = recv_tx.clone();
+        let session = session.clone();
         let send = channel.send;
         async move {
             let _enter = span.enter();
-            run_writer(send, sender_rx, close_timeout, recv_tx, ctx, listener).await;
+            run_writer(send, sender_rx, close_timeout, recv_tx, ctx, listener, session).await;
         }
     });
 
@@ -260,6 +244,8 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
         let ctx = ctx.clone();
         let listener = listener.clone();
         let recv = channel.recv;
+        let session = session.clone();
+        let pong_tracker = pong_tracker.clone();
         async move {
             let _enter = span.enter();
             run_reader(
@@ -270,6 +256,7 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
                 pong_tracker,
                 ctx,
                 listener,
+                session,
             )
             .await;
         }
@@ -278,7 +265,7 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
     if let Some(config) = heartbeat {
         let heartbeat_tx = sender_tx.clone();
         let span = tracing::info_span!("websocket_heartbeat");
-        let pong_tracker = PongTracker::new();
+        let pong_tracker = pong_tracker.expect("heartbeat tracker missing");
         tokio::spawn(async move {
             let _enter = span.enter();
             run_heartbeat(
@@ -301,6 +288,26 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
 pub(crate) struct HeartbeatConfig {
     pub interval: Duration,
     pub pong_timeout: Duration,
+}
+
+#[derive(Clone, Default)]
+struct SessionState {
+    local_close_started: Arc<AtomicBool>,
+    closed_emitted: Arc<AtomicBool>,
+}
+
+impl SessionState {
+    fn mark_local_close_started(&self) {
+        self.local_close_started.store(true, Ordering::Release);
+    }
+
+    fn local_close_started(&self) -> bool {
+        self.local_close_started.load(Ordering::Acquire)
+    }
+
+    fn try_mark_closed(&self) -> bool {
+        !self.closed_emitted.swap(true, Ordering::AcqRel)
+    }
 }
 
 #[derive(Clone)]
@@ -415,6 +422,7 @@ mod tests {
             recv_tx,
             None,
             None,
+            SessionState::default(),
         ));
 
         cmd_tx
@@ -443,6 +451,7 @@ mod tests {
             recv_tx,
             None,
             None,
+            SessionState::default(),
         ));
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -482,6 +491,7 @@ mod tests {
             recv_tx,
             None,
             None,
+            SessionState::default(),
         ));
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx

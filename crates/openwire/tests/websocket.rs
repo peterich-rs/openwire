@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::Method;
 use openwire::{Client, RequestBody};
 use openwire_core::websocket::{HandshakeFailure, Message, WebSocketError};
-use openwire_test::{spawn_websocket_echo, spawn_websocket_handler};
+use openwire_test::{spawn_websocket_echo, spawn_websocket_handler, RecordingEventListenerFactory};
 
 fn ws_request(uri: &str) -> http::Request<RequestBody> {
     http::Request::builder()
@@ -150,6 +150,50 @@ async fn client_initiated_close_completes() {
     let sender = ws.sender();
     sender.close(1000, "client done").await.expect("close");
     assert!(sender.is_closed());
+}
+
+#[tokio::test]
+async fn event_listener_records_websocket_lifecycle_once() {
+    let server = spawn_websocket_echo().await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = ws_request(&format!("ws://{}/", server.addr()));
+
+    let ws = client
+        .new_websocket(request)
+        .execute()
+        .await
+        .expect("ws established");
+    let (sender, mut receiver) = ws.split();
+
+    sender.send_text("hello").await.expect("send");
+    let first = receiver.next().await.expect("first frame").expect("ok");
+    assert!(matches!(first, Message::Text(text) if text == "hello"));
+
+    sender.close(1000, "bye").await.expect("close");
+
+    let events = events.events();
+    assert!(events.iter().any(|event| event == "websocket_open 101 Switching Protocols"));
+    assert!(events
+        .iter()
+        .any(|event| event == "websocket_message_sent Text 5"));
+    assert!(events
+        .iter()
+        .any(|event| event == "websocket_message_received Text 5"));
+    assert!(events
+        .iter()
+        .any(|event| event == "websocket_closing Local 1000 bye"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("websocket_closed "))
+            .count(),
+        1,
+        "websocket_closed should fire exactly once: {events:?}"
+    );
 }
 
 #[tokio::test]
