@@ -176,7 +176,9 @@ async fn event_listener_records_websocket_lifecycle_once() {
     sender.close(1000, "bye").await.expect("close");
 
     let events = events.events();
-    assert!(events.iter().any(|event| event == "websocket_open 101 Switching Protocols"));
+    assert!(events
+        .iter()
+        .any(|event| event == "websocket_open 101 Switching Protocols"));
     assert!(events
         .iter()
         .any(|event| event == "websocket_message_sent Text 5"));

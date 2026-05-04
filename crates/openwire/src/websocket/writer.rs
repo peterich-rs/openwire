@@ -93,7 +93,7 @@ async fn run_writer(
                 let _ = ack.send(());
                 if session.try_mark_closed() {
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_closed(ctx, final_code, &final_reason);
+                        listener.websocket_closed(ctx, final_code, &final_reason);
                     }
                 }
                 return;
@@ -235,7 +235,16 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
         let send = channel.send;
         async move {
             let _enter = span.enter();
-            run_writer(send, sender_rx, close_timeout, recv_tx, ctx, listener, session).await;
+            run_writer(
+                send,
+                sender_rx,
+                close_timeout,
+                recv_tx,
+                ctx,
+                listener,
+                session,
+            )
+            .await;
         }
     });
 

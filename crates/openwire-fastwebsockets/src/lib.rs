@@ -69,7 +69,8 @@ impl WebSocketEngine for FastWebSocketsEngine {
         Box::pin(async move {
             validate_config(&config)?;
 
-            let websocket = fastwebsockets::WebSocket::after_handshake(TokioIo::new(io), FastRole::Client);
+            let websocket =
+                fastwebsockets::WebSocket::after_handshake(TokioIo::new(io), FastRole::Client);
             let (mut read, write) = websocket.split(tokio::io::split);
             read.set_auto_close(false);
             read.set_auto_pong(false);
@@ -91,7 +92,11 @@ fn validate_config(config: &WebSocketEngineConfig) -> Result<(), WebSocketEngine
             "fastwebsockets engine only supports client role".into(),
         ));
     }
-    if config.extensions.iter().any(|extension| !extension.is_empty()) {
+    if config
+        .extensions
+        .iter()
+        .any(|extension| !extension.is_empty())
+    {
         return Err(WebSocketEngineError::UnsupportedExtension(
             config.extensions.join(", "),
         ));
@@ -129,7 +134,10 @@ where
                 let inner = Arc::clone(&self.inner);
                 self.write_fut = Some(Box::pin(async move {
                     let mut writer = inner.lock_owned().await;
-                    writer.write_frame(engine_to_fast(frame)).await.map_err(map_error)
+                    writer
+                        .write_frame(engine_to_fast(frame))
+                        .await
+                        .map_err(map_error)
                 }));
             }
         }
@@ -176,10 +184,7 @@ where
 {
     type Error = WebSocketEngineError;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.as_mut().get_mut().poll_pending(cx)
     }
 
@@ -192,10 +197,7 @@ where
         Ok(())
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let me = self.as_mut().get_mut();
         match me.poll_pending(cx) {
             Poll::Pending => Poll::Pending,
@@ -207,10 +209,7 @@ where
         }
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.as_mut().poll_flush(cx)
     }
 }
@@ -333,7 +332,10 @@ fn map_error(error: FastWebSocketError) -> WebSocketEngineError {
     map_error_with_limit(error, 0)
 }
 
-fn map_error_with_limit(error: FastWebSocketError, max_message_size: usize) -> WebSocketEngineError {
+fn map_error_with_limit(
+    error: FastWebSocketError,
+    max_message_size: usize,
+) -> WebSocketEngineError {
     match error {
         FastWebSocketError::IoError(io) => protocol_io_error("fastwebsockets IO error", io),
         FastWebSocketError::InvalidUTF8 => WebSocketEngineError::InvalidUtf8,
@@ -349,11 +351,12 @@ fn map_error_with_limit(error: FastWebSocketError, max_message_size: usize) -> W
     }
 }
 
-fn protocol_io_error(
-    message: &'static str,
-    error: std::io::Error,
-) -> WebSocketEngineError {
-    WebSocketEngineError::Io(WireError::with_source(WireErrorKind::Protocol, message, error))
+fn protocol_io_error(message: &'static str, error: std::io::Error) -> WebSocketEngineError {
+    WebSocketEngineError::Io(WireError::with_source(
+        WireErrorKind::Protocol,
+        message,
+        error,
+    ))
 }
 
 fn closed_sink_error(message: &'static str) -> WebSocketEngineError {

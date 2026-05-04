@@ -283,7 +283,10 @@ impl EventListener for RecordingEventListener {
         kind: openwire_core::websocket::MessageKind,
         payload_len: usize,
     ) {
-        self.push(format!("websocket_message_received {:?} {payload_len}", kind));
+        self.push(format!(
+            "websocket_message_received {:?} {payload_len}",
+            kind
+        ));
     }
 
     #[cfg(feature = "websocket")]
