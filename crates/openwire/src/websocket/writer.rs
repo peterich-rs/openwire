@@ -106,19 +106,32 @@ async fn run_writer(
     }
 }
 
-/// Drives the engine's inbound `Stream`, forwarding messages to the user's
-/// `WebSocketReceiver` and auto-responding to `Ping` frames. On `Close`,
-/// signals the writer task with `Cancel` so the close handshake can complete.
-async fn run_reader(
-    mut stream: BoxEngineStream,
-    deliver_control_frames: bool,
+struct ReaderRuntime {
     out: mpsc::Sender<Result<Message, WebSocketError>>,
     auto_pong: mpsc::Sender<WriterCommand>,
     pong_tracker: Option<PongTracker>,
     ctx: Option<CallContext>,
     listener: Option<SharedEventListener>,
     session: SessionState,
+}
+
+/// Drives the engine's inbound `Stream`, forwarding messages to the user's
+/// `WebSocketReceiver` and auto-responding to `Ping` frames. On `Close`,
+/// signals the writer task with `Cancel` so the close handshake can complete.
+async fn run_reader(
+    mut stream: BoxEngineStream,
+    deliver_control_frames: bool,
+    runtime: ReaderRuntime,
 ) {
+    let ReaderRuntime {
+        out,
+        auto_pong,
+        pong_tracker,
+        ctx,
+        listener,
+        session,
+    } = runtime;
+
     while let Some(item) = stream.next().await {
         match item {
             Ok(EngineFrame::Ping(payload)) => {
@@ -260,12 +273,14 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
             run_reader(
                 recv,
                 deliver_control_frames,
-                recv_tx,
-                auto_pong_tx,
-                pong_tracker,
-                ctx,
-                listener,
-                session,
+                ReaderRuntime {
+                    out: recv_tx,
+                    auto_pong: auto_pong_tx,
+                    pong_tracker,
+                    ctx,
+                    listener,
+                    session,
+                },
             )
             .await;
         }

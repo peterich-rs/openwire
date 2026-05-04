@@ -298,9 +298,9 @@ fn response_body_decision(
                 len, config.max_body_bytes
             )));
         }
-        return ResponseBodyDecision::Buffer;
+        ResponseBodyDecision::Buffer
     } else {
-        return ResponseBodyDecision::Omit(BodyPreview::omitted(STREAMING_BODY_MESSAGE));
+        ResponseBodyDecision::Omit(BodyPreview::omitted(STREAMING_BODY_MESSAGE))
     }
 }
 
