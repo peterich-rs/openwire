@@ -3,6 +3,7 @@ mod bridge;
 mod client;
 mod connection;
 mod cookie;
+mod logging;
 mod policy;
 mod proxy;
 mod sync_util;
@@ -19,6 +20,7 @@ pub use connection::{
     TlsIdentity, UriScheme,
 };
 pub use cookie::Jar;
+pub use logging::{HttpLogger, LogLevel, LoggerInterceptor, StderrLogger};
 pub use openwire_core::{
     AuthContext, AuthKind, Authenticator, BoxFuture, BoxTaskHandle, CallContext, CallId, Connected,
     Connection, ConnectionId, ConnectionInfo, CookieJar, DnsResolver, EstablishmentStage,

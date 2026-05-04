@@ -3,6 +3,7 @@ members = [
     "crates/openwire",
     "crates/openwire-cache",
     "crates/openwire-core",
+    "crates/openwire-fastwebsockets",
     "crates/openwire-tokio",
     "crates/openwire-rustls",
     "crates/openwire-test",
@@ -22,6 +23,7 @@ rust-version = "1.80"
 async-trait = "0.1.89"
 base64 = "0.22"
 bytes = "1.10.1"
+fastwebsockets = { version = "0.10", features = ["unstable-split"] }
 futures-channel = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"

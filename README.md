@@ -16,6 +16,7 @@ blocks, and stable observability hooks.
 - `Client`, `ClientBuilder`, and one-shot `Call` over `http::Request<RequestBody>`
 - request-scoped timeout, retry, and redirect overrides through `Call`
 - application and network interceptors
+- built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
@@ -81,6 +82,41 @@ let response = client
 
 These per-request retry and redirect overrides target the built-in scalar policy
 knobs. Custom `RetryPolicy` and `RedirectPolicy` objects remain client-scoped.
+
+## HTTP Logging
+
+OpenWire includes an OkHttp-style `LoggerInterceptor` that can be attached as an
+application interceptor for logical-call logging or as a network interceptor for
+post-normalization, per-attempt wire logging:
+
+```rust
+use http::Request;
+use openwire::{Client, LogLevel, LoggerInterceptor, RequestBody};
+
+let client = Client::builder()
+  .application_interceptor(LoggerInterceptor::new(LogLevel::Body))
+  .build()?;
+
+let request = Request::builder()
+  .method("POST")
+  .uri("https://api.example.com/users")
+  .header("content-type", "application/json")
+  .header("authorization", "Bearer secret")
+  .body(RequestBody::from_static(br#"{"name":"Alice","age":18}"#))?;
+
+let response = client.execute(request).await?;
+println!("status = {}", response.status());
+```
+
+`LogLevel::Body` pretty-prints JSON with `serde_json::to_writer_pretty`, redacts
+`Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` by default,
+and only buffers bodies when they are replayable and bounded. Streaming request
+bodies, chunked responses, SSE, upgraded protocols, and oversized bodies are
+logged as omitted placeholders instead of being fully drained into memory.
+
+The WebSocket path still bypasses the interceptor chain today, so
+`LoggerInterceptor` covers HTTP calls made through `Client::execute(...)` /
+`Call::execute()` rather than `Client::new_websocket(...)`.
 
 Proxy routing is configured through a selector so the active proxy can change at
 execution time. A selector can return multiple candidates for one request; the

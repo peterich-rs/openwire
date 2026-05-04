@@ -465,6 +465,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastwebsockets"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "305d3ba574508e27190906d11707dad683e0494e6b85eae9b044cb2734a5e422"
+dependencies = [
+ "bytes",
+ "rand",
+ "simdutf8",
+ "thiserror 1.0.69",
+ "tokio",
+ "utf-8",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1107,6 +1121,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openwire-fastwebsockets"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fastwebsockets",
+ "futures-util",
+ "http",
+ "openwire",
+ "openwire-core",
+ "openwire-test",
+ "openwire-tokio",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "openwire-rustls"
 version = "0.1.0"
 dependencies = [
@@ -1655,6 +1685,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "slab"

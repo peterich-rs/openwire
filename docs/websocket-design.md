@@ -279,8 +279,9 @@ The engine is **not** responsible for:
 Adapter crates follow the `openwire-rustls` / `openwire-tokio` pattern:
 separate workspace crate, one trait impl, no public surface beyond the engine
 type and a default constructor. Users who want them run
-`cargo add openwire-tungstenite` and call
-`ClientBuilder::websocket_engine(Arc::new(TungsteniteEngine::default()))`.
+`cargo add openwire-tungstenite` or `cargo add openwire-fastwebsockets` and call
+`ClientBuilder::websocket_engine(Arc::new(TungsteniteEngine::default()))` or
+`ClientBuilder::websocket_engine(Arc::new(FastWebSocketsEngine::default()))`.
 
 `NativeEngine` is the v1 in-house implementation, scoped per §4.6. It has zero
 new third-party dependencies — all I/O goes through `BoxConnection`, framing
