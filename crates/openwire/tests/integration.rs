@@ -23,16 +23,16 @@ use openwire::{
     ResponseBody, RetryContext, RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector,
     TaskHandle, TcpConnector, TlsConnector, Url, WireError, WireErrorKind,
 };
+#[cfg(feature = "websocket")]
+use openwire_core::websocket::Message as WebSocketMessage;
 use openwire_core::BoxConnection;
 use openwire_core::WireExecutor;
 #[cfg(feature = "websocket")]
-use openwire_core::websocket::Message as WebSocketMessage;
+use openwire_test::spawn_wss_echo_with_alpn;
 use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
     RecordingEventListenerFactory, StaticDnsResolver,
 };
-#[cfg(feature = "websocket")]
-use openwire_test::spawn_wss_echo_with_alpn;
 use openwire_tokio::TokioTcpConnector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -3523,16 +3523,15 @@ async fn websocket_tls_uses_http11_alpn_when_server_prefers_h2() {
         .execute()
         .await
         .expect("websocket handshake");
-    assert_eq!(websocket.handshake().status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        websocket.handshake().status(),
+        StatusCode::SWITCHING_PROTOCOLS
+    );
 
     let (sender, mut receiver) = websocket.split();
     sender.send_text("hello over wss").await.expect("send text");
 
-    let message = receiver
-        .next()
-        .await
-        .expect("echo frame")
-        .expect("echo ok");
+    let message = receiver.next().await.expect("echo frame").expect("echo ok");
     match message {
         WebSocketMessage::Text(text) => assert_eq!(text, "hello over wss"),
         other => panic!("expected text echo, got {other:?}"),

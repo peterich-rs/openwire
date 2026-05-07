@@ -475,8 +475,7 @@ mod websocket {
     /// Spawn a WebSocket server that echoes every Text/Binary message back to
     /// the client. Pings/pongs are handled by tokio-tungstenite.
     pub async fn spawn_websocket_echo() -> TestServer {
-        spawn_websocket_handler(|websocket| async move { echo_messages(websocket).await })
-        .await
+        spawn_websocket_handler(|websocket| async move { echo_messages(websocket).await }).await
     }
 
     /// Spawn a secure WebSocket echo server with a caller-specified TLS ALPN
