@@ -140,6 +140,18 @@ impl TcpConnectRequest {
     }
 }
 
+/// Per-call hint for how a TLS connector should advertise ALPN.
+///
+/// `Auto` leaves protocol selection to the connector's default behavior.
+/// `Http1Only` is used by WebSocket-over-TLS calls, which must complete an
+/// HTTP/1.1 upgrade handshake and therefore must not negotiate HTTP/2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsAlpnPreference {
+    #[default]
+    Auto,
+    Http1Only,
+}
+
 pub struct TlsConnectRequest {
     pub ctx: CallContext,
     pub uri: Uri,

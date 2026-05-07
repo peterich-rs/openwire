@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{SharedEventListener, SharedEventListenerFactory};
+use crate::{SharedEventListener, SharedEventListenerFactory, TlsAlpnPreference};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -53,6 +53,7 @@ struct CallContextInner {
     created_at: Instant,
     deadline: Option<Instant>,
     connection_established: AtomicBool,
+    tls_alpn_preference: TlsAlpnPreference,
 }
 
 impl std::fmt::Debug for CallContext {
@@ -61,12 +62,21 @@ impl std::fmt::Debug for CallContext {
             .field("call_id", &self.call_id())
             .field("created_at", &self.created_at())
             .field("deadline", &self.deadline())
+            .field("tls_alpn_preference", &self.tls_alpn_preference())
             .finish()
     }
 }
 
 impl CallContext {
     pub fn new(listener: SharedEventListener, deadline: Option<Duration>) -> Self {
+        Self::with_tls_alpn_preference(listener, deadline, TlsAlpnPreference::Auto)
+    }
+
+    fn with_tls_alpn_preference(
+        listener: SharedEventListener,
+        deadline: Option<Duration>,
+        tls_alpn_preference: TlsAlpnPreference,
+    ) -> Self {
         let created_at = Instant::now();
         let deadline = deadline.map(|duration| created_at + duration);
         Self {
@@ -76,6 +86,7 @@ impl CallContext {
                 created_at,
                 deadline,
                 connection_established: AtomicBool::new(false),
+                tls_alpn_preference,
             }),
         }
     }
@@ -86,7 +97,12 @@ impl CallContext {
         deadline: Option<Duration>,
     ) -> Self {
         let listener = factory.create(request);
-        Self::new(listener, deadline)
+        let tls_alpn_preference = request
+            .extensions()
+            .get::<TlsAlpnPreference>()
+            .copied()
+            .unwrap_or_default();
+        Self::with_tls_alpn_preference(listener, deadline, tls_alpn_preference)
     }
 
     pub fn call_id(&self) -> CallId {
@@ -105,6 +121,10 @@ impl CallContext {
         self.inner.deadline
     }
 
+    pub fn tls_alpn_preference(&self) -> TlsAlpnPreference {
+        self.inner.tls_alpn_preference
+    }
+
     pub fn mark_connection_established(&self) {
         self.inner
             .connection_established
@@ -113,5 +133,42 @@ impl CallContext {
 
     pub fn connection_established(&self) -> bool {
         self.inner.connection_established.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{NoopEventListenerFactory, RequestBody, SharedEventListenerFactory};
+
+    #[test]
+    fn from_factory_defaults_tls_alpn_preference_to_auto() {
+        let factory = Arc::new(NoopEventListenerFactory) as SharedEventListenerFactory;
+        let request = http::Request::builder()
+            .uri("https://example.com/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let ctx = CallContext::from_factory(&factory, &request, None);
+
+        assert_eq!(ctx.tls_alpn_preference(), TlsAlpnPreference::Auto);
+    }
+
+    #[test]
+    fn from_factory_preserves_tls_alpn_preference_from_request_extensions() {
+        let factory = Arc::new(NoopEventListenerFactory) as SharedEventListenerFactory;
+        let mut request = http::Request::builder()
+            .uri("https://example.com/")
+            .body(RequestBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(TlsAlpnPreference::Http1Only);
+
+        let ctx = CallContext::from_factory(&factory, &request, None);
+
+        assert_eq!(ctx.tls_alpn_preference(), TlsAlpnPreference::Http1Only);
     }
 }

@@ -4,7 +4,7 @@ use http::{HeaderValue, Request, Uri, Version};
 use sha1::{Digest, Sha1};
 
 use openwire_core::websocket::HandshakeFailure;
-use openwire_core::{RequestBody, WireError};
+use openwire_core::{RequestBody, TlsAlpnPreference, WireError};
 
 use crate::connection::RoutePreference;
 
@@ -78,6 +78,9 @@ pub(crate) fn inject_handshake(request: &mut Request<RequestBody>) -> Result<(),
     }
 
     *request.version_mut() = Version::HTTP_11;
+    request
+        .extensions_mut()
+        .insert(TlsAlpnPreference::Http1Only);
     request.extensions_mut().insert(RoutePreference::Http1Only);
 
     Ok(())

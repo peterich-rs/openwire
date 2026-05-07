@@ -27,7 +27,7 @@ pub use openwire_core::{
     EventListener, EventListenerFactory, Exchange, HyperExecutor, Interceptor, Next,
     NoopEventListener, NoopEventListenerFactory, RedirectContext, RedirectDecision, RedirectPolicy,
     RequestBody, ResponseBody, RetryContext, RetryPolicy, SharedTimer, TaskHandle, TcpConnector,
-    TlsConnector, WireError, WireErrorKind, WireExecutor,
+    TlsAlpnPreference, TlsConnector, WireError, WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

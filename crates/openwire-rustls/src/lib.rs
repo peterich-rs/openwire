@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use hyper::Uri;
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, CoalescingInfo, Connected, Connection, ConnectionInfo,
-    ConnectionIo, TlsConnector, WireError,
+    ConnectionIo, TlsAlpnPreference, TlsConnector, WireError,
 };
 use openwire_tokio::TokioIo;
 use pin_project_lite::pin_project;
@@ -81,6 +81,13 @@ impl RustlsTlsConnectorBuilder {
 
         #[cfg(feature = "platform-verifier")]
         if self.custom_roots.is_empty() && self.use_platform_verifier {
+            tracing::info!(
+                target: "openwire::tls",
+                tls_backend = "rustls",
+                verifier_backend = "platform-verifier",
+                target_os = std::env::consts::OS,
+                "configured openwire TLS verifier"
+            );
             let mut config = ClientConfig::builder()
                 .with_platform_verifier()
                 .map_err(|error| WireError::tls("failed to initialize platform verifier", error))?
@@ -119,6 +126,15 @@ impl RustlsTlsConnectorBuilder {
             ));
         }
 
+        tracing::info!(
+            target: "openwire::tls",
+            tls_backend = "rustls",
+            verifier_backend = "native-root-store",
+            target_os = std::env::consts::OS,
+            custom_root_count = roots.len(),
+            "configured openwire TLS verifier"
+        );
+
         let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -130,6 +146,20 @@ impl RustlsTlsConnectorBuilder {
 fn ensure_default_http_alpn(config: &mut ClientConfig) {
     if config.alpn_protocols.is_empty() {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
+}
+
+fn config_for_alpn_preference(
+    config: &Arc<ClientConfig>,
+    preference: TlsAlpnPreference,
+) -> Arc<ClientConfig> {
+    match preference {
+        TlsAlpnPreference::Auto => config.clone(),
+        TlsAlpnPreference::Http1Only => {
+            let mut config = (**config).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(config)
+        }
     }
 }
 
@@ -158,6 +188,7 @@ impl TlsConnector for RustlsTlsConnector {
                 .with_authority_from_uri(&uri)
             })?;
             let connection_info = connection_info_from_stream(&*stream);
+            let config = config_for_alpn_preference(&config, ctx.tls_alpn_preference());
             let connector = tokio_rustls::TlsConnector::from(config);
 
             let tls_stream = match connector.connect(server_name, TokioIo::new(stream)).await {
@@ -352,6 +383,34 @@ mod tests {
     }
 
     #[test]
+    fn config_for_auto_reuses_existing_config() {
+        let config = Arc::new(test_client_config_with_alpn(vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ]));
+
+        let derived = config_for_alpn_preference(&config, TlsAlpnPreference::Auto);
+
+        assert!(Arc::ptr_eq(&config, &derived));
+    }
+
+    #[test]
+    fn config_for_http1_only_overrides_existing_alpn_configuration() {
+        let config = Arc::new(test_client_config_with_alpn(vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ]));
+
+        let derived = config_for_alpn_preference(&config, TlsAlpnPreference::Http1Only);
+
+        assert_eq!(derived.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
     fn build_connected_preserves_inner_proxy_flag() {
         let info = test_connection_info();
         let coalescing = CoalescingInfo::new(vec!["example.com".to_owned()]);
@@ -399,6 +458,15 @@ mod tests {
             local_addr: Some(([192, 0, 2, 20], 50000).into()),
             tls: true,
         }
+    }
+
+    fn test_client_config_with_alpn(alpn_protocols: Vec<Vec<u8>>) -> ClientConfig {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoopVerifier))
+            .with_no_client_auth();
+        config.alpn_protocols = alpn_protocols;
+        config
     }
 
     #[derive(Debug)]
