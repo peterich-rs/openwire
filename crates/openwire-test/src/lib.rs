@@ -438,7 +438,7 @@ enum TestProtocol {
 }
 
 #[cfg(feature = "websocket")]
-pub use websocket::{spawn_websocket_echo, spawn_websocket_handler};
+pub use websocket::{spawn_websocket_echo, spawn_websocket_handler, spawn_wss_echo_with_alpn};
 
 #[cfg(feature = "websocket")]
 mod websocket {
@@ -446,31 +446,79 @@ mod websocket {
     use std::sync::Arc;
 
     use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message as TungMessage;
 
     use super::TestServer;
 
+    async fn echo_messages<S>(mut websocket: tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        while let Some(message) = websocket.next().await {
+            let Ok(message) = message else {
+                return;
+            };
+            let echo = match message {
+                TungMessage::Close(_) => return,
+                msg @ (TungMessage::Text(_) | TungMessage::Binary(_)) => msg,
+                _ => continue,
+            };
+            if websocket.send(echo).await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Spawn a WebSocket server that echoes every Text/Binary message back to
     /// the client. Pings/pongs are handled by tokio-tungstenite.
     pub async fn spawn_websocket_echo() -> TestServer {
-        spawn_websocket_handler(|mut websocket| async move {
-            while let Some(message) = websocket.next().await {
-                let Ok(message) = message else {
-                    return;
-                };
-                let echo = match message {
-                    TungMessage::Close(_) => return,
-                    msg @ (TungMessage::Text(_) | TungMessage::Binary(_)) => msg,
-                    _ => continue,
-                };
-                if websocket.send(echo).await.is_err() {
-                    return;
+        spawn_websocket_handler(|websocket| async move { echo_messages(websocket).await }).await
+    }
+
+    /// Spawn a secure WebSocket echo server with a caller-specified TLS ALPN
+    /// preference list.
+    pub async fn spawn_wss_echo_with_alpn(alpn_protocols: Vec<Vec<u8>>) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wss test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (tls_acceptor, tls_root_pem) =
+            super::tls_acceptor_with_alpn_and_hosts(alpn_protocols, &["localhost"]);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _peer)) = accepted else { break; };
+                        let tls_acceptor = tls_acceptor.clone();
+                        tokio::spawn(async move {
+                            let tls_stream = match tls_acceptor.accept(stream).await {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    tracing::debug!(?error, "wss tls handshake failed");
+                                    return;
+                                }
+                            };
+                            match tokio_tungstenite::accept_async(tls_stream).await {
+                                Ok(websocket) => echo_messages(websocket).await,
+                                Err(error) => tracing::debug!(?error, "wss handshake failed"),
+                            }
+                        });
+                    }
                 }
             }
-        })
-        .await
+        });
+
+        TestServer {
+            addr,
+            shutdown: Some(shutdown_tx),
+            tls_root_pem: Some(tls_root_pem),
+        }
     }
 
     /// Spawn a custom WebSocket handler. The handler receives the upgraded

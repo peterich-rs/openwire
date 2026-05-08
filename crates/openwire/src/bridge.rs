@@ -147,6 +147,7 @@ mod tests {
     fn injects_websocket_handshake_headers() {
         use crate::websocket::handshake::WebSocketRequestMarker;
         use http::Method;
+        use openwire_core::TlsAlpnPreference;
 
         let mut request: Request<crate::RequestBody> = Request::builder()
             .method(Method::GET)
@@ -178,6 +179,10 @@ mod tests {
             .get::<WebSocketRequestMarker>()
             .expect("marker preserved");
         assert!(!marker.expected_accept.is_empty());
+        assert_eq!(
+            request.extensions().get::<TlsAlpnPreference>(),
+            Some(&TlsAlpnPreference::Http1Only)
+        );
     }
 
     #[cfg(feature = "websocket")]
