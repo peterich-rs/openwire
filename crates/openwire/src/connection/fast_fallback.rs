@@ -22,6 +22,52 @@ use super::{
 
 static NEXT_CONNECT_RACE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug)]
+struct RouteTaskLifecycle {
+    call_id: u64,
+    race_id: u64,
+    route_index: usize,
+    route_count: usize,
+    stage: &'static str,
+    outcome: Option<&'static str>,
+}
+
+impl RouteTaskLifecycle {
+    fn new(call_id: u64, race_id: u64, route_index: usize, route_count: usize) -> Self {
+        Self {
+            call_id,
+            race_id,
+            route_index,
+            route_count,
+            stage: "scheduled",
+            outcome: None,
+        }
+    }
+
+    fn set_stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+    }
+
+    fn set_outcome(&mut self, outcome: &'static str) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl Drop for RouteTaskLifecycle {
+    fn drop(&mut self) {
+        if self.outcome.is_none() {
+            tracing::warn!(
+                call_id = self.call_id,
+                connect_race_id = self.race_id,
+                route_index = self.route_index,
+                route_count = self.route_count,
+                stage = self.stage,
+                "fast fallback route task dropped before reporting result"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FastFallbackOutcome {
     pub(crate) race_id: u64,
@@ -125,9 +171,12 @@ impl FastFallbackDialer {
             let timer = runtime.timer.clone();
             let (abort, abort_registration) = AbortHandle::new_pair();
             let future = async move {
-                let _ = Abortable::new(
-                    async move {
+                let mut task_lifecycle =
+                    RouteTaskLifecycle::new(ctx.call_id().as_u64(), race_id, index, route_count);
+                let abort_result = Abortable::new(
+                    async {
                         if attempt.scheduled_after() > Duration::ZERO {
+                            task_lifecycle.set_stage("delay");
                             timer.sleep(attempt.scheduled_after()).await;
                         }
                         let route_family = route_family_label(attempt.route().family());
@@ -149,12 +198,15 @@ impl FastFallbackDialer {
                         }
 
                         let route = attempt.route().clone();
+                        task_lifecycle.set_stage("connect");
                         let result = match connect(ctx.clone(), route.clone()).await {
                             Ok(intermediate) => {
+                                task_lifecycle.set_stage("finalize");
                                 finalize(ctx.clone(), uri, route, intermediate).await
                             }
                             Err(error) => Err(error),
                         };
+                        task_lifecycle.set_stage("report");
                         if tx
                             .unbounded_send(FastFallbackMessage::Finished {
                                 route_index: index,
@@ -162,17 +214,50 @@ impl FastFallbackDialer {
                             })
                             .is_err()
                         {
+                            task_lifecycle.set_outcome("receiver_closed");
+                            tracing::warn!(
+                                call_id = ctx.call_id().as_u64(),
+                                connect_race_id = race_id,
+                                route_index = index,
+                                route_count,
+                                stage = task_lifecycle.stage,
+                                "fast fallback route task finished after dialer receiver closed",
+                            );
                             tracing::debug!(
                                 call_id = ctx.call_id().as_u64(),
                                 connect_race_id = race_id,
                                 route_index = index,
                                 "fast fallback finish event dropped because receiver was closed",
                             );
+                        } else {
+                            task_lifecycle.set_outcome("reported");
                         }
                     },
                     abort_registration,
                 )
                 .await;
+                if abort_result.is_err() {
+                    task_lifecycle.set_outcome("aborted");
+                    if route_count == 1 {
+                        tracing::warn!(
+                            call_id = ctx.call_id().as_u64(),
+                            connect_race_id = race_id,
+                            route_index = index,
+                            route_count,
+                            stage = task_lifecycle.stage,
+                            "fast fallback single-route task aborted before reporting result",
+                        );
+                    } else {
+                        tracing::debug!(
+                            call_id = ctx.call_id().as_u64(),
+                            connect_race_id = race_id,
+                            route_index = index,
+                            route_count,
+                            stage = task_lifecycle.stage,
+                            "fast fallback route task aborted",
+                        );
+                    }
+                }
             };
             if let Err(error) = runtime
                 .executor
