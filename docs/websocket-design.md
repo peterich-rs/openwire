@@ -389,7 +389,8 @@ After the network interceptors deliver a response, the WebSocket transport
 branch verifies:
 
 - `status == 101 Switching Protocols`
-- `Connection` includes `upgrade` (case-insensitive, comma-list aware)
+- `Connection` includes `upgrade` (case-insensitive, comma-list aware across
+  one or more `Connection` field lines)
 - `Upgrade` is `websocket` (case-insensitive)
 - `Sec-WebSocket-Accept` equals the value recorded in `CallContext`
 - No `Sec-WebSocket-Extensions`; v1 does not negotiate extensions, so any

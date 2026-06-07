@@ -122,14 +122,7 @@ pub(crate) fn validate_handshake_response<B>(
         return Err(HandshakeFailure::MissingUpgrade);
     }
 
-    let connection = headers
-        .get("connection")
-        .ok_or(HandshakeFailure::MissingConnection)?;
-    let connection_lc = connection.to_str().unwrap_or("").to_ascii_lowercase();
-    if !connection_lc
-        .split(',')
-        .any(|token| token.trim() == "upgrade")
-    {
+    if !connection_has_upgrade(headers) {
         return Err(HandshakeFailure::MissingConnection);
     }
 
@@ -167,6 +160,15 @@ pub(crate) fn validate_handshake_response<B>(
     Ok(ValidatedHandshake {
         subprotocol,
         extensions: Vec::new(),
+    })
+}
+
+fn connection_has_upgrade(headers: &HeaderMap) -> bool {
+    headers.get_all("connection").iter().any(|value| {
+        value.to_str().is_ok_and(|raw| {
+            raw.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
     })
 }
 
@@ -268,6 +270,31 @@ mod response_tests {
         response.headers_mut().remove("connection");
         let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
         assert!(matches!(err, HandshakeFailure::MissingConnection));
+    }
+
+    #[test]
+    fn accepts_upgrade_token_across_multiple_connection_fields() {
+        let mut response = ok_response("expected");
+        response.headers_mut().remove("connection");
+        response
+            .headers_mut()
+            .append("connection", HeaderValue::from_static("keep-alive"));
+        response
+            .headers_mut()
+            .append("connection", HeaderValue::from_static("Upgrade"));
+
+        assert!(validate_handshake_response(&response, "expected", &[]).is_ok());
+    }
+
+    #[test]
+    fn accepts_upgrade_token_inside_connection_comma_list() {
+        let mut response = ok_response("expected");
+        response.headers_mut().insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, UpGrAdE"),
+        );
+
+        assert!(validate_handshake_response(&response, "expected", &[]).is_ok());
     }
 
     #[test]
