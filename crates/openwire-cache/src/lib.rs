@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{
     AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, DATE, ETAG, EXPIRES,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, SET_COOKIE, TRANSFER_ENCODING, VARY,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, PRAGMA, SET_COOKIE, TRANSFER_ENCODING, VARY,
 };
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
@@ -260,7 +260,7 @@ struct CacheDirective {
 }
 
 fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
-    let directives = CacheDirectives::from_headers(request.headers());
+    let directives = request_cache_directives(request.headers());
     let is_cacheable = request.method() == Method::GET
         && request.body().replayable_len() == Some(0)
         && !request.headers().contains_key(AUTHORIZATION);
@@ -278,6 +278,22 @@ fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
         max_stale: directives.max_stale,
         min_fresh: directives.min_fresh,
     }
+}
+
+fn request_cache_directives(headers: &HeaderMap) -> CacheDirectives {
+    let mut directives = CacheDirectives::from_headers(headers);
+    if !headers.contains_key(CACHE_CONTROL) && request_pragma_no_cache(headers) {
+        directives.no_cache = true;
+    }
+    directives
+}
+
+fn request_pragma_no_cache(headers: &HeaderMap) -> bool {
+    headers.get_all(PRAGMA).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            cache_control_directives(value).any(|directive| directive.name == "no-cache")
+        })
+    })
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]

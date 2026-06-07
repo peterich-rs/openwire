@@ -235,6 +235,8 @@ controls needed to avoid unsafe reuse:
 
 - request `Cache-Control: no-cache`, `no-store`, `max-age=0`,
   `max-stale`, `min-fresh`, and `only-if-cached`
+- request `Pragma: no-cache` as an HTTP/1.0 compatibility signal when
+  `Cache-Control` is absent
 - response `Cache-Control: max-age`, `must-revalidate`, `no-cache`, and
   `no-store`
 - `Expires` freshness when `max-age` is absent
