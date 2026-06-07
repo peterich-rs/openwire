@@ -176,13 +176,7 @@ pub(crate) fn validate_handshake_response<B>(
         return Err(HandshakeFailure::MissingConnection);
     }
 
-    let accept = headers
-        .get("sec-websocket-accept")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(HandshakeFailure::InvalidAccept)?;
-    if accept != expected_accept {
-        return Err(HandshakeFailure::InvalidAccept);
-    }
+    validate_accept_header(headers, expected_accept)?;
 
     let subprotocol = validate_selected_subprotocol(headers, offered_subprotocols)?;
 
@@ -213,6 +207,28 @@ fn header_value_has_token(value: &HeaderValue, expected: &str) -> bool {
         raw.split(',')
             .any(|token| token.trim().eq_ignore_ascii_case(expected))
     })
+}
+
+fn validate_accept_header(
+    headers: &HeaderMap,
+    expected_accept: &str,
+) -> Result<(), HandshakeFailure> {
+    let mut values = headers.get_all("sec-websocket-accept").iter();
+    let Some(value) = values.next() else {
+        return Err(HandshakeFailure::InvalidAccept);
+    };
+    if values.next().is_some() {
+        return Err(HandshakeFailure::InvalidAccept);
+    }
+
+    let accept = value
+        .to_str()
+        .map_err(|_| HandshakeFailure::InvalidAccept)?;
+    if accept != expected_accept {
+        return Err(HandshakeFailure::InvalidAccept);
+    }
+
+    Ok(())
 }
 
 fn validate_selected_subprotocol(
@@ -327,6 +343,18 @@ mod response_tests {
     fn rejects_bad_accept() {
         let response = ok_response("wrong");
         let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
+        assert!(matches!(err, HandshakeFailure::InvalidAccept));
+    }
+
+    #[test]
+    fn rejects_multiple_accept_header_fields() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .append("sec-websocket-accept", HeaderValue::from_static("expected"));
+
+        let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
+
         assert!(matches!(err, HandshakeFailure::InvalidAccept));
     }
 
