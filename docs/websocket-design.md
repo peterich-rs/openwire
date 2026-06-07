@@ -410,7 +410,8 @@ branch verifies:
   one or more `Connection` field lines)
 - `Upgrade` includes `websocket` (case-insensitive, comma-list aware across
   one or more `Upgrade` field lines)
-- `Sec-WebSocket-Accept` equals the value recorded in `CallContext`
+- exactly one `Sec-WebSocket-Accept` field equals the value recorded in
+  `CallContext`
 - No `Sec-WebSocket-Extensions`; v1 does not negotiate extensions, so any
   returned extension is treated as an unrequested extension and fails the
   handshake
