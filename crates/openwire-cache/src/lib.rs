@@ -57,7 +57,7 @@ where
             if let Some(cache_key) = cache_key.as_ref() {
                 for entry in store.get_candidates(cache_key).await.into_iter().rev() {
                     if entry.matches_request(&request_headers) {
-                        if request_policy.lookup && entry.is_fresh_for(&request_policy) {
+                        if request_policy.lookup && entry.is_servable_for(&request_policy) {
                             return Ok(entry.into_response());
                         }
 
@@ -111,14 +111,15 @@ where
             }
 
             let validators = CacheValidators::from_headers(&parts.headers);
-            let fresh_for =
-                response_freshness(&parts.headers, &response_directives).unwrap_or_default();
+            let freshness_lifetime =
+                response_freshness_lifetime(&parts.headers, &response_directives)
+                    .unwrap_or_default();
             if !response_is_storable(
                 &parts.headers,
                 parts.status,
                 &response_directives,
                 &validators,
-                fresh_for,
+                freshness_lifetime,
             ) {
                 if parts.status == StatusCode::OK {
                     store.remove(&cache_key).await;
@@ -141,9 +142,12 @@ where
                         parts.version,
                         cached_headers,
                         body.clone(),
-                        fresh_for,
-                        vary,
-                        response_directives.no_cache,
+                        freshness_lifetime,
+                        CachedResponseOptions {
+                            vary,
+                            must_validate: response_directives.no_cache,
+                            must_revalidate: response_directives.must_revalidate,
+                        },
                     ),
                 )
                 .await;
@@ -165,6 +169,7 @@ struct RequestCachePolicy {
     store_response: bool,
     only_if_cached: bool,
     max_age: Option<Duration>,
+    max_stale: Option<MaxStale>,
     min_fresh: Option<Duration>,
 }
 
@@ -174,7 +179,15 @@ struct CacheDirectives {
     no_store: bool,
     only_if_cached: bool,
     max_age: Option<Duration>,
+    max_stale: Option<MaxStale>,
     min_fresh: Option<Duration>,
+    must_revalidate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaxStale {
+    Any,
+    Limit(Duration),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -209,6 +222,7 @@ impl CacheDirectives {
                     "no-cache" => out.no_cache = true,
                     "no-store" => out.no_store = true,
                     "only-if-cached" => out.only_if_cached = true,
+                    "must-revalidate" => out.must_revalidate = true,
                     "max-age" => {
                         if let Some(value) =
                             directive.value.as_deref().and_then(parse_delta_seconds)
@@ -216,6 +230,14 @@ impl CacheDirectives {
                             out.max_age = Some(value);
                         }
                     }
+                    "max-stale" => match directive.value.as_deref() {
+                        Some(value) => {
+                            if let Some(value) = parse_delta_seconds(value) {
+                                out.max_stale = Some(MaxStale::Limit(value));
+                            }
+                        }
+                        None => out.max_stale = Some(MaxStale::Any),
+                    },
                     "min-fresh" => {
                         if let Some(value) =
                             directive.value.as_deref().and_then(parse_delta_seconds)
@@ -244,7 +266,8 @@ fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
         && !request.headers().contains_key(AUTHORIZATION);
     let lookup = is_cacheable
         && !directives.no_cache
-        && !directives.max_age.is_some_and(|max_age| max_age.is_zero());
+        && (!directives.max_age.is_some_and(|max_age| max_age.is_zero())
+            || directives.max_stale.is_some());
 
     RequestCachePolicy {
         is_cacheable,
@@ -252,6 +275,7 @@ fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
         store_response: is_cacheable && !directives.no_store,
         only_if_cached: is_cacheable && directives.only_if_cached,
         max_age: directives.max_age,
+        max_stale: directives.max_stale,
         min_fresh: directives.min_fresh,
     }
 }
@@ -406,9 +430,17 @@ pub struct CachedResponse {
     body: Bytes,
     stored_at: Instant,
     initial_age: Duration,
-    fresh_until: Instant,
+    freshness_lifetime: Duration,
     vary: CapturedVary,
     must_validate: bool,
+    must_revalidate: bool,
+}
+
+#[derive(Clone, Default)]
+struct CachedResponseOptions {
+    vary: CapturedVary,
+    must_validate: bool,
+    must_revalidate: bool,
 }
 
 impl CachedResponse {
@@ -417,16 +449,15 @@ impl CachedResponse {
         version: Version,
         headers: HeaderMap,
         body: Bytes,
-        fresh_for: Duration,
+        freshness_lifetime: Duration,
     ) -> Self {
         Self::new_with_vary(
             status,
             version,
             headers,
             body,
-            fresh_for,
-            CapturedVary::default(),
-            false,
+            freshness_lifetime,
+            CachedResponseOptions::default(),
         )
     }
 
@@ -435,9 +466,8 @@ impl CachedResponse {
         version: Version,
         headers: HeaderMap,
         body: Bytes,
-        fresh_for: Duration,
-        vary: CapturedVary,
-        must_validate: bool,
+        freshness_lifetime: Duration,
+        options: CachedResponseOptions,
     ) -> Self {
         let stored_at = Instant::now();
         let initial_age = response_current_age(&headers, SystemTime::now());
@@ -448,40 +478,70 @@ impl CachedResponse {
             body,
             stored_at,
             initial_age,
-            fresh_until: stored_at
-                .checked_add(fresh_for)
-                .unwrap_or_else(|| stored_at + Duration::from_secs(MAX_DELTA_SECONDS)),
-            vary,
-            must_validate,
+            freshness_lifetime,
+            vary: options.vary,
+            must_validate: options.must_validate,
+            must_revalidate: options.must_revalidate,
         }
     }
 
-    fn is_fresh_for(&self, request_policy: &RequestCachePolicy) -> bool {
+    fn is_servable_for(&self, request_policy: &RequestCachePolicy) -> bool {
         if self.must_validate {
             return false;
         }
 
-        let now = Instant::now();
-        if now >= self.fresh_until {
+        let current_age = self.current_age();
+        let effective_freshness_lifetime = self.effective_freshness_lifetime(request_policy);
+        if self.is_fresh_for(current_age, effective_freshness_lifetime, request_policy) {
+            return true;
+        }
+
+        self.is_stale_acceptable_for(current_age, effective_freshness_lifetime, request_policy)
+    }
+
+    fn effective_freshness_lifetime(&self, request_policy: &RequestCachePolicy) -> Duration {
+        request_policy
+            .max_age
+            .map(|max_age| self.freshness_lifetime.min(max_age))
+            .unwrap_or(self.freshness_lifetime)
+    }
+
+    fn is_fresh_for(
+        &self,
+        current_age: Duration,
+        effective_freshness_lifetime: Duration,
+        request_policy: &RequestCachePolicy,
+    ) -> bool {
+        if current_age >= effective_freshness_lifetime {
             return false;
         }
 
-        if let Some(max_age) = request_policy.max_age {
-            if self.current_age() > max_age {
-                return false;
-            }
-        }
-
         if let Some(min_fresh) = request_policy.min_fresh {
-            let Some(required_fresh_until) = now.checked_add(min_fresh) else {
+            let Some(required_age) = current_age.checked_add(min_fresh) else {
                 return false;
             };
-            if required_fresh_until > self.fresh_until {
-                return false;
-            }
+            return required_age <= effective_freshness_lifetime;
         }
 
         true
+    }
+
+    fn is_stale_acceptable_for(
+        &self,
+        current_age: Duration,
+        effective_freshness_lifetime: Duration,
+        request_policy: &RequestCachePolicy,
+    ) -> bool {
+        if self.must_revalidate || request_policy.min_fresh.is_some() {
+            return false;
+        }
+
+        let staleness = current_age.saturating_sub(effective_freshness_lifetime);
+        match request_policy.max_stale {
+            Some(MaxStale::Any) => true,
+            Some(MaxStale::Limit(limit)) => staleness <= limit,
+            None => false,
+        }
     }
 
     fn matches_request(&self, request_headers: &HeaderMap) -> bool {
@@ -516,18 +576,28 @@ impl CachedResponse {
         let headers = merge_304_headers(&self.headers, validation_headers);
         let directives = CacheDirectives::from_headers(&headers);
         let validators = CacheValidators::from_headers(&headers);
-        let fresh_for = response_freshness(&headers, &directives).unwrap_or_default();
+        let freshness_lifetime =
+            response_freshness_lifetime(&headers, &directives).unwrap_or_default();
         let vary = CapturedVary::capture(&headers, request_headers);
         let store_response = vary.is_some()
-            && response_is_storable(&headers, self.status, &directives, &validators, fresh_for);
+            && response_is_storable(
+                &headers,
+                self.status,
+                &directives,
+                &validators,
+                freshness_lifetime,
+            );
         let response = Self::new_with_vary(
             self.status,
             self.version,
             headers,
             self.body.clone(),
-            fresh_for,
-            vary.unwrap_or_default(),
-            directives.no_cache,
+            freshness_lifetime,
+            CachedResponseOptions {
+                vary: vary.unwrap_or_default(),
+                must_validate: directives.no_cache,
+                must_revalidate: directives.must_revalidate,
+            },
         );
         (response, store_response)
     }
@@ -551,37 +621,29 @@ fn response_is_storable(
     status: StatusCode,
     directives: &CacheDirectives,
     validators: &CacheValidators,
-    fresh_for: Duration,
+    freshness_lifetime: Duration,
 ) -> bool {
     status == StatusCode::OK
         && !headers.contains_key(SET_COOKIE)
         && !directives.no_store
         && (!directives.no_cache || validators.has_any())
-        && (!fresh_for.is_zero() || validators.has_any())
+        && (!freshness_lifetime.is_zero() || validators.has_any())
 }
 
-fn response_freshness(headers: &HeaderMap, directives: &CacheDirectives) -> Option<Duration> {
+fn response_freshness_lifetime(
+    headers: &HeaderMap,
+    directives: &CacheDirectives,
+) -> Option<Duration> {
     let now = SystemTime::now();
-    let current_age = response_current_age(headers, now);
     if let Some(max_age) = directives.max_age {
-        return Some(max_age.checked_sub(current_age).unwrap_or_default());
+        return Some(max_age);
     }
 
     if let Some(freshness_lifetime) = explicit_expires_lifetime(headers, now) {
-        return Some(
-            freshness_lifetime
-                .checked_sub(current_age)
-                .unwrap_or_default(),
-        );
+        return Some(freshness_lifetime);
     }
 
-    heuristic_freshness_lifetime(headers, now)
-        .map(|freshness_lifetime| {
-            freshness_lifetime
-                .checked_sub(current_age)
-                .unwrap_or_default()
-        })
-        .filter(|remaining| !remaining.is_zero())
+    heuristic_freshness_lifetime(headers, now).filter(|lifetime| !lifetime.is_zero())
 }
 
 fn explicit_expires_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {

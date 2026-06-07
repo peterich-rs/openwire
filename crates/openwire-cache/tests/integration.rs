@@ -721,6 +721,238 @@ async fn stale_last_modified_response_revalidates_with_if_modified_since() {
 }
 
 #[tokio::test]
+async fn request_max_stale_serves_explicitly_permitted_stale_response() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = text_response(StatusCode::OK, format!("stale body {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=0".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"stale-v1\"".parse().expect("etag"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/max-stale")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "stale body 1"
+    );
+
+    let stale = client
+        .execute(request_with_header(
+            server.http_url("/max-stale"),
+            CACHE_CONTROL,
+            "max-stale",
+        ))
+        .await
+        .expect("stale response");
+    assert_eq!(
+        stale.into_body().text().await.expect("body"),
+        "stale body 1"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn request_max_age_zero_with_max_stale_can_serve_recent_stale_response() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response =
+                    text_response(StatusCode::OK, format!("recent stale body {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/max-age-zero-max-stale")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "recent stale body 1"
+    );
+
+    let stale = client
+        .execute(request_with_header(
+            server.http_url("/max-age-zero-max-stale"),
+            CACHE_CONTROL,
+            "max-age=0, max-stale=60",
+        ))
+        .await
+        .expect("stale response");
+    assert_eq!(
+        stale.into_body().text().await.expect("body"),
+        "recent stale body 1"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn request_max_stale_limit_revalidates_when_staleness_exceeds_limit() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    let mut response = text_response(StatusCode::OK, "too stale body");
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                    response
+                        .headers_mut()
+                        .insert(AGE, "120".parse().expect("age"));
+                    response
+                        .headers_mut()
+                        .insert(ETAG, "\"too-stale-v1\"".parse().expect("etag"));
+                    return response;
+                }
+
+                assert_eq!(
+                    request.headers().get(IF_NONE_MATCH).expect("if-none-match"),
+                    "\"too-stale-v1\""
+                );
+                let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"too-stale-v1\"".parse().expect("etag"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/max-stale-limit")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "too stale body"
+    );
+
+    let revalidated = client
+        .execute(request_with_header(
+            server.http_url("/max-stale-limit"),
+            CACHE_CONTROL,
+            "max-stale=30",
+        ))
+        .await
+        .expect("revalidated response");
+    assert_eq!(
+        revalidated.into_body().text().await.expect("body"),
+        "too stale body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn response_must_revalidate_blocks_request_max_stale() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    let mut response = text_response(StatusCode::OK, "must revalidate body");
+                    response.headers_mut().insert(
+                        CACHE_CONTROL,
+                        "max-age=0, must-revalidate".parse().expect("header"),
+                    );
+                    response
+                        .headers_mut()
+                        .insert(ETAG, "\"must-revalidate-v1\"".parse().expect("etag"));
+                    return response;
+                }
+
+                assert_eq!(
+                    request.headers().get(IF_NONE_MATCH).expect("if-none-match"),
+                    "\"must-revalidate-v1\""
+                );
+                let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"must-revalidate-v1\"".parse().expect("etag"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/must-revalidate")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "must revalidate body"
+    );
+
+    let revalidated = client
+        .execute(request_with_header(
+            server.http_url("/must-revalidate"),
+            CACHE_CONTROL,
+            "max-stale=60",
+        ))
+        .await
+        .expect("revalidated response");
+    assert_eq!(
+        revalidated.into_body().text().await.expect("body"),
+        "must revalidate body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn cached_hits_generate_current_age_header() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = spawn_http1({
