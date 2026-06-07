@@ -35,7 +35,8 @@ blocks, and stable observability hooks.
 - optional JSON helpers behind the `json` feature
 - optional WebSocket (RFC 6455) client behind the `websocket` feature, with a
   pluggable `WebSocketEngine` trait and a built-in native codec
-- `openwire-cache` as a separate application-layer cache crate
+- `openwire-cache` as a separate application-layer cache crate with an
+  RFC 9111-aligned freshness subset
 
 ## Workspace
 
@@ -161,6 +162,26 @@ compressed `Content-Length` headers.
 If a caller sets `Accept-Encoding` explicitly, OpenWire leaves the response
 body and headers untouched so the caller owns the wire encoding semantics.
 
+## Application Cache
+
+`openwire-cache` provides an application interceptor for private, in-process
+response caching. It currently caches replayable `GET` responses with explicit
+freshness metadata and honors the core RFC 9111 controls needed to avoid unsafe
+reuse:
+
+- request `Cache-Control: no-cache`, `no-store`, `max-age=0`,
+  `min-fresh`, and `only-if-cached`
+- response `Cache-Control: max-age`, `no-cache`, and `no-store`
+- `Expires` freshness when `max-age` is absent
+- `Age` reducing remaining `max-age` freshness
+- `Vary` matching against the original request headers, with `Vary: *`
+  treated as not reusable
+
+The cache intentionally remains conservative: it only stores `200 OK` `GET`
+responses, skips responses with `Set-Cookie`, skips authenticated requests, and
+does not yet implement validator revalidation, heuristic freshness, stale
+serving, or multiple stored variants for one URI.
+
 ## Default Transport Settings
 
 `Client::builder()` currently defaults to:
@@ -184,7 +205,7 @@ Today the project includes:
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support
 - owned HTTP/1.1 and HTTP/2 bindings via `hyper::client::conn`
 - connection pooling, fast fallback, and route planning
-- optional cache integration in `openwire-cache`
+- optional RFC 9111-oriented cache integration in `openwire-cache`
 - an opt-in live-network smoke suite outside the required CI path
 
 ## Development
