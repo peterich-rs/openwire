@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-websocket = ["dep:tokio-tungstenite"]
+websocket = ["dep:tokio-tungstenite", "openwire-core/websocket"]
 
 [dependencies]
 bytes.workspace = true

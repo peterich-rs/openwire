@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,7 +11,8 @@ use futures_util::stream;
 #[cfg(feature = "websocket")]
 use futures_util::StreamExt;
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, TRANSFER_ENCODING, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HOST,
+    TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
@@ -3892,6 +3893,7 @@ async fn bridge_interceptor_omits_content_length_for_absent_requests_before_netw
     let expected = ObservedHeaders {
         host: Some(format!("openwire.test:{}", server.addr().port())),
         user_agent: Some(default_user_agent().to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
         content_length: None,
         transfer_encoding: None,
     };
@@ -3948,6 +3950,7 @@ async fn bridge_interceptor_normalizes_empty_requests_before_network_interceptor
     let expected = ObservedHeaders {
         host: Some(format!("openwire.test:{}", server.addr().port())),
         user_agent: Some(default_user_agent().to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
         content_length: Some("0".to_owned()),
         transfer_encoding: None,
     };
@@ -4006,6 +4009,7 @@ async fn bridge_interceptor_preserves_user_agent_and_sets_fixed_body_content_len
     let expected = ObservedHeaders {
         host: Some(format!("openwire.test:{}", server.addr().port())),
         user_agent: Some("custom-agent/1.0".to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
         content_length: Some("5".to_owned()),
         transfer_encoding: None,
     };
@@ -4068,6 +4072,7 @@ async fn bridge_interceptor_streaming_body_uses_chunked_without_content_length()
     let expected = ObservedHeaders {
         host: Some(format!("openwire.test:{}", server.addr().port())),
         user_agent: Some(default_user_agent().to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
         content_length: None,
         transfer_encoding: Some("chunked".to_owned()),
     };
@@ -4079,6 +4084,145 @@ async fn bridge_interceptor_streaming_body_uses_chunked_without_content_length()
             body: "hello stream".to_owned(),
         }
     );
+}
+
+#[tokio::test]
+async fn bridge_interceptor_injects_accept_encoding_and_decodes_gzip_responses() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("request body should be utf-8"),
+            });
+
+            let compressed = gzip_bytes(b"decoded gzip response");
+            Response::builder()
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .body(http_body_util::Full::new(Bytes::from(compressed)))
+                .expect("gzip response")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/gzip",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert!(response.headers().get(CONTENT_ENCODING).is_none());
+    assert!(response.headers().get(CONTENT_LENGTH).is_none());
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "decoded gzip response");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some(default_user_agent().to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
+        content_length: None,
+        transfer_encoding: None,
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: String::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn bridge_interceptor_decodes_zstd_responses() {
+    let server = spawn_http1(|_request: Request<Incoming>| async move {
+        let compressed = zstd::bulk::compress(b"decoded zstd response", 0).expect("zstd payload");
+        Response::builder()
+            .header(CONTENT_ENCODING, "zstd")
+            .header(CONTENT_LENGTH, compressed.len().to_string())
+            .body(http_body_util::Full::new(Bytes::from(compressed)))
+            .expect("zstd response")
+    })
+    .await;
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/zstd",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+
+    assert!(response.headers().get(CONTENT_ENCODING).is_none());
+    assert!(response.headers().get(CONTENT_LENGTH).is_none());
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "decoded zstd response");
+}
+
+#[tokio::test]
+async fn bridge_interceptor_preserves_explicit_accept_encoding_and_wire_body() {
+    let compressed = Arc::new(gzip_bytes(b"caller manages gzip"));
+    let expected_wire_body = compressed.clone();
+    let server = spawn_http1(move |_request: Request<Incoming>| {
+        let compressed = compressed.clone();
+        async move {
+            Response::builder()
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .body(http_body_util::Full::new(Bytes::from(
+                    compressed.as_ref().clone(),
+                )))
+                .expect("gzip response")
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "http://openwire.test:{}/explicit-encoding",
+            server.addr().port()
+        ))
+        .header(ACCEPT_ENCODING, "gzip")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(expected_wire_body.len())
+    );
+    let body = response.into_body().bytes().await.expect("body");
+    assert_eq!(body.as_ref(), expected_wire_body.as_slice());
 }
 
 #[tokio::test]
@@ -4408,6 +4552,7 @@ impl Interceptor for RewriteUriInterceptor {
 struct ObservedHeaders {
     host: Option<String>,
     user_agent: Option<String>,
+    accept_encoding: Option<String>,
     content_length: Option<String>,
     transfer_encoding: Option<String>,
 }
@@ -4417,6 +4562,7 @@ impl ObservedHeaders {
         Self {
             host: header_value(headers, HOST),
             user_agent: header_value(headers, USER_AGENT),
+            accept_encoding: header_value(headers, ACCEPT_ENCODING),
             content_length: header_value(headers, CONTENT_LENGTH),
             transfer_encoding: header_value(headers, TRANSFER_ENCODING),
         }
@@ -4505,6 +4651,16 @@ impl ProxySelector for SwitchingProxySelector {
 
 fn default_user_agent() -> &'static str {
     concat!("openwire/", env!("CARGO_PKG_VERSION"))
+}
+
+fn default_accept_encoding() -> &'static str {
+    "br, gzip, deflate, zstd"
+}
+
+fn gzip_bytes(input: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(input).expect("write gzip payload");
+    encoder.finish().expect("finish gzip payload")
 }
 
 fn environment_lock() -> &'static AsyncMutex<()> {

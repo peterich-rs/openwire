@@ -15,15 +15,29 @@ impl Interceptor for BridgeInterceptor {
         mut exchange: Exchange,
         next: Next,
     ) -> BoxFuture<Result<http::Response<ResponseBody>, WireError>> {
+        #[cfg(feature = "compression")]
+        let request_method = exchange.request().method().clone();
         let normalization = normalize_request(exchange.request_mut());
+        #[cfg(feature = "compression")]
+        let transparent_compression = normalization.as_ref().copied().unwrap_or(false);
         Box::pin(async move {
             normalization?;
-            next.run(exchange).await
+            let response = next.run(exchange).await?;
+            #[cfg(feature = "compression")]
+            {
+                if transparent_compression {
+                    return Ok(crate::compression::decode_response(
+                        response,
+                        &request_method,
+                    ));
+                }
+            }
+            Ok(response)
         })
     }
 }
 
-pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<(), WireError> {
+pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<bool, WireError> {
     #[cfg(feature = "websocket")]
     {
         if request
@@ -37,7 +51,11 @@ pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<()
     normalize_host_header(request)?;
     normalize_user_agent_header(request);
     normalize_body_headers(request);
-    Ok(())
+    #[cfg(feature = "compression")]
+    let transparent_compression = crate::compression::normalize_request(request);
+    #[cfg(not(feature = "compression"))]
+    let transparent_compression = false;
+    Ok(transparent_compression)
 }
 
 fn normalize_host_header(request: &mut Request<RequestBody>) -> Result<(), WireError> {

@@ -19,6 +19,8 @@ blocks, and stable observability hooks.
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
+- transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
+  through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
   including `socks5://user:pass@host:port` credentials and proxy-endpoint
   fast fallback
@@ -146,6 +148,18 @@ let client = Client::builder()
 Once a proxied attempt succeeds, later auth and redirect follow-ups in the same
 logical call prefer that proxy first so proxy-authorization state stays bound
 to the proxy that actually handled the request.
+
+## Transparent Compression
+
+With the default `compression` feature enabled, the bridge injects
+`Accept-Encoding: br, gzip, deflate, zstd` for normal HTTP requests that do not
+already set `Accept-Encoding` and are not range requests. Responses using those
+encodings are decoded as a stream before they reach application interceptors or
+callers, and the decoded response omits the wire `Content-Encoding` and
+compressed `Content-Length` headers.
+
+If a caller sets `Accept-Encoding` explicitly, OpenWire leaves the response
+body and headers untouched so the caller owns the wire encoding semantics.
 
 ## Default Transport Settings
 
