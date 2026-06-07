@@ -13,7 +13,9 @@ blocks, and stable observability hooks.
 
 ## What It Provides
 
-- `Client`, `ClientBuilder`, and one-shot `Call` over `http::Request<RequestBody>`
+- `Client`, `ClientBuilder`, and single-execution `Call` over `http::Request<RequestBody>`
+- OkHttp-style `Call` handles for cancellation, execution state, replayable
+  cloning, and executor-backed queued calls
 - request-scoped timeout, retry, and redirect overrides through `Call`
 - application and network interceptors
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
@@ -84,6 +86,34 @@ let response = client
 
 These per-request retry and redirect overrides target the built-in scalar policy
 knobs. Custom `RetryPolicy` and `RedirectPolicy` objects remain client-scoped.
+
+Calls can also be controlled after they have been moved into async execution.
+`Call::handle()` returns a cloneable cancellation and state handle, and
+`Call::try_clone()` creates a fresh unexecuted call when the request body is
+replayable:
+
+```rust
+let call = client
+    .new_call(request)
+    .call_timeout(Duration::from_secs(5));
+let handle = call.handle();
+let task = tokio::spawn(async move { call.execute().await });
+
+handle.cancel();
+let error = task.await?.expect_err("call canceled");
+assert_eq!(error.kind(), openwire::WireErrorKind::Canceled);
+```
+
+For OkHttp-style asynchronous dispatch through the client's configured
+executor, queue the call and await the returned handle:
+
+```rust
+let queued = client.new_call(request).enqueue()?;
+let response = queued.await_response().await?;
+```
+
+Dropping `QueuedCall` does not request cancellation; call `cancel()` on the
+queued call or its `CallHandle` when the in-flight work should stop.
 
 ## HTTP Logging
 
@@ -179,6 +209,8 @@ the corresponding knobs explicitly, for example with `usize::MAX`.
 Today the project includes:
 
 - request execution through `Client::execute(...)` and `Call::execute()`
+- cancellation, execution-state handles, replayable `Call::try_clone()`, and
+  queued calls through `Call::enqueue()`
 - application and network interceptors
 - retry, redirect, cookie, and authenticator follow-up handling
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support
