@@ -97,6 +97,12 @@ path, with `Content-Encoding` and compressed `Content-Length` removed before the
 response reaches application interceptors or callers. Network interceptors still
 observe the normalized request and wire response for each network attempt.
 
+The transport protocol-binding step applies protocol-specific final shaping.
+Direct HTTP/1.1 requests are converted to origin-form before they enter hyper's
+HTTP/1.1 client binding. HTTP/2 requests keep their absolute URI but strip
+connection-specific fields, including fields named by `Connection`; `TE` is
+preserved only for the RFC 9113 `trailers` value.
+
 ## 4. Transport Layering
 
 ```mermaid
