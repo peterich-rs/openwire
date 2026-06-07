@@ -29,8 +29,8 @@ use bytes::Bytes;
 use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use openwire_core::websocket::{
-    BoxEngineSink, BoxEngineStream, EngineFrame, Role, WebSocketChannel, WebSocketEngine,
-    WebSocketEngineConfig, WebSocketEngineError,
+    validate_outbound_engine_frame, BoxEngineSink, BoxEngineStream, EngineFrame, Role,
+    WebSocketChannel, WebSocketEngine, WebSocketEngineConfig, WebSocketEngineError,
 };
 use openwire_core::{BoxConnection, BoxFuture, WireError};
 use openwire_tokio::TokioIo;
@@ -104,6 +104,7 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: EngineFrame) -> Result<(), Self::Error> {
+        validate_outbound_engine_frame(&item)?;
         let message = engine_to_tung(item);
         Pin::new(&mut self.inner)
             .start_send(message)

@@ -6,8 +6,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use openwire_core::websocket::{
-    BoxEngineSink, BoxEngineStream, EngineFrame, Role, WebSocketChannel, WebSocketEngine,
-    WebSocketEngineConfig, WebSocketEngineError,
+    validate_outbound_engine_frame, BoxEngineSink, BoxEngineStream, EngineFrame, Role,
+    WebSocketChannel, WebSocketEngine, WebSocketEngineConfig, WebSocketEngineError,
 };
 use openwire_core::{BoxConnection, BoxFuture, WireError};
 use openwire_tokio::TokioIo;
@@ -130,6 +130,8 @@ impl Sink<EngineFrame> for NativeSink {
     }
 
     fn start_send(self: Pin<&mut Self>, item: EngineFrame) -> Result<(), Self::Error> {
+        validate_outbound_engine_frame(&item)?;
+
         let me = self.get_mut();
         let key = random_mask_key();
         let header = match &item {

@@ -1,8 +1,8 @@
 use bytes::{Bytes, BytesMut};
 
-use openwire_core::websocket::{EngineFrame, WebSocketEngineError};
+use openwire_core::websocket::{close_code_is_valid, EngineFrame, WebSocketEngineError};
 
-use super::codec::{close_code_is_valid, DecodedFrame, Opcode};
+use super::codec::{DecodedFrame, Opcode};
 
 pub(crate) struct ReassemblyState {
     max_message_size: usize,

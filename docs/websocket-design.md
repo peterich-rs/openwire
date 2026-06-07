@@ -253,9 +253,11 @@ The engine is responsible for:
 - Frame masking on send (client always masks; server never masks in v1).
 - Fragmentation handling on receive (re-assembly into a single `EngineFrame`
   per logical message, capped by `max_message_size`).
-- Control-frame validation (≤125 bytes, never fragmented).
+- Control-frame validation (≤125 bytes, never fragmented). Public sender APIs
+  and engine sink adapters reject outbound control frames that would violate
+  that payload budget before they are written.
 - UTF-8 validation for `Text` frames (per RFC 6455 §8.1).
-- Close-frame echo on receive of a Close (RFC 6455 §5.5.1).
+- Close-frame parsing and close-code validation on receive.
 - Mapping protocol violations to `WebSocketEngineError`.
 
 The engine is **not** responsible for:
@@ -336,10 +338,16 @@ Implements RFC 6455 §5–§8 with the following surface:
   it exceeds `max_message_size`.
 - UTF-8: `Text` frames are validated per RFC 6455 §8.1 using `std::str::from_utf8`
   on the reassembled payload (we do not stream-validate fragments).
-- Close: outgoing close sends `0x88` with status code + reason (truncated to
-  fit ≤125 bytes); incoming close echoes once. After close exchange both
+- Close: outgoing close is validated before it enters the writer queue. The
+  code must be valid on the wire and the reason must fit the 123-byte reason
+  budget so the control-frame payload stays ≤125 bytes. Invalid values return
+  an error and are not sent. Incoming close is surfaced to the receiver and
+  wakes the writer cancellation path. After a local close completes, both
   halves of the channel return `Ok(None)` / `Poll::Ready(Ok(()))`.
-- Close codes: validated against the reserved-range table in RFC 6455 §7.4.
+  Sending `Message::Close` through the generic `send` path uses the same
+  validation, so it cannot bypass the close-frame limits.
+- Close codes: validated against the reserved-range table in RFC 6455 §7.4 at
+  the public sender boundary and in inbound engine parsing.
 
 Out of scope for native v1:
 
@@ -424,11 +432,12 @@ The writer task owns the engine's `BoxSink<EngineFrame>` and consumes from a
 - `Send(Message)` — user data
 - `Pong(Bytes)` — auto-reply to received `Ping`
 - `Ping(Bytes)` — heartbeat
-- `Close { code, reason }` — explicit close (from user `close()` or `Drop`)
+- `Close { code, reason }` — explicit close from user `close()`
 - `Cancel` — abort without sending close
 
-The writer task processes commands FIFO. `WebSocketSender::send_*` returns
-`Ok(())` once the message is enqueued (engine-level write is asynchronous).
+The writer task processes commands FIFO. `WebSocketSender::send_*` validates
+outbound control messages and returns `Ok(())` once the message is enqueued
+(engine-level write is asynchronous).
 `queue_size()` returns the number of pending `WriterCommand`s in the mpsc.
 This is approximate parity with OkHttp's `WebSocket.queueSize()` (which
 reports buffered bytes); we surface message count rather than bytes because
@@ -440,14 +449,18 @@ queue is full, providing natural backpressure.
 
 When the writer task observes a `Close` command, it sends the close frame,
 then waits up to `close_timeout` for the receiver task to surface a remote
-close (the engine handles echo). On timeout, it forces socket teardown.
+close. On timeout, it forces socket teardown.
+`WebSocketSender::close` validates the close code and reason byte length
+before it marks the sender closed, so a rejected close leaves the sender
+usable and does not enqueue a frame. The generic `send(Message)` path applies
+the same close validation and also rejects oversized `Ping` / `Pong` payloads.
 
 ### 4.9 Heartbeat
 
 When `ping_interval` is set, a background timer task periodically enqueues
 `Ping(b"")` to the writer queue. If `pong_timeout` elapses without a matching
 pong, the writer enqueues a `Close { code: 1011, reason: "ping timeout" }`
-and the call fails with `WebSocketError::Timeout(PingTimeout)`. The receiver
+and the call fails with `WebSocketError::Timeout(Ping)`. The receiver
 task marks the most recent inbound pong timestamp; the heartbeat task
 inspects it via an atomic.
 
@@ -459,16 +472,10 @@ held does **not** initiate close — the user may still want to receive
 server-pushed messages. Dropping the `WebSocketReceiver` while sender remains
 also does not initiate close.
 
-When **both** halves are dropped (Arc refcount on a shared inner state hits
-zero), a `Cancel`-equivalent signal fires:
-
-1. Best-effort `Close { code: 1001, reason: "client cancelled" }` is enqueued.
-2. The writer task waits up to `close_timeout` (default 1 s) for the close
-   echo.
-3. The TCP/TLS connection is torn down.
-4. The `ConnectionPermit` is released.
-5. `EventListener::websocket_closing(initiator = Local)` and
-   `websocket_closed` fire.
+When the last `WebSocketSender` handle is dropped, its shared inner state sends
+a best-effort `Cancel` command so the writer wakes, flushes pending bytes, and
+returns. Dropping handles is therefore an abort path, not a graceful close
+handshake, and it does not emit local close events on its own.
 
 Explicit `WebSocketSender::close(code, reason)` is the documented way to
 trigger an orderly close with custom code/reason; the drop path exists only
@@ -655,12 +662,14 @@ Integration tests (`crates/openwire/tests/websocket.rs`):
    upgrade header; subprotocol negotiated / rejected / mismatched.
 2. **Message exchange**: text / binary roundtrip; large messages near and
    over `max_message_size`; fragmented receive; UTF-8 violation in text.
-3. **Control frames**: server-initiated ping / client auto-pong; server
-   pong absorption when ping interval is set; ping timeout.
+3. **Control frames**: server-initiated ping / client auto-pong; oversized
+   outbound ping / pong rejection; server pong absorption when ping interval
+   is set; ping timeout.
 4. **Close**: client-initiated close; server-initiated close; concurrent
-   close; close timeout; abnormal disconnect (TCP reset).
-5. **Drop semantics**: dropping both halves triggers close 1001 within
-   close_timeout; dropping only sender or only receiver does not close.
+   close; invalid close code/reason rejection; close timeout; abnormal
+   disconnect (TCP reset).
+5. **Drop semantics**: dropping the last sender cancels the writer without a
+   graceful close; dropping only one half does not initiate close.
 6. **Concurrent send**: cloned `WebSocketSender` from multiple tasks; queue
    backpressure when `send_queue_size` is small.
 7. **Proxy**: WSS through an HTTPS proxy via CONNECT tunnel.
