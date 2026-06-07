@@ -21,6 +21,7 @@ blocks, and stable observability hooks.
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
+  with structured HTTP authentication challenge parsing
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
   through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
@@ -115,6 +116,22 @@ let response = queued.await_response().await?;
 
 Dropping `QueuedCall` does not request cancellation; call `cancel()` on the
 queued call or its `CallHandle` when the in-flight work should stop.
+
+## Authentication Challenges
+
+`Authenticator` receives an `AuthContext` for origin `401 Unauthorized`,
+forward-proxy `407 Proxy Authentication Required`, and HTTPS CONNECT proxy
+authentication challenges. `AuthContext::challenges()` parses the applicable
+RFC 9110 / RFC 7235 authentication header into `AuthChallenge` values:
+
+- origin authentication reads `WWW-Authenticate`
+- proxy authentication reads `Proxy-Authenticate`
+- each challenge exposes its auth scheme, optional token68 value, parameters,
+  and convenience access to `realm`
+
+OpenWire does not choose credentials by itself. The caller's authenticator
+selects a supported challenge and returns a replayable follow-up request with
+`Authorization` or `Proxy-Authorization` as appropriate.
 
 ## HTTP Logging
 

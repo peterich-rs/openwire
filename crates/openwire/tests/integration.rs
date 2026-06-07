@@ -18,11 +18,11 @@ use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::rt::{Sleep, Timer};
 use openwire::{
-    AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client, DefaultRoutePlanner,
-    DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next, NoProxy, Proxy, ProxyRules,
-    ProxySelection, ProxySelector, RedirectContext, RedirectDecision, RedirectPolicy, RequestBody,
-    ResponseBody, RetryContext, RetryPolicy, RoutePlan, RoutePlanner, RustlsTlsConnector,
-    TaskHandle, TcpConnector, TlsConnector, Url, WireError, WireErrorKind,
+    AuthChallenge, AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client,
+    DefaultRoutePlanner, DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next,
+    NoProxy, Proxy, ProxyRules, ProxySelection, ProxySelector, RedirectContext, RedirectDecision,
+    RedirectPolicy, RequestBody, ResponseBody, RetryContext, RetryPolicy, RoutePlan, RoutePlanner,
+    RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url, WireError, WireErrorKind,
 };
 #[cfg(feature = "websocket")]
 use openwire_core::websocket::Message as WebSocketMessage;
@@ -1022,6 +1022,11 @@ async fn authenticator_retries_replayable_requests_on_401() {
         .expect("response");
 
     assert_eq!(authenticator.calls(), 1);
+    assert_single_realm_challenge(
+        &authenticator.observed_challenges()[0],
+        "Bearer",
+        "openwire",
+    );
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "authorized");
 }
@@ -1116,6 +1121,7 @@ async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator
         authenticator.observed_kinds(),
         vec![openwire::AuthKind::Proxy]
     );
+    assert_single_realm_challenge(&authenticator.observed_challenges()[0], "Basic", "proxy");
 
     let requests = proxy.requests();
     assert_eq!(requests.len(), 2, "requests = {requests:?}");
@@ -2185,6 +2191,7 @@ async fn http_proxy_can_retry_requests_after_407_with_proxy_authenticator() {
         authenticator.observed_kinds(),
         vec![openwire::AuthKind::Proxy]
     );
+    assert_single_realm_challenge(&authenticator.observed_challenges()[0], "Basic", "proxy");
 }
 
 #[tokio::test]
@@ -4468,6 +4475,7 @@ struct StaticAuthorizationAuthenticator {
     header_value: &'static str,
     calls: Arc<AtomicUsize>,
     observed_auth_counts: Arc<Mutex<Vec<u32>>>,
+    observed_challenges: Arc<Mutex<Vec<Vec<AuthChallenge>>>>,
 }
 
 impl StaticAuthorizationAuthenticator {
@@ -4476,6 +4484,7 @@ impl StaticAuthorizationAuthenticator {
             header_value,
             calls: Arc::new(AtomicUsize::new(0)),
             observed_auth_counts: Arc::new(Mutex::new(Vec::new())),
+            observed_challenges: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4489,6 +4498,13 @@ impl StaticAuthorizationAuthenticator {
             .expect("auth counts")
             .clone()
     }
+
+    fn observed_challenges(&self) -> Vec<Vec<AuthChallenge>> {
+        self.observed_challenges
+            .lock()
+            .expect("auth challenges")
+            .clone()
+    }
 }
 
 impl Authenticator for StaticAuthorizationAuthenticator {
@@ -4499,12 +4515,17 @@ impl Authenticator for StaticAuthorizationAuthenticator {
         let header_value = self.header_value;
         let calls = self.calls.clone();
         let observed_auth_counts = self.observed_auth_counts.clone();
+        let observed_challenges = self.observed_challenges.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::Relaxed);
             observed_auth_counts
                 .lock()
                 .expect("auth counts")
                 .push(ctx.auth_count());
+            observed_challenges
+                .lock()
+                .expect("auth challenges")
+                .push(ctx.challenges());
             let Some(mut request) = ctx.try_clone_request() else {
                 return Ok(None);
             };
@@ -4533,6 +4554,7 @@ struct StaticHeaderAuthenticator {
     header_value: &'static str,
     calls: Arc<AtomicUsize>,
     observed_kinds: Arc<Mutex<Vec<openwire::AuthKind>>>,
+    observed_challenges: Arc<Mutex<Vec<Vec<AuthChallenge>>>>,
 }
 
 impl StaticHeaderAuthenticator {
@@ -4542,6 +4564,7 @@ impl StaticHeaderAuthenticator {
             header_value,
             calls: Arc::new(AtomicUsize::new(0)),
             observed_kinds: Arc::new(Mutex::new(Vec::new())),
+            observed_challenges: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4551,6 +4574,13 @@ impl StaticHeaderAuthenticator {
 
     fn observed_kinds(&self) -> Vec<openwire::AuthKind> {
         self.observed_kinds.lock().expect("auth kinds").clone()
+    }
+
+    fn observed_challenges(&self) -> Vec<Vec<AuthChallenge>> {
+        self.observed_challenges
+            .lock()
+            .expect("auth challenges")
+            .clone()
     }
 }
 
@@ -4563,9 +4593,14 @@ impl Authenticator for StaticHeaderAuthenticator {
         let header_value = self.header_value;
         let calls = self.calls.clone();
         let observed_kinds = self.observed_kinds.clone();
+        let observed_challenges = self.observed_challenges.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::Relaxed);
             observed_kinds.lock().expect("auth kinds").push(ctx.kind());
+            observed_challenges
+                .lock()
+                .expect("auth challenges")
+                .push(ctx.challenges());
             let Some(mut request) = ctx.try_clone_request() else {
                 return Ok(None);
             };
@@ -4589,6 +4624,16 @@ impl Authenticator for DecliningAuthenticator {
             Ok(None)
         })
     }
+}
+
+fn assert_single_realm_challenge(
+    challenges: &[AuthChallenge],
+    expected_scheme: &str,
+    expected_realm: &str,
+) {
+    assert_eq!(challenges.len(), 1, "challenges = {challenges:?}");
+    assert_eq!(challenges[0].scheme(), expected_scheme);
+    assert_eq!(challenges[0].realm(), Some(expected_realm));
 }
 
 impl RecordingInterceptor {
