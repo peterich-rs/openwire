@@ -9,6 +9,7 @@ use openwire_core::websocket::{
 };
 use openwire_core::{BoxConnection, CallContext, RequestBody, WireError};
 
+use crate::auth::AuthAttemptState;
 use crate::client::WebSocketCall;
 use crate::connection::Address;
 use crate::proxy::{ProxyChoice, ProxySelector, SelectedProxy};
@@ -81,7 +82,19 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
         let deps: ProxyConnectDeps = client
             .ws_connector()
             .proxy_connect_deps(client.ws_connector().connect_timeout);
-        let io = connect_route_plan(ctx.clone(), request.uri().clone(), route_plan, deps).await?;
+        let io = connect_route_plan(
+            ctx.clone(),
+            request.uri().clone(),
+            route_plan,
+            AuthAttemptState {
+                total_attempt: 1,
+                retry_count: 0,
+                redirect_count: 0,
+                auth_count: 0,
+            },
+            deps,
+        )
+        .await?;
         Ok::<BoxConnection, WireError>(io)
     };
 

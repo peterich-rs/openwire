@@ -197,6 +197,16 @@ Once a proxied attempt succeeds, later auth and redirect follow-ups in the same
 logical call prefer that proxy first so proxy-authorization state stays bound
 to the proxy that actually handled the request.
 
+Origin and proxy authenticators receive an `AuthContext` with the logical call
+counters accumulated before the authentication decision: total attempt number,
+retry count, redirect count, and completed auth follow-up count. HTTPS CONNECT
+proxy challenges are raised while the tunnel is being established, but their
+proxy authenticator context uses those same logical counters; repeated CONNECT
+407 tunnel retries add their tunnel-local proxy auth count to the logical auth
+count before calling the authenticator again. `ClientBuilder::max_auth_attempts`
+is a per-logical-call budget, so CONNECT proxy authentication also stops once
+the logical auth count plus completed CONNECT-local retries reaches that limit.
+
 ## Transparent Compression
 
 With the default `compression` feature enabled, the bridge injects
