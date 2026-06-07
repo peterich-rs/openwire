@@ -508,6 +508,15 @@ fn validate_request_uri(uri: &Uri) -> Result<(), WireError> {
         ));
     }
 
+    let authority = uri
+        .authority()
+        .ok_or_else(|| WireError::invalid_request("request URI is missing an authority"))?;
+    if authority.as_str().contains('@') {
+        return Err(WireError::invalid_request(
+            "request URI authority must not include userinfo",
+        ));
+    }
+
     if uri.host().is_none() {
         return Err(WireError::invalid_request("request URI is missing a host"));
     }
@@ -596,8 +605,8 @@ mod tests {
     use tower::{Service, ServiceExt};
 
     use super::{
-        same_origin, AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, PolicyTraceContext,
-        RequestSnapshot,
+        same_origin, validate_request_uri, AuthPolicyConfig, FollowUpPolicyService, PolicyConfig,
+        PolicyTraceContext, RequestSnapshot,
     };
     use crate::policy::{RedirectPolicyConfig, RetryPolicyConfig};
     use crate::RequestBody;
@@ -621,6 +630,19 @@ mod tests {
         let implicit = "http://example.com/path".parse().expect("implicit uri");
         let explicit = "http://example.com:80/other".parse().expect("explicit uri");
         assert!(same_origin(&implicit, &explicit).expect("same origin"));
+    }
+
+    #[test]
+    fn request_validation_rejects_uri_userinfo() {
+        let uri = "http://user:pass@example.com/resource"
+            .parse()
+            .expect("uri");
+        let error = validate_request_uri(&uri).expect_err("userinfo should fail validation");
+
+        assert!(
+            error.message().contains("must not include userinfo"),
+            "error = {error}",
+        );
     }
 
     #[test]
