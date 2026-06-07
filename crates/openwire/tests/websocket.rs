@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::Method;
-use openwire::{Client, RequestBody};
+use openwire::{Client, RequestBody, WireErrorKind};
 use openwire_core::websocket::{HandshakeFailure, Message, WebSocketError};
 use openwire_test::{spawn_websocket_echo, spawn_websocket_handler, RecordingEventListenerFactory};
 
@@ -91,6 +91,34 @@ async fn subprotocol_negotiated_successfully() {
         .await
         .expect("ws established without selected subprotocol");
     assert!(ws.handshake().subprotocol().is_none());
+}
+
+#[tokio::test]
+async fn invalid_subprotocol_rejected_before_connect() {
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = ws_request("ws://127.0.0.1:9/");
+
+    let result = client
+        .new_websocket(request)
+        .subprotocols(["chat room"])
+        .execute()
+        .await;
+
+    match result {
+        Err(WebSocketError::Io(error)) => {
+            assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+        }
+        Err(other) => panic!("expected invalid request error, got {other:?}"),
+        Ok(_) => panic!("invalid subprotocol must not establish a websocket"),
+    }
+    assert!(
+        events.events().is_empty(),
+        "invalid subprotocol should fail before call_start"
+    );
 }
 
 #[tokio::test]

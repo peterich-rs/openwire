@@ -134,6 +134,10 @@ impl<'a> WebSocketCall<'a> {
 }
 ```
 
+Each offered subprotocol must be a non-empty RFC 6455 token and must be unique
+within the offer list. Invalid names such as values containing whitespace,
+commas, separators, or non-ASCII bytes fail before any network I/O.
+
 `ClientBuilder` carries the same names (`websocket_handshake_timeout`,
 `websocket_max_frame_size`, etc.) for client-wide defaults, plus
 `websocket_engine(Arc<dyn WebSocketEngine>)` to switch the default engine.
@@ -378,7 +382,8 @@ requests by checking the `Upgrade` extension marker that
   is conceptual; the wire is HTTP/1.1).
 - Adds `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Version: 13`,
   generates a 16-byte random `Sec-WebSocket-Key` (base64-encoded).
-- Adds `Sec-WebSocket-Protocol: <comma-separated subprotocols>` if any.
+- Validates offered subprotocols as unique RFC 6455 tokens, then adds
+  `Sec-WebSocket-Protocol: <comma-separated subprotocols>` if any.
 - Disallows request bodies (caller-supplied `Request<()>` already enforces this).
 - Records the expected `Sec-WebSocket-Accept` value in `CallContext` for
   validation when the response arrives.

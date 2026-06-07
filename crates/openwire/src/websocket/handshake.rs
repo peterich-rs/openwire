@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use base64::Engine;
 use http::header::{CONNECTION, UPGRADE};
 use http::{HeaderMap, HeaderValue, Request, Uri, Version};
@@ -42,6 +44,13 @@ pub(crate) fn generate_client_key() -> String {
 }
 
 pub(crate) fn inject_handshake(request: &mut Request<RequestBody>) -> Result<(), WireError> {
+    let subprotocols = &request
+        .extensions()
+        .get::<WebSocketRequestMarker>()
+        .expect("WebSocketRequestMarker must be present when inject_handshake runs")
+        .subprotocols;
+    validate_subprotocols(subprotocols)?;
+
     request_must_be_get(request)?;
     rewrite_scheme(request)?;
     request
@@ -84,6 +93,50 @@ pub(crate) fn inject_handshake(request: &mut Request<RequestBody>) -> Result<(),
     request.extensions_mut().insert(RoutePreference::Http1Only);
 
     Ok(())
+}
+
+fn validate_subprotocols(protocols: &[String]) -> Result<(), WireError> {
+    let mut seen = HashSet::new();
+    for protocol in protocols {
+        if !is_subprotocol_token(protocol) {
+            return Err(WireError::invalid_request(format!(
+                "WebSocket subprotocol must be a non-empty RFC 6455 token: {protocol:?}"
+            )));
+        }
+        if !seen.insert(protocol.as_str()) {
+            return Err(WireError::invalid_request(format!(
+                "WebSocket subprotocol appears more than once: {protocol:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_subprotocol_token(protocol: &str) -> bool {
+    !protocol.is_empty() && protocol.bytes().all(is_http_token_byte)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    matches!(byte, 0x21..=0x7e)
+        && !matches!(
+            byte,
+            b'(' | b')'
+                | b'<'
+                | b'>'
+                | b'@'
+                | b','
+                | b';'
+                | b':'
+                | b'\\'
+                | b'"'
+                | b'/'
+                | b'['
+                | b']'
+                | b'?'
+                | b'='
+                | b'{'
+                | b'}'
+        )
 }
 
 fn request_must_be_get(request: &Request<RequestBody>) -> Result<(), WireError> {
@@ -349,6 +402,19 @@ mod response_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Method;
+
+    fn request_with_subprotocols(protocols: Vec<&str>) -> Request<RequestBody> {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("ws://example.com/socket")
+            .body(RequestBody::empty())
+            .expect("request");
+        request.extensions_mut().insert(WebSocketRequestMarker::new(
+            protocols.into_iter().map(String::from).collect(),
+        ));
+        request
+    }
 
     #[test]
     fn rfc_6455_section_1_3_example() {
@@ -372,5 +438,40 @@ mod tests {
         let a = generate_client_key();
         let b = generate_client_key();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn inject_handshake_accepts_valid_subprotocol_tokens() {
+        let mut request = request_with_subprotocols(vec!["chat", "superchat.v2"]);
+
+        inject_handshake(&mut request).expect("valid subprotocols");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("chat, superchat.v2")
+        );
+    }
+
+    #[test]
+    fn inject_handshake_rejects_invalid_subprotocol_tokens() {
+        for protocol in ["", "chat room", "chat,evil", "chat/evil", "chät"] {
+            let mut request = request_with_subprotocols(vec![protocol]);
+
+            let error = inject_handshake(&mut request).expect_err("invalid token");
+
+            assert_eq!(error.kind(), openwire_core::WireErrorKind::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn inject_handshake_rejects_duplicate_subprotocol_tokens() {
+        let mut request = request_with_subprotocols(vec!["chat", "chat"]);
+
+        let error = inject_handshake(&mut request).expect_err("duplicate token");
+
+        assert_eq!(error.kind(), openwire_core::WireErrorKind::InvalidRequest);
     }
 }
