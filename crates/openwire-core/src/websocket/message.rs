@@ -69,12 +69,13 @@ impl From<EngineFrame> for Message {
     }
 }
 
-/// RFC 6455 §7.4 close codes accepted on the wire. The 1004/1005/1006 codes
-/// are reserved for in-process signaling and must not appear in close frames.
+/// WebSocket close codes accepted on the wire. The 1004/1005/1006 and 1015
+/// codes are reserved for in-process signaling and must not appear in close
+/// frames.
 pub fn close_code_is_valid(code: u16) -> bool {
     matches!(
         code,
-        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 3000..=4999
+        1000..=1003 | 1007..=1014 | 3000..=4999
     )
 }
 
@@ -140,6 +141,9 @@ mod tests {
         assert!(!close_code_is_valid(1004));
         assert!(!close_code_is_valid(1005));
         assert!(!close_code_is_valid(1006));
+        assert!(close_code_is_valid(1012));
+        assert!(close_code_is_valid(1013));
+        assert!(close_code_is_valid(1014));
         assert!(!close_code_is_valid(1015));
         assert!(!close_code_is_valid(2999));
         assert!(close_code_is_valid(3000));
