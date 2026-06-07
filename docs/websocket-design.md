@@ -584,6 +584,13 @@ inner channel. Engines therefore never need to know about `EventListener`.
 | `websocket_engine` | `NativeEngine` | yes (`engine(Arc::new(...))`) | pluggability |
 | `websocket_deliver_control_frames` | false | yes | rare advanced use case |
 
+Runtime overrides are validated before `call_start`: `send_queue_size` must be
+greater than zero, `ping_interval` must be greater than zero when heartbeat is
+enabled, and `pong_timeout` must be greater than zero when supplied for an
+enabled heartbeat. If `pong_timeout` is omitted, the derived
+`ping_interval * 2` default must fit in `Duration`; otherwise the call fails as
+an invalid request instead of panicking or starting a busy heartbeat loop.
+
 ## 7. Error Model
 
 ```rust

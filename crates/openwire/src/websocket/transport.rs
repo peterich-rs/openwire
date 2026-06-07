@@ -50,6 +50,8 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
     let max_frame_size = max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE);
     let max_message_size = max_message_size.unwrap_or(DEFAULT_MAX_MESSAGE_SIZE);
     let send_queue_size = send_queue_size.unwrap_or(DEFAULT_SEND_QUEUE_SIZE);
+    let heartbeat = validate_runtime_config(send_queue_size, ping_interval, pong_timeout)
+        .map_err(WebSocketError::Io)?;
     let engine: SharedWebSocketEngine = engine.unwrap_or_else(|| Arc::new(NativeEngine::new()));
 
     request
@@ -139,10 +141,6 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
         validated.extensions,
     );
 
-    let heartbeat = ping_interval.map(|interval| HeartbeatConfig {
-        interval,
-        pong_timeout: pong_timeout.unwrap_or(interval * 2),
-    });
     ctx.listener().websocket_open(&ctx, &handshake);
     let session = spawn_session(
         channel,
@@ -165,6 +163,50 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
         receiver,
         handshake,
     })
+}
+
+fn validate_runtime_config(
+    send_queue_size: usize,
+    ping_interval: Option<Duration>,
+    pong_timeout: Option<Duration>,
+) -> Result<Option<HeartbeatConfig>, WireError> {
+    if send_queue_size == 0 {
+        return Err(invalid_runtime_config(
+            "WebSocket send_queue_size must be greater than 0",
+        ));
+    }
+
+    let Some(interval) = ping_interval else {
+        return Ok(None);
+    };
+    if interval.is_zero() {
+        return Err(invalid_runtime_config(
+            "WebSocket ping_interval must be greater than 0",
+        ));
+    }
+
+    let pong_timeout = match pong_timeout {
+        Some(timeout) if timeout.is_zero() => {
+            return Err(invalid_runtime_config(
+                "WebSocket pong_timeout must be greater than 0 when ping_interval is enabled",
+            ));
+        }
+        Some(timeout) => timeout,
+        None => interval.checked_mul(2).ok_or_else(|| {
+            invalid_runtime_config(
+                "WebSocket pong_timeout default would overflow for the configured ping_interval",
+            )
+        })?,
+    };
+
+    Ok(Some(HeartbeatConfig {
+        interval,
+        pong_timeout,
+    }))
+}
+
+fn invalid_runtime_config(message: &'static str) -> WireError {
+    WireError::invalid_request(message)
 }
 
 fn fail_before_open(ctx: &CallContext, error: WebSocketError) -> WebSocketError {

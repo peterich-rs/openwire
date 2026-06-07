@@ -122,6 +122,89 @@ async fn invalid_subprotocol_rejected_before_connect() {
 }
 
 #[tokio::test]
+async fn invalid_runtime_config_rejected_before_connect() {
+    enum Case {
+        SendQueueZero,
+        PingIntervalZero,
+        PongTimeoutZero,
+        DefaultPongTimeoutOverflow,
+    }
+
+    let cases = [
+        (
+            Case::SendQueueZero,
+            "send_queue_size must be greater than 0",
+        ),
+        (
+            Case::PingIntervalZero,
+            "ping_interval must be greater than 0",
+        ),
+        (Case::PongTimeoutZero, "pong_timeout must be greater than 0"),
+        (
+            Case::DefaultPongTimeoutOverflow,
+            "pong_timeout default would overflow",
+        ),
+    ];
+
+    for (case, expected_message) in cases {
+        let events = RecordingEventListenerFactory::default();
+        let client = Client::builder()
+            .event_listener_factory(events.clone())
+            .build()
+            .expect("client");
+        let request = ws_request("ws://127.0.0.1:9/");
+
+        let result = match case {
+            Case::SendQueueZero => {
+                client
+                    .new_websocket(request)
+                    .send_queue_size(0)
+                    .execute()
+                    .await
+            }
+            Case::PingIntervalZero => {
+                client
+                    .new_websocket(request)
+                    .ping_interval(Duration::ZERO)
+                    .execute()
+                    .await
+            }
+            Case::PongTimeoutZero => {
+                client
+                    .new_websocket(request)
+                    .ping_interval(Duration::from_secs(1))
+                    .pong_timeout(Duration::ZERO)
+                    .execute()
+                    .await
+            }
+            Case::DefaultPongTimeoutOverflow => {
+                client
+                    .new_websocket(request)
+                    .ping_interval(Duration::MAX)
+                    .execute()
+                    .await
+            }
+        };
+
+        match result {
+            Err(WebSocketError::Io(error)) => {
+                assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+                assert!(
+                    error.message().contains(expected_message),
+                    "unexpected error message: {error}"
+                );
+            }
+            Err(other) => panic!("expected invalid request error, got {other:?}"),
+            Ok(_) => panic!("invalid runtime config must not establish a websocket"),
+        }
+        assert!(
+            events.events().is_empty(),
+            "invalid runtime config should fail before call_start"
+        );
+    }
+}
+
+#[tokio::test]
 async fn server_initiated_close_reaches_client() {
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(1);
     let server = spawn_websocket_handler(move |mut websocket| {
