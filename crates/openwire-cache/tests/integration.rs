@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use http::header::{
-    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
     LAST_MODIFIED, VARY,
 };
 use http::{Request, StatusCode};
@@ -198,6 +198,59 @@ async fn request_no_store_does_not_store_forwarded_response() {
 }
 
 #[tokio::test]
+async fn request_max_age_uses_response_apparent_age() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let date = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(120));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let date = date.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            let date = date.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = text_response(StatusCode::OK, format!("apparent-age {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=300".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(DATE, date.parse().expect("date"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/request-max-age")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "apparent-age 1"
+    );
+
+    let second = client
+        .execute(request_with_header(
+            server.http_url("/request-max-age"),
+            CACHE_CONTROL,
+            "max-age=60",
+        ))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "apparent-age 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn expires_header_can_make_response_fresh() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = spawn_http1({
@@ -240,6 +293,194 @@ async fn expires_header_can_make_response_fresh() {
         "expires body"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn last_modified_response_uses_heuristic_freshness_when_explicit_freshness_absent() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let now = SystemTime::now();
+    let date = httpdate::fmt_http_date(now);
+    let last_modified = httpdate::fmt_http_date(now - Duration::from_secs(1_000));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let date = date.clone();
+        let last_modified = last_modified.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            let date = date.clone();
+            let last_modified = last_modified.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut response = text_response(StatusCode::OK, "heuristic body");
+                response
+                    .headers_mut()
+                    .insert(DATE, date.parse().expect("date"));
+                response
+                    .headers_mut()
+                    .insert(LAST_MODIFIED, last_modified.parse().expect("last-modified"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/heuristic")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "heuristic body"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/heuristic")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "heuristic body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn explicit_expired_expires_prevents_last_modified_heuristic_reuse() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let now = SystemTime::now();
+    let date = httpdate::fmt_http_date(now);
+    let expires = httpdate::fmt_http_date(now - Duration::from_secs(60));
+    let last_modified = httpdate::fmt_http_date(now - Duration::from_secs(1_000));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let date = date.clone();
+        let expires = expires.clone();
+        let last_modified = last_modified.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            let date = date.clone();
+            let expires = expires.clone();
+            let last_modified = last_modified.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit > 1 {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(IF_MODIFIED_SINCE)
+                            .expect("if-modified-since")
+                            .to_str()
+                            .expect("header value"),
+                        last_modified
+                    );
+                }
+                let mut response = text_response(StatusCode::OK, format!("expired body {hit}"));
+                response
+                    .headers_mut()
+                    .insert(DATE, date.parse().expect("date"));
+                response
+                    .headers_mut()
+                    .insert(EXPIRES, expires.parse().expect("expires"));
+                response
+                    .headers_mut()
+                    .insert(LAST_MODIFIED, last_modified.parse().expect("last-modified"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/expired-expires")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "expired body 1"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/expired-expires")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "expired body 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn invalid_expires_prevents_last_modified_heuristic_reuse() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let now = SystemTime::now();
+    let date = httpdate::fmt_http_date(now);
+    let last_modified = httpdate::fmt_http_date(now - Duration::from_secs(1_000));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let date = date.clone();
+        let last_modified = last_modified.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            let date = date.clone();
+            let last_modified = last_modified.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit > 1 {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(IF_MODIFIED_SINCE)
+                            .expect("if-modified-since")
+                            .to_str()
+                            .expect("header value"),
+                        last_modified
+                    );
+                }
+                let mut response =
+                    text_response(StatusCode::OK, format!("invalid expires body {hit}"));
+                response
+                    .headers_mut()
+                    .insert(DATE, date.parse().expect("date"));
+                response
+                    .headers_mut()
+                    .insert(EXPIRES, "0".parse().expect("expires"));
+                response
+                    .headers_mut()
+                    .insert(LAST_MODIFIED, last_modified.parse().expect("last-modified"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/invalid-expires")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "invalid expires body 1"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/invalid-expires")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "invalid expires body 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -530,6 +771,64 @@ async fn cached_hits_generate_current_age_header() {
     assert_eq!(
         second.into_body().text().await.expect("body"),
         "aged cache hit"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cached_hits_include_apparent_age_from_response_date() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let date = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(120));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let date = date.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            let date = date.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut response = text_response(StatusCode::OK, "dated cache hit");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=300".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(DATE, date.parse().expect("date"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/cache-date-age")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "dated cache hit"
+    );
+
+    let second = client
+        .execute(empty_request(server.http_url("/cache-date-age")))
+        .await
+        .expect("cached response");
+    let age = second
+        .headers()
+        .get(AGE)
+        .expect("age")
+        .to_str()
+        .expect("age string")
+        .parse::<u64>()
+        .expect("age seconds");
+    assert!(age >= 120, "age = {age}");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "dated cache hit"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }

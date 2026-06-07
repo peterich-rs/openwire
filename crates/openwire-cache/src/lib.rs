@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{
-    AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, EXPIRES,
+    AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, DATE, ETAG, EXPIRES,
     IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, SET_COOKIE, TRANSFER_ENCODING, VARY,
 };
 use http::{
@@ -15,6 +15,7 @@ use openwire::{BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody
 use tokio::sync::RwLock;
 
 const MAX_DELTA_SECONDS: u64 = 2_147_483_648;
+const LAST_MODIFIED_HEURISTIC_DENOMINATOR: u64 = 10;
 
 #[derive(Clone)]
 pub struct CacheInterceptor<S = MemoryCacheStore> {
@@ -404,6 +405,7 @@ pub struct CachedResponse {
     headers: HeaderMap,
     body: Bytes,
     stored_at: Instant,
+    initial_age: Duration,
     fresh_until: Instant,
     vary: CapturedVary,
     must_validate: bool,
@@ -438,12 +440,14 @@ impl CachedResponse {
         must_validate: bool,
     ) -> Self {
         let stored_at = Instant::now();
+        let initial_age = response_current_age(&headers, SystemTime::now());
         Self {
             status,
             version,
             headers,
             body,
             stored_at,
+            initial_age,
             fresh_until: stored_at
                 .checked_add(fresh_for)
                 .unwrap_or_else(|| stored_at + Duration::from_secs(MAX_DELTA_SECONDS)),
@@ -463,7 +467,7 @@ impl CachedResponse {
         }
 
         if let Some(max_age) = request_policy.max_age {
-            if now.duration_since(self.stored_at) > max_age {
+            if self.current_age() > max_age {
                 return false;
             }
         }
@@ -529,7 +533,7 @@ impl CachedResponse {
     }
 
     fn current_age(&self) -> Duration {
-        response_age(&self.headers).saturating_add(self.stored_at.elapsed())
+        self.initial_age.saturating_add(self.stored_at.elapsed())
     }
 
     fn into_response(self) -> Response<ResponseBody> {
@@ -557,15 +561,62 @@ fn response_is_storable(
 }
 
 fn response_freshness(headers: &HeaderMap, directives: &CacheDirectives) -> Option<Duration> {
+    let now = SystemTime::now();
+    let current_age = response_current_age(headers, now);
     if let Some(max_age) = directives.max_age {
-        let age = response_age(headers);
-        return Some(max_age.checked_sub(age).unwrap_or_default());
+        return Some(max_age.checked_sub(current_age).unwrap_or_default());
     }
 
-    let expires = headers.get(EXPIRES)?.to_str().ok()?;
-    let expires = httpdate::parse_http_date(expires).ok()?;
-    let remaining = expires.duration_since(SystemTime::now()).ok()?;
-    (!remaining.is_zero()).then_some(remaining)
+    if let Some(freshness_lifetime) = explicit_expires_lifetime(headers, now) {
+        return Some(
+            freshness_lifetime
+                .checked_sub(current_age)
+                .unwrap_or_default(),
+        );
+    }
+
+    heuristic_freshness_lifetime(headers, now)
+        .map(|freshness_lifetime| {
+            freshness_lifetime
+                .checked_sub(current_age)
+                .unwrap_or_default()
+        })
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn explicit_expires_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let expires = match headers.get(EXPIRES) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| httpdate::parse_http_date(value).ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+        None => return None,
+    };
+    let date = parse_http_date_header(headers, DATE).unwrap_or(now);
+    Some(expires.duration_since(date).unwrap_or_default())
+}
+
+fn heuristic_freshness_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let last_modified = parse_http_date_header(headers, LAST_MODIFIED)?;
+    let date = parse_http_date_header(headers, DATE).unwrap_or(now);
+    let since_last_modified = date.duration_since(last_modified).ok()?;
+    let heuristic_seconds = since_last_modified.as_secs() / LAST_MODIFIED_HEURISTIC_DENOMINATOR;
+    (heuristic_seconds > 0).then(|| Duration::from_secs(heuristic_seconds))
+}
+
+fn parse_http_date_header(headers: &HeaderMap, name: HeaderName) -> Option<SystemTime> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+}
+
+fn response_current_age(headers: &HeaderMap, now: SystemTime) -> Duration {
+    let apparent_age = parse_http_date_header(headers, DATE)
+        .and_then(|date| now.duration_since(date).ok())
+        .unwrap_or_default();
+    apparent_age.max(response_age(headers))
 }
 
 fn merge_304_headers(stored: &HeaderMap, validation: &HeaderMap) -> HeaderMap {
