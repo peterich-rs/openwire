@@ -285,6 +285,9 @@ fn engine_to_fast(frame: EngineFrame) -> FastFrame<'static> {
             FastFrame::new(true, FastOpCode::Ping, None, bytes.to_vec().into())
         }
         EngineFrame::Pong(bytes) => FastFrame::pong(bytes.to_vec().into()),
+        EngineFrame::Close { code: 1005, reason } if reason.is_empty() => {
+            FastFrame::new(true, FastOpCode::Close, None, Vec::<u8>::new().into())
+        }
         EngineFrame::Close { code, reason } => FastFrame::close(code, reason.as_bytes()),
     }
 }
@@ -360,4 +363,21 @@ fn protocol_io_error(message: &'static str, error: std::io::Error) -> WebSocketE
 
 fn closed_sink_error(message: &'static str) -> WebSocketEngineError {
     WebSocketEngineError::Io(WireError::new(WireErrorKind::Protocol, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_status_close_ack_maps_to_empty_fastwebsockets_close() {
+        let frame = engine_to_fast(EngineFrame::Close {
+            code: 1005,
+            reason: String::new(),
+        });
+
+        assert!(frame.fin);
+        assert_eq!(frame.opcode, FastOpCode::Close);
+        assert!(frame.payload.is_empty());
+    }
 }

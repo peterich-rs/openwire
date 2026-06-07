@@ -152,6 +152,7 @@ fn engine_to_tung(frame: EngineFrame) -> TungMessage {
         EngineFrame::Binary(bytes) => TungMessage::Binary(bytes.to_vec()),
         EngineFrame::Ping(bytes) => TungMessage::Ping(bytes.to_vec()),
         EngineFrame::Pong(bytes) => TungMessage::Pong(bytes.to_vec()),
+        EngineFrame::Close { code: 1005, reason } if reason.is_empty() => TungMessage::Close(None),
         EngineFrame::Close { code, reason } => TungMessage::Close(Some(CloseFrame {
             code: CloseCode::from(code),
             reason: reason.into(),
@@ -192,5 +193,20 @@ fn map_error(error: tokio_tungstenite::tungstenite::Error) -> WebSocketEngineErr
         },
         TE::Protocol(error) => WebSocketEngineError::InvalidFrame(error.to_string()),
         other => WebSocketEngineError::InvalidFrame(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_status_close_ack_maps_to_empty_tungstenite_close() {
+        let message = engine_to_tung(EngineFrame::Close {
+            code: 1005,
+            reason: String::new(),
+        });
+
+        assert!(matches!(message, TungMessage::Close(None)));
     }
 }

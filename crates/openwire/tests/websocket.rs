@@ -182,6 +182,50 @@ async fn server_initiated_close_reaches_client() {
 }
 
 #[tokio::test]
+async fn empty_server_close_is_acknowledged_without_status_code() {
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(1);
+    let server = spawn_websocket_handler(move |mut websocket| {
+        let ack_tx = ack_tx.clone();
+        async move {
+            let _ = websocket
+                .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await;
+            let ack = matches!(
+                tokio::time::timeout(Duration::from_secs(1), websocket.next()).await,
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(
+                    None
+                ))))
+            );
+            let _ = ack_tx.send(ack).await;
+        }
+    })
+    .await;
+
+    let client = Client::builder().build().expect("client");
+    let request = ws_request(&format!("ws://{}/", server.addr()));
+    let ws = client
+        .new_websocket(request)
+        .execute()
+        .await
+        .expect("ws established");
+    let (_sender, mut receiver) = ws.split();
+
+    match receiver.next().await {
+        Some(Err(WebSocketError::ClosedByPeer { code, reason })) => {
+            assert_eq!(code, 1005);
+            assert!(reason.is_empty());
+        }
+        other => panic!("expected empty ClosedByPeer, got {other:?}"),
+    }
+
+    let acked = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
+        .await
+        .expect("server should observe empty close ack")
+        .expect("ack result");
+    assert!(acked, "server should receive an empty close ack");
+}
+
+#[tokio::test]
 async fn client_initiated_close_completes() {
     let server = spawn_websocket_echo().await;
     let client = Client::builder().build().expect("client");

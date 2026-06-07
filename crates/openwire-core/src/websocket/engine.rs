@@ -32,7 +32,13 @@ pub enum EngineFrame {
     Binary(Bytes),
     Ping(Bytes),
     Pong(Bytes),
-    Close { code: u16, reason: String },
+    /// Close frame. `code == 1005` with an empty reason is the internal
+    /// "no status code received" sentinel and must be encoded as an empty
+    /// close payload, never as a two-byte wire close code.
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
 pub type BoxEngineSink = Pin<Box<dyn Sink<EngineFrame, Error = WebSocketEngineError> + Send>>;
