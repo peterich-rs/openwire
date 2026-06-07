@@ -1,6 +1,6 @@
 use base64::Engine;
 use http::header::{CONNECTION, UPGRADE};
-use http::{HeaderValue, Request, Uri, Version};
+use http::{HeaderMap, HeaderValue, Request, Uri, Version};
 use sha1::{Digest, Sha1};
 
 use openwire_core::websocket::HandshakeFailure;
@@ -162,21 +162,30 @@ pub(crate) fn validate_handshake_response<B>(
         }
     };
 
-    let extensions: Vec<String> = headers
-        .get("sec-websocket-extensions")
-        .and_then(|value| value.to_str().ok())
-        .map(|raw| {
-            raw.split(',')
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    reject_unrequested_extensions(headers)?;
 
     Ok(ValidatedHandshake {
         subprotocol,
-        extensions,
+        extensions: Vec::new(),
     })
+}
+
+fn reject_unrequested_extensions(headers: &HeaderMap) -> Result<(), HandshakeFailure> {
+    for value in headers.get_all("sec-websocket-extensions") {
+        let raw = value
+            .to_str()
+            .map_err(|_| HandshakeFailure::UnsupportedExtension("<invalid>".into()))?;
+        if let Some(extension) = raw
+            .split(',')
+            .map(str::trim)
+            .find(|extension| !extension.is_empty())
+        {
+            return Err(HandshakeFailure::UnsupportedExtension(
+                extension.to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_scheme(request: &mut Request<RequestBody>) -> Result<(), WireError> {
@@ -278,16 +287,35 @@ mod response_tests {
     }
 
     #[test]
-    fn extracts_extensions_when_present() {
+    fn rejects_unrequested_extensions() {
         let mut response = ok_response("expected");
         response.headers_mut().insert(
             "sec-websocket-extensions",
             HeaderValue::from_static("permessage-deflate, future"),
         );
-        let validated = validate_handshake_response(&response, "expected", &[]).unwrap();
-        assert_eq!(validated.extensions.len(), 2);
-        assert_eq!(validated.extensions[0], "permessage-deflate");
-        assert_eq!(validated.extensions[1], "future");
+        let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeFailure::UnsupportedExtension(extension)
+                if extension == "permessage-deflate"
+        ));
+    }
+
+    #[test]
+    fn rejects_unrequested_extensions_across_multiple_header_fields() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .append("sec-websocket-extensions", HeaderValue::from_static(" "));
+        response.headers_mut().append(
+            "sec-websocket-extensions",
+            HeaderValue::from_static("future"),
+        );
+        let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeFailure::UnsupportedExtension(extension) if extension == "future"
+        ));
     }
 }
 

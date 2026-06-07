@@ -237,6 +237,68 @@ async fn rejects_non_websocket_response() {
 }
 
 #[tokio::test]
+async fn rejects_unrequested_server_extensions() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let read = stream.read(&mut buf).await.expect("read");
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request);
+        let key = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .expect("websocket key");
+        let accept = websocket_accept(key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate\r\n\
+             \r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+    });
+
+    let client = Client::builder().build().expect("client");
+    let request = ws_request(&format!("ws://{addr}/"));
+    let result = client.new_websocket(request).execute().await;
+    match result {
+        Err(WebSocketError::Handshake {
+            status: Some(status),
+            reason: HandshakeFailure::UnsupportedExtension(extension),
+        }) => {
+            assert_eq!(status, http::StatusCode::SWITCHING_PROTOCOLS);
+            assert_eq!(extension, "permessage-deflate");
+        }
+        Err(other) => panic!("expected UnsupportedExtension handshake failure, got {other:?}"),
+        Ok(_) => panic!("unrequested extension must not produce a websocket"),
+    }
+}
+
+#[tokio::test]
 async fn handshake_timeout_fires_when_server_silent() {
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -252,4 +314,14 @@ async fn handshake_timeout_fires_when_server_silent() {
         .execute()
         .await;
     assert!(matches!(result, Err(WebSocketError::Timeout(_))));
+}
+
+fn websocket_accept(client_key: &str) -> String {
+    use base64::Engine;
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(client_key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
