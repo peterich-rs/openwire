@@ -133,6 +133,11 @@ OpenWire does not choose credentials by itself. The caller's authenticator
 selects a supported challenge and returns a replayable follow-up request with
 `Authorization` or `Proxy-Authorization` as appropriate.
 
+Proxy authentication follow-ups are only attempted for responses produced by a
+selected proxy route. If an origin server on a direct route returns `407`,
+OpenWire returns that response to the caller instead of treating it as a proxy
+challenge.
+
 ## HTTP Logging
 
 OpenWire includes an OkHttp-style `LoggerInterceptor` that can be attached as an
@@ -199,13 +204,15 @@ to the proxy that actually handled the request.
 
 Origin and proxy authenticators receive an `AuthContext` with the logical call
 counters accumulated before the authentication decision: total attempt number,
-retry count, redirect count, and completed auth follow-up count. HTTPS CONNECT
-proxy challenges are raised while the tunnel is being established, but their
-proxy authenticator context uses those same logical counters; repeated CONNECT
-407 tunnel retries add their tunnel-local proxy auth count to the logical auth
-count before calling the authenticator again. `ClientBuilder::max_auth_attempts`
-is a per-logical-call budget, so CONNECT proxy authentication also stops once
-the logical auth count plus completed CONNECT-local retries reaches that limit.
+retry count, redirect count, and completed auth follow-up count. Forward-proxy
+HTTP `407` follow-ups require a selected proxy route; direct-origin `407`
+responses are returned unchanged. HTTPS CONNECT proxy challenges are raised
+while the tunnel is being established, but their proxy authenticator context
+uses those same logical counters; repeated CONNECT 407 tunnel retries add their
+tunnel-local proxy auth count to the logical auth count before calling the
+authenticator again. `ClientBuilder::max_auth_attempts` is a per-logical-call
+budget, so CONNECT proxy authentication also stops once the logical auth count
+plus completed CONNECT-local retries reaches that limit.
 
 ## Transparent Compression
 
