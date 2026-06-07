@@ -6540,7 +6540,7 @@ impl TraceCapture {
                 event
                     .fields
                     .get("message")
-                    .is_some_and(|value| value == message)
+                    .is_some_and(|value| value.trim_matches('"') == message)
             })
             .cloned()
     }
