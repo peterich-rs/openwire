@@ -297,7 +297,7 @@ async fn authenticate_response(
 ) -> Result<Option<(Request<RequestBody>, u32)>, WireError> {
     let (kind, authenticator): (AuthKind, Option<&SharedAuthenticator>) = match response.status() {
         StatusCode::UNAUTHORIZED => (AuthKind::Origin, config.authenticator.as_ref()),
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED if selected_proxy.is_some() => {
             (AuthKind::Proxy, config.proxy_authenticator.as_ref())
         }
         _ => (AuthKind::Origin, None),
