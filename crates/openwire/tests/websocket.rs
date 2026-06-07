@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::Method;
 use openwire::{Client, RequestBody, WireErrorKind};
-use openwire_core::websocket::{HandshakeFailure, Message, WebSocketError};
+use openwire_core::websocket::{HandshakeFailure, Message, WebSocketEngineError, WebSocketError};
 use openwire_test::{spawn_websocket_echo, spawn_websocket_handler, RecordingEventListenerFactory};
 
 fn ws_request(uri: &str) -> http::Request<RequestBody> {
@@ -286,6 +286,21 @@ async fn event_listener_records_websocket_lifecycle_once() {
         1,
         "websocket_closed should fire exactly once: {events:?}"
     );
+    assert_eq!(
+        events.iter().filter(|event| *event == "call_end").count(),
+        1,
+        "call_end should fire once after close: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("call_failed")),
+        "graceful close should not fail call lifecycle: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("websocket_failed")),
+        "graceful close should not fail websocket lifecycle: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -312,7 +327,11 @@ async fn rejects_non_websocket_response() {
     use openwire_test::{ok_text, spawn_http1};
 
     let server = spawn_http1(|_| async { ok_text("not a websocket") }).await;
-    let client = Client::builder().build().expect("client");
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
     let request = ws_request(&format!("ws://{}/", server.addr()));
 
     let result = client.new_websocket(request).execute().await;
@@ -324,6 +343,30 @@ async fn rejects_non_websocket_response() {
         Err(other) => panic!("expected UnexpectedStatus handshake failure, got {other:?}"),
         Ok(_) => panic!("plain HTTP response must not produce a websocket"),
     }
+
+    let events = events.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("call_start GET")),
+        "handshake failure after execution starts should record call_start: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "websocket_failed handshake failed: UnexpectedStatus"),
+        "handshake failure should record websocket_failed: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event == "call_failed Protocol"),
+        "handshake failure should terminate the call lifecycle: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("websocket_open")),
+        "failed handshake must not record websocket_open: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -404,6 +447,91 @@ async fn handshake_timeout_fires_when_server_silent() {
         .execute()
         .await;
     assert!(matches!(result, Err(WebSocketError::Timeout(_))));
+}
+
+#[tokio::test]
+async fn server_disconnect_without_close_reports_protocol_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let read = stream.read(&mut buf).await.expect("read");
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request);
+        let key = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .expect("websocket key");
+        let accept = websocket_accept(key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             \r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+        // Drop without sending a WebSocket Close frame.
+    });
+
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = ws_request(&format!("ws://{addr}/"));
+    let ws = client
+        .new_websocket(request)
+        .execute()
+        .await
+        .expect("websocket established");
+    let (_sender, mut receiver) = ws.split();
+
+    match receiver.next().await {
+        Some(Err(WebSocketError::Engine(WebSocketEngineError::InvalidFrame(reason)))) => {
+            assert_eq!(reason, "websocket stream ended before close frame");
+        }
+        other => panic!("expected abnormal websocket EOF failure, got {other:?}"),
+    }
+
+    let events = events.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "websocket_open 101 Switching Protocols"),
+        "successful 101 should still record websocket_open: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event == "websocket_failed invalid frame: websocket stream ended before close frame"
+        }),
+        "abnormal EOF should record websocket_failed: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event == "call_failed Protocol"),
+        "abnormal EOF should fail call lifecycle: {events:?}"
+    );
 }
 
 fn websocket_accept(client_key: &str) -> String {

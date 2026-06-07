@@ -19,7 +19,9 @@ use crate::websocket::handshake::{
 };
 use crate::websocket::native::NativeEngine;
 use crate::websocket::public::{WebSocket, WebSocketReceiver, WebSocketSender};
-use crate::websocket::writer::{spawn_session, HeartbeatConfig, SessionConfig};
+use crate::websocket::writer::{
+    spawn_session, websocket_error_as_wire_error, HeartbeatConfig, SessionConfig,
+};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,10 +102,11 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
 
     let io = match tokio::time::timeout(handshake_timeout, connect).await {
         Ok(Ok(io)) => io,
-        Ok(Err(error)) => return Err(WebSocketError::Io(error)),
+        Ok(Err(error)) => return Err(fail_before_open(&ctx, WebSocketError::Io(error))),
         Err(_) => {
-            return Err(WebSocketError::Timeout(
-                openwire_core::websocket::TimeoutKind::Handshake,
+            return Err(fail_before_open(
+                &ctx,
+                WebSocketError::Timeout(openwire_core::websocket::TimeoutKind::Handshake),
             ))
         }
     };
@@ -120,10 +123,11 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
     let (response, channel, validated) =
         match tokio::time::timeout(handshake_timeout, handshake_future).await {
             Ok(Ok(triple)) => triple,
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => return Err(fail_before_open(&ctx, error)),
             Err(_) => {
-                return Err(WebSocketError::Timeout(
-                    openwire_core::websocket::TimeoutKind::Handshake,
+                return Err(fail_before_open(
+                    &ctx,
+                    WebSocketError::Timeout(openwire_core::websocket::TimeoutKind::Handshake),
                 ))
             }
         };
@@ -161,6 +165,13 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
         receiver,
         handshake,
     })
+}
+
+fn fail_before_open(ctx: &CallContext, error: WebSocketError) -> WebSocketError {
+    ctx.listener().websocket_failed(ctx, &error);
+    let wire_error = websocket_error_as_wire_error(&error);
+    ctx.listener().call_failed(ctx, &wire_error);
+    error
 }
 
 async fn run_handshake(
