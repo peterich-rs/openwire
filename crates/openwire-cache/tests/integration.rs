@@ -6,7 +6,7 @@ use http::header::{
     ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
     LAST_MODIFIED, PRAGMA, VARY,
 };
-use http::{Request, StatusCode};
+use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
 use openwire::{Client, RequestBody};
 use openwire_cache::CacheInterceptor;
@@ -300,6 +300,115 @@ async fn request_no_store_does_not_store_forwarded_response() {
         .await
         .expect("second response");
     assert_eq!(second.into_body().text().await.expect("body"), "body-2");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn successful_unsafe_method_invalidates_cached_target_uri() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if request.method() == Method::POST {
+                    return text_response(StatusCode::OK, "updated");
+                }
+
+                let mut response = text_response(StatusCode::OK, format!("cached-body-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/unsafe-invalidation");
+
+    let first = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "cached-body-1"
+    );
+
+    let post = client
+        .execute(method_request(&uri, Method::POST))
+        .await
+        .expect("post response");
+    assert_eq!(post.into_body().text().await.expect("body"), "updated");
+
+    let refreshed = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("refreshed response");
+    assert_eq!(
+        refreshed.into_body().text().await.expect("body"),
+        "cached-body-3"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn error_response_to_unsafe_method_keeps_cached_target_uri() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if request.method() == Method::POST {
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+                }
+
+                let mut response = text_response(StatusCode::OK, format!("cached-body-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/unsafe-error-keeps-cache");
+
+    let first = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "cached-body-1"
+    );
+
+    let post = client
+        .execute(method_request(&uri, Method::POST))
+        .await
+        .expect("post response");
+    assert_eq!(post.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(post.into_body().text().await.expect("body"), "failed");
+
+    let cached = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached.into_body().text().await.expect("body"),
+        "cached-body-1"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
@@ -1298,6 +1407,14 @@ async fn only_if_cached_returns_gateway_timeout_on_miss() {
 
 fn empty_request(uri: impl AsRef<str>) -> Request<RequestBody> {
     Request::builder()
+        .uri(uri.as_ref())
+        .body(RequestBody::empty())
+        .expect("request")
+}
+
+fn method_request(uri: impl AsRef<str>, method: Method) -> Request<RequestBody> {
+    Request::builder()
+        .method(method)
         .uri(uri.as_ref())
         .body(RequestBody::empty())
         .expect("request")

@@ -252,6 +252,8 @@ controls needed to avoid unsafe reuse:
   refresh stored metadata before returning the cached body as `200 OK`
 - stale stored responses are served only when the request explicitly permits
   them with `max-stale` and the cached response does not require validation
+- non-error `2xx` / `3xx` unsafe-method responses invalidate stored responses
+  for the target URI
 - cached hits generate a current `Age` header
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
