@@ -61,6 +61,38 @@ async fn basic_get_returns_body() {
 }
 
 #[tokio::test]
+async fn request_uri_userinfo_is_rejected_before_network() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ok_text("should not be reached")
+            }
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://user:pass@127.0.0.1:{}/userinfo",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("userinfo must be rejected before network");
+
+    assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+    assert!(
+        error.message().contains("must not include userinfo"),
+        "error = {error}",
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn client_call_timeout_applies_to_requests() {
     let server = spawn_http1(|_request| async move {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

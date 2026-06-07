@@ -22,6 +22,8 @@ blocks, and stable observability hooks.
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
   with structured HTTP authentication challenge parsing
+- request validation rejects HTTP URI authorities that include userinfo before
+  bridge normalization or network I/O
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
   through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
