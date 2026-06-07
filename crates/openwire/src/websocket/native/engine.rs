@@ -267,6 +267,14 @@ impl Stream for NativeStream {
                     }
                     Poll::Ready(Ok(true)) => {
                         me.done = true;
+                        if !me.buf.is_empty() {
+                            return Poll::Ready(Some(Err(WebSocketEngineError::InvalidFrame(
+                                "truncated websocket frame".into(),
+                            ))));
+                        }
+                        if let Err(error) = me.reassembly.end_of_stream() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
                         return Poll::Ready(None);
                     }
                     Poll::Ready(Ok(false)) => continue,
@@ -453,6 +461,73 @@ mod tests {
             .upgrade(box_connection(client_io), cfg)
             .await
             .expect("upgrade");
+        assert!(channel.recv.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn engine_rejects_eof_during_fragmented_message() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        // Server writes a Text frame with FIN=0 and then closes before the
+        // final continuation frame.
+        server_io
+            .write_all(&[0x01, 0x02, b'h', b'i'])
+            .await
+            .expect("server write");
+        drop(server_io);
+
+        let engine = NativeEngine::new();
+        let cfg = WebSocketEngineConfig {
+            role: Role::Client,
+            subprotocol: None,
+            extensions: vec![],
+            max_frame_size: 1024,
+            max_message_size: 1024,
+        };
+        let mut channel = engine
+            .upgrade(box_connection(client_io), cfg)
+            .await
+            .expect("upgrade");
+
+        let err = channel
+            .recv
+            .next()
+            .await
+            .expect("frame result")
+            .expect_err("incomplete fragment must be rejected");
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
+        assert!(channel.recv.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn engine_rejects_eof_during_partial_frame() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        // Header declares a two-byte Text payload but only one byte arrives.
+        server_io
+            .write_all(&[0x81, 0x02, b'h'])
+            .await
+            .expect("server write");
+        drop(server_io);
+
+        let engine = NativeEngine::new();
+        let cfg = WebSocketEngineConfig {
+            role: Role::Client,
+            subprotocol: None,
+            extensions: vec![],
+            max_frame_size: 1024,
+            max_message_size: 1024,
+        };
+        let mut channel = engine
+            .upgrade(box_connection(client_io), cfg)
+            .await
+            .expect("upgrade");
+
+        let err = channel
+            .recv
+            .next()
+            .await
+            .expect("frame result")
+            .expect_err("partial frame must be rejected");
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
         assert!(channel.recv.next().await.is_none());
     }
 }
