@@ -216,6 +216,9 @@ follow-ups (pool reuse, interceptor chain integration).
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
+- Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
+  and HTTP URI authorities that include userinfo before bridge normalization can
+  derive `Host` or transport can route the request.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
 - Forward-proxy HTTP `407` follow-ups are only attempted when the transport
