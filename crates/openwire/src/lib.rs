@@ -1,6 +1,8 @@
 mod auth;
 mod bridge;
 mod client;
+#[cfg(feature = "compression")]
+mod compression;
 mod connection;
 mod cookie;
 mod logging;

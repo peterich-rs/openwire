@@ -44,7 +44,7 @@ flowchart LR
 
 | Crate | Responsibility |
 | --- | --- |
-| `crates/openwire` | public client API, interceptor chain, follow-up policy, bridge normalization, transport orchestration, connection management, route planning |
+| `crates/openwire` | public client API, interceptor chain, follow-up policy, bridge normalization, transparent compression, transport orchestration, connection management, route planning |
 | `crates/openwire-core` | shared body types, errors, call metadata, event traits, executor/timer traits, transport traits, policy traits |
 | `crates/openwire-tokio` | Tokio executor, timer, I/O adapter, system DNS, TCP connector |
 | `crates/openwire-rustls` | default Rustls-backed TLS connector |
@@ -74,6 +74,17 @@ flowchart TD
 ```
 
 No feature should bypass this chain.
+
+`BridgeInterceptor` owns HTTP request/response normalization that is above the
+transport byte stream but below user-facing application interceptors. That
+includes `Host`, `User-Agent`, request body framing headers, WebSocket handshake
+headers, and transparent compression. When the default `compression` feature is
+enabled, bridge injects `Accept-Encoding: br, gzip, deflate, zstd` only for
+requests that did not already specify `Accept-Encoding` and are not range
+requests. Matching compressed responses are decoded as a stream on the return
+path, with `Content-Encoding` and compressed `Content-Length` removed before the
+response reaches application interceptors or callers. Network interceptors still
+observe the normalized request and wire response for each network attempt.
 
 ## 4. Transport Layering
 
