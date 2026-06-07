@@ -442,6 +442,7 @@ The writer task owns the engine's `BoxSink<EngineFrame>` and consumes from a
 - `Pong(Bytes)` — auto-reply to received `Ping`
 - `Ping(Bytes)` — heartbeat
 - `Close { code, reason }` — explicit close from user `close()`
+- `CloseAck { code, reason }` — automatic acknowledgement for a remote close
 - `Cancel` — abort without sending close
 
 The writer task processes commands FIFO. `WebSocketSender::send_*` validates
@@ -459,6 +460,11 @@ queue is full, providing natural backpressure.
 When the writer task observes a `Close` command, it sends the close frame,
 then waits up to `close_timeout` for the receiver task to surface a remote
 close. On timeout, it forces socket teardown.
+When the receiver task observes a remote close before local close has started,
+it enqueues `CloseAck` with the peer's code and reason. The writer drops any
+later queued data/control sends, writes that close acknowledgement, flushes,
+and exits without waiting for `close_timeout`. If local close is already in
+progress, the receiver still enqueues `Cancel` to wake the writer's wait loop.
 `WebSocketSender::close` validates the close code and reason byte length
 before it marks the sender closed, so a rejected close leaves the sender
 usable and does not enqueue a frame. The generic `send(Message)` path applies

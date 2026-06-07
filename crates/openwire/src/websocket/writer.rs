@@ -26,6 +26,10 @@ pub(crate) enum WriterCommand {
         reason: String,
         ack: tokio::sync::oneshot::Sender<()>,
     },
+    CloseAck {
+        code: u16,
+        reason: String,
+    },
     Cancel,
 }
 
@@ -44,6 +48,9 @@ async fn run_writer(
     while let Some(cmd) = commands.recv().await {
         match cmd {
             WriterCommand::Send(message) => {
+                if session.remote_close_started() {
+                    continue;
+                }
                 if let Err(error) = sink.send(message.into()).await {
                     let mapped = map_engine_error(error);
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
@@ -54,6 +61,9 @@ async fn run_writer(
                 }
             }
             WriterCommand::Ping(payload) => {
+                if session.remote_close_started() {
+                    continue;
+                }
                 if let Err(error) = sink.send(EngineFrame::Ping(payload)).await {
                     let mapped = map_engine_error(error);
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
@@ -64,6 +74,9 @@ async fn run_writer(
                 }
             }
             WriterCommand::Pong(payload) => {
+                if session.remote_close_started() {
+                    continue;
+                }
                 if let Err(error) = sink.send(EngineFrame::Pong(payload)).await {
                     let mapped = map_engine_error(error);
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
@@ -74,6 +87,10 @@ async fn run_writer(
                 }
             }
             WriterCommand::Close { code, reason, ack } => {
+                if session.remote_close_started() {
+                    let _ = ack.send(());
+                    continue;
+                }
                 session.mark_local_close_started();
                 if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                     listener.websocket_closing(ctx, code, &reason, CloseInitiator::Local);
@@ -96,6 +113,11 @@ async fn run_writer(
                         listener.websocket_closed(ctx, final_code, &final_reason);
                     }
                 }
+                return;
+            }
+            WriterCommand::CloseAck { code, reason } => {
+                let _ = sink.send(EngineFrame::Close { code, reason }).await;
+                let _ = sink.flush().await;
                 return;
             }
             WriterCommand::Cancel => {
@@ -149,7 +171,9 @@ async fn run_reader(
                 }
             }
             Ok(EngineFrame::Close { code, reason }) => {
-                if !session.local_close_started() && session.try_mark_closed() {
+                let local_close_started = session.local_close_started();
+                session.mark_remote_close_started();
+                if !local_close_started && session.try_mark_closed() {
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                         listener.websocket_closed(ctx, code, &reason);
                     }
@@ -160,7 +184,12 @@ async fn run_reader(
                         reason: reason.clone(),
                     }))
                     .await;
-                let _ = auto_pong.send(WriterCommand::Cancel).await;
+                let command = if local_close_started {
+                    WriterCommand::Cancel
+                } else {
+                    WriterCommand::CloseAck { code, reason }
+                };
+                let _ = auto_pong.send(command).await;
                 return;
             }
             Ok(EngineFrame::Text(text)) => {
@@ -317,6 +346,7 @@ pub(crate) struct HeartbeatConfig {
 #[derive(Clone, Default)]
 struct SessionState {
     local_close_started: Arc<AtomicBool>,
+    remote_close_started: Arc<AtomicBool>,
     closed_emitted: Arc<AtomicBool>,
 }
 
@@ -327,6 +357,14 @@ impl SessionState {
 
     fn local_close_started(&self) -> bool {
         self.local_close_started.load(Ordering::Acquire)
+    }
+
+    fn mark_remote_close_started(&self) {
+        self.remote_close_started.store(true, Ordering::Release);
+    }
+
+    fn remote_close_started(&self) -> bool {
+        self.remote_close_started.load(Ordering::Acquire)
     }
 
     fn try_mark_closed(&self) -> bool {
@@ -392,7 +430,7 @@ pub(crate) async fn run_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::sink;
+    use futures_util::{sink, stream};
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -458,6 +496,48 @@ mod tests {
 
         let captured = captured.lock().unwrap();
         assert!(matches!(captured.as_slice(), [EngineFrame::Text(t)] if t == "hi"));
+    }
+
+    #[tokio::test]
+    async fn writer_skips_queued_data_after_remote_close_and_sends_ack() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<EngineFrame>>> = Default::default();
+        let sink: BoxEngineSink = Box::pin(CapturingSink {
+            captured: captured.clone(),
+        });
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WriterCommand>(8);
+        let (recv_tx, _recv_rx) = mpsc::channel::<Result<Message, WebSocketError>>(8);
+        let session = SessionState::default();
+        session.mark_remote_close_started();
+
+        let writer = tokio::spawn(run_writer(
+            sink,
+            cmd_rx,
+            Duration::from_millis(50),
+            recv_tx,
+            None,
+            None,
+            session,
+        ));
+
+        cmd_tx
+            .send(WriterCommand::Send(Message::Text("late".into())))
+            .await
+            .expect("late send");
+        cmd_tx
+            .send(WriterCommand::CloseAck {
+                code: 1000,
+                reason: "peer done".into(),
+            })
+            .await
+            .expect("close ack");
+
+        writer.await.expect("writer joined");
+
+        let captured = captured.lock().unwrap();
+        assert!(matches!(
+            captured.as_slice(),
+            [EngineFrame::Close { code: 1000, reason }] if reason == "peer done"
+        ));
     }
 
     #[tokio::test]
@@ -528,5 +608,72 @@ mod tests {
             .expect("close");
         ack_rx.await.expect("ack");
         writer.await.expect("writer joined");
+    }
+
+    #[tokio::test]
+    async fn reader_sends_close_ack_for_remote_close() {
+        let stream: BoxEngineStream = Box::pin(stream::iter([Ok(EngineFrame::Close {
+            code: 1000,
+            reason: "remote done".into(),
+        })]));
+        let (out_tx, mut out_rx) = mpsc::channel::<Result<Message, WebSocketError>>(4);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCommand>(4);
+
+        run_reader(
+            stream,
+            false,
+            ReaderRuntime {
+                out: out_tx,
+                auto_pong: cmd_tx,
+                pong_tracker: None,
+                ctx: None,
+                listener: None,
+                session: SessionState::default(),
+            },
+        )
+        .await;
+
+        match out_rx.recv().await.expect("closed by peer") {
+            Err(WebSocketError::ClosedByPeer { code, reason }) => {
+                assert_eq!(code, 1000);
+                assert_eq!(reason, "remote done");
+            }
+            other => panic!("expected ClosedByPeer, got {other:?}"),
+        }
+        assert!(matches!(
+            cmd_rx.recv().await.expect("close ack"),
+            WriterCommand::CloseAck { code: 1000, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_cancels_local_close_when_remote_close_arrives() {
+        let stream: BoxEngineStream = Box::pin(stream::iter([Ok(EngineFrame::Close {
+            code: 1000,
+            reason: "ack".into(),
+        })]));
+        let (out_tx, _out_rx) = mpsc::channel::<Result<Message, WebSocketError>>(4);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCommand>(4);
+        let session = SessionState::default();
+        session.mark_local_close_started();
+
+        run_reader(
+            stream,
+            false,
+            ReaderRuntime {
+                out: out_tx,
+                auto_pong: cmd_tx,
+                pong_tracker: None,
+                ctx: None,
+                listener: None,
+                session,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            cmd_rx.recv().await.expect("cancel"),
+            WriterCommand::Cancel
+        ));
     }
 }
