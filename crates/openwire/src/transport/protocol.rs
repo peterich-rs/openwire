@@ -2,9 +2,11 @@ use http::header::CONNECTION;
 use http::{HeaderMap, HeaderValue, Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
+#[cfg(feature = "websocket")]
+use openwire_core::Connection;
 use openwire_core::{
-    BoxConnection, CoalescingInfo, Connected, Connection, ConnectionInfo, HyperExecutor,
-    RequestBody, SharedTimer, WireError,
+    BoxConnection, CoalescingInfo, Connected, ConnectionInfo, HyperExecutor, RequestBody,
+    SharedTimer, WireError,
 };
 
 use crate::connection::{Address, ConnectionProtocol, RouteKind, UriScheme};
