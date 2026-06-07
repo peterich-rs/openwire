@@ -63,6 +63,7 @@ pub(super) struct ConnectTunnelParams<'a> {
     pub(super) target_uri: &'a Uri,
     pub(super) stream: BoxConnection,
     pub(super) tcp_connector: Arc<dyn TcpConnector>,
+    pub(super) auth_attempts: AuthAttemptState,
     pub(super) initial_proxy_credentials: Option<ProxyCredentials>,
     pub(super) proxy_authenticator: Option<SharedAuthenticator>,
     pub(super) max_proxy_auth_attempts: usize,
@@ -188,6 +189,7 @@ pub(crate) async fn connect_route_plan(
     ctx: CallContext,
     uri: Uri,
     route_plan: RoutePlan,
+    auth_attempts: AuthAttemptState,
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let Some(first_route) = route_plan.route(0) else {
@@ -217,7 +219,9 @@ pub(crate) async fn connect_route_plan(
             )
             .await
         }
-        RouteKind::ConnectProxy { .. } => connect_via_http_proxy(ctx, uri, route_plan, deps).await,
+        RouteKind::ConnectProxy { .. } => {
+            connect_via_http_proxy(ctx, uri, route_plan, auth_attempts, deps).await
+        }
         RouteKind::SocksProxy { .. } => connect_via_socks_proxy(ctx, uri, route_plan, deps).await,
     }
 }
@@ -294,6 +298,7 @@ async fn connect_via_http_proxy(
     ctx: CallContext,
     target_uri: Uri,
     route_plan: RoutePlan,
+    auth_attempts: AuthAttemptState,
     deps: ProxyConnectDeps,
 ) -> Result<BoxConnection, WireError> {
     let target_scheme = target_uri
@@ -358,6 +363,7 @@ async fn connect_via_http_proxy(
                             target_uri: &target_uri,
                             stream,
                             tcp_connector: deps.tcp_connector.clone(),
+                            auth_attempts,
                             initial_proxy_credentials: credentials,
                             proxy_authenticator: deps.proxy_authenticator.clone(),
                             max_proxy_auth_attempts: deps.max_proxy_auth_attempts,
@@ -537,7 +543,9 @@ pub(super) async fn establish_connect_tunnel(
                     return Err(proxy_connect_status_error(&head.status_line));
                 };
 
-                if auth_count as usize >= params.max_proxy_auth_attempts {
+                let effective_auth_count =
+                    params.auth_attempts.auth_count.saturating_add(auth_count);
+                if effective_auth_count as usize >= params.max_proxy_auth_attempts {
                     return Err(proxy_connect_status_error(&head.status_line));
                 }
 
@@ -553,10 +561,10 @@ pub(super) async fn establish_connect_tunnel(
                     ),
                     AuthResponseState::new(head.status, head.headers.clone()),
                     AuthAttemptState {
-                        total_attempt: 1,
-                        retry_count: 0,
-                        redirect_count: 0,
-                        auth_count,
+                        total_attempt: params.auth_attempts.total_attempt,
+                        retry_count: params.auth_attempts.retry_count,
+                        redirect_count: params.auth_attempts.redirect_count,
+                        auth_count: effective_auth_count,
                     },
                 );
 
