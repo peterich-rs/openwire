@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
@@ -38,7 +38,7 @@ use super::connect::{
 };
 use super::protocol::connection_header_requests_close;
 use super::service::prepare_request_for_send;
-use crate::auth::SharedAuthenticator;
+use crate::auth::{AuthAttemptState, SharedAuthenticator};
 use crate::connection::ConnectionPool;
 use crate::connection::{
     Address, AuthorityKey, ConnectionAvailability, ConnectionProtocol, DnsPolicy,
@@ -540,24 +540,79 @@ impl TcpConnector for RecordingRetryTcpConnector {
     }
 }
 
+#[derive(Clone)]
+struct QueuedTcpConnector {
+    streams: Arc<Mutex<VecDeque<BoxConnection>>>,
+}
+
+impl QueuedTcpConnector {
+    fn new(streams: impl IntoIterator<Item = BoxConnection>) -> Self {
+        Self {
+            streams: Arc::new(Mutex::new(streams.into_iter().collect())),
+        }
+    }
+}
+
+impl TcpConnector for QueuedTcpConnector {
+    fn connect(
+        &self,
+        _ctx: CallContext,
+        _addr: std::net::SocketAddr,
+        _timeout: Option<Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let stream = self
+            .streams
+            .lock()
+            .expect("tcp streams lock")
+            .pop_front()
+            .expect("queued tcp stream");
+        Box::pin(async move { Ok(stream) })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedAuthAttempt {
+    total_attempt: u32,
+    retry_count: u32,
+    redirect_count: u32,
+    auth_count: u32,
+}
+
 #[derive(Clone, Default)]
 struct StaticProxyAuthenticator {
     calls: Arc<AtomicUsize>,
+    observed_attempts: Arc<Mutex<Vec<ObservedAuthAttempt>>>,
 }
 
 impl StaticProxyAuthenticator {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn observed_attempts(&self) -> Vec<ObservedAuthAttempt> {
+        self.observed_attempts
+            .lock()
+            .expect("auth attempts lock")
+            .clone()
+    }
 }
 
 impl Authenticator for StaticProxyAuthenticator {
     fn authenticate(
         &self,
-        _ctx: AuthContext,
+        ctx: AuthContext,
     ) -> BoxFuture<Result<Option<Request<RequestBody>>, WireError>> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.observed_attempts
+            .lock()
+            .expect("auth attempts lock")
+            .push(ObservedAuthAttempt {
+                total_attempt: ctx.total_attempt(),
+                retry_count: ctx.retry_count(),
+                redirect_count: ctx.redirect_count(),
+                auth_count: ctx.auth_count(),
+            });
         Box::pin(async move {
             let mut request = Request::new(RequestBody::empty());
             *request.method_mut() = Method::CONNECT;
@@ -944,6 +999,12 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
         target_uri: &target_uri,
         stream: initial_stream,
         tcp_connector: Arc::new(retry_connector.clone()),
+        auth_attempts: AuthAttemptState {
+            total_attempt: 1,
+            retry_count: 0,
+            redirect_count: 0,
+            auth_count: 0,
+        },
         initial_proxy_credentials: None,
         proxy_authenticator: Some(authenticator.clone()),
         max_proxy_auth_attempts: 1,
@@ -972,6 +1033,150 @@ async fn connect_tunnel_shares_budget_across_407_redial_and_response_read() {
 
     first_response.await.expect("first response task");
     second_response.await.expect("second response task");
+}
+
+#[tokio::test]
+async fn connect_tunnel_proxy_auth_context_extends_logical_attempt_counts() {
+    let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
+    let target_uri: Uri = "https://example.com:443/".parse().expect("target uri");
+    let (initial_stream, mut initial_peer) = duplex_box_connection(1024);
+    let (retry_stream, mut retry_peer) = duplex_box_connection(1024);
+    let (final_stream, mut final_peer) = duplex_box_connection(1024);
+    let retry_connector = QueuedTcpConnector::new([retry_stream, final_stream]);
+    let authenticator_impl = Arc::new(StaticProxyAuthenticator::default());
+    let authenticator = authenticator_impl.clone() as SharedAuthenticator;
+
+    let first_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut initial_peer).await;
+        let request = String::from_utf8(request).expect("CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        initial_peer
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+            )
+            .await
+            .expect("write first 407");
+    });
+    let second_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut retry_peer).await;
+        let request = String::from_utf8(request).expect("retry CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(request.contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"));
+        retry_peer
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+            )
+            .await
+            .expect("write second 407");
+    });
+    let third_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut final_peer).await;
+        let request = String::from_utf8(request).expect("final CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(request.contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"));
+        final_peer
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .expect("write CONNECT success");
+    });
+
+    let _tunneled = establish_connect_tunnel(ConnectTunnelParams {
+        ctx: make_call_context(),
+        proxy_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+        target_uri: &target_uri,
+        stream: initial_stream,
+        tcp_connector: Arc::new(retry_connector),
+        auth_attempts: AuthAttemptState {
+            total_attempt: 5,
+            retry_count: 1,
+            redirect_count: 2,
+            auth_count: 3,
+        },
+        initial_proxy_credentials: None,
+        proxy_authenticator: Some(authenticator.clone()),
+        max_proxy_auth_attempts: 5,
+        budget: ConnectBudget::new(Some(Duration::from_secs(1)), None),
+        timer: timer.clone(),
+    })
+    .await
+    .expect("CONNECT should succeed after proxy auth retries");
+
+    assert_eq!(authenticator_impl.calls(), 2);
+    assert_eq!(
+        authenticator_impl.observed_attempts(),
+        vec![
+            ObservedAuthAttempt {
+                total_attempt: 5,
+                retry_count: 1,
+                redirect_count: 2,
+                auth_count: 3,
+            },
+            ObservedAuthAttempt {
+                total_attempt: 5,
+                retry_count: 1,
+                redirect_count: 2,
+                auth_count: 4,
+            },
+        ]
+    );
+    first_response.await.expect("first response task");
+    second_response.await.expect("second response task");
+    third_response.await.expect("third response task");
+}
+
+#[tokio::test]
+async fn connect_tunnel_proxy_auth_budget_includes_logical_auth_count() {
+    let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
+    let target_uri: Uri = "https://example.com:443/".parse().expect("target uri");
+    let (initial_stream, mut initial_peer) = duplex_box_connection(1024);
+    let authenticator_impl = Arc::new(StaticProxyAuthenticator::default());
+    let authenticator = authenticator_impl.clone() as SharedAuthenticator;
+
+    let first_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut initial_peer).await;
+        let request = String::from_utf8(request).expect("CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        initial_peer
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+            )
+            .await
+            .expect("write 407");
+    });
+
+    let error = match establish_connect_tunnel(ConnectTunnelParams {
+        ctx: make_call_context(),
+        proxy_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+        target_uri: &target_uri,
+        stream: initial_stream,
+        tcp_connector: Arc::new(QueuedTcpConnector::new([])),
+        auth_attempts: AuthAttemptState {
+            total_attempt: 3,
+            retry_count: 0,
+            redirect_count: 1,
+            auth_count: 1,
+        },
+        initial_proxy_credentials: None,
+        proxy_authenticator: Some(authenticator),
+        max_proxy_auth_attempts: 1,
+        budget: ConnectBudget::new(Some(Duration::from_secs(1)), None),
+        timer: timer.clone(),
+    })
+    .await
+    {
+        Ok(_) => panic!("exhausted logical auth budget should fail CONNECT"),
+        Err(error) => error,
+    };
+
+    assert_eq!(authenticator_impl.calls(), 0);
+    assert_eq!(error.kind(), openwire_core::WireErrorKind::Connect);
+    assert!(
+        error
+            .message()
+            .contains("407 Proxy Authentication Required"),
+        "{error:?}",
+    );
+    first_response.await.expect("first response task");
 }
 
 #[tokio::test]

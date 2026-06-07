@@ -1122,6 +1122,15 @@ async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator
         vec![openwire::AuthKind::Proxy]
     );
     assert_single_realm_challenge(&authenticator.observed_challenges()[0], "Basic", "proxy");
+    assert_eq!(
+        authenticator.observed_attempts(),
+        vec![ObservedAuthAttempt {
+            total_attempt: 1,
+            retry_count: 0,
+            redirect_count: 0,
+            auth_count: 0,
+        }]
+    );
 
     let requests = proxy.requests();
     assert_eq!(requests.len(), 2, "requests = {requests:?}");
@@ -1134,6 +1143,88 @@ async fn https_proxy_connect_can_retry_tunnel_after_407_with_proxy_authenticator
     );
     assert!(
         !requests[0].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}",
+    );
+    assert!(
+        requests[1].contains("proxy-authorization: Basic cHJveHk6c2VjcmV0"),
+        "requests = {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn redirected_https_connect_proxy_auth_context_keeps_logical_attempt_counts() {
+    let secure_server =
+        spawn_https_http1(|_request| async move { ok_text("redirected proxied tls auth ok") })
+            .await;
+    let redirect_target = format!(
+        "https://localhost:{}/secure-after-redirect",
+        secure_server.addr().port()
+    );
+    let redirect_server = spawn_http1(move |_request: Request<Incoming>| {
+        let redirect_target = redirect_target.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", redirect_target)
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response")
+        }
+    })
+    .await;
+    let proxy = spawn_connect_proxy_requiring_authorization(
+        "Proxy-Authorization",
+        "Basic cHJveHk6c2VjcmV0",
+    )
+    .await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(secure_server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+    let authenticator =
+        StaticHeaderAuthenticator::new("proxy-authorization", "Basic cHJveHk6c2VjcmV0");
+
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("redirect.test".to_owned(), redirect_server.addr()),
+            ("proxy.test".to_owned(), proxy.addr()),
+        ]))
+        .proxy_selector(proxy_rules(
+            Proxy::https(format!("http://proxy.test:{}", proxy.addr().port()))
+                .expect("proxy config"),
+        ))
+        .proxy_authenticator(authenticator.clone())
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://redirect.test:{}/start",
+            redirect_server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "redirected proxied tls auth ok");
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(
+        authenticator.observed_attempts(),
+        vec![ObservedAuthAttempt {
+            total_attempt: 2,
+            retry_count: 0,
+            redirect_count: 1,
+            auth_count: 0,
+        }]
+    );
+
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 2, "requests = {requests:?}");
+    assert!(
+        requests[0].starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            secure_server.addr().port()
+        )),
         "requests = {requests:?}",
     );
     assert!(
@@ -4548,6 +4639,14 @@ impl DecliningAuthenticator {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedAuthAttempt {
+    total_attempt: u32,
+    retry_count: u32,
+    redirect_count: u32,
+    auth_count: u32,
+}
+
 #[derive(Clone)]
 struct StaticHeaderAuthenticator {
     header_name: &'static str,
@@ -4555,6 +4654,7 @@ struct StaticHeaderAuthenticator {
     calls: Arc<AtomicUsize>,
     observed_kinds: Arc<Mutex<Vec<openwire::AuthKind>>>,
     observed_challenges: Arc<Mutex<Vec<Vec<AuthChallenge>>>>,
+    observed_attempts: Arc<Mutex<Vec<ObservedAuthAttempt>>>,
 }
 
 impl StaticHeaderAuthenticator {
@@ -4565,6 +4665,7 @@ impl StaticHeaderAuthenticator {
             calls: Arc::new(AtomicUsize::new(0)),
             observed_kinds: Arc::new(Mutex::new(Vec::new())),
             observed_challenges: Arc::new(Mutex::new(Vec::new())),
+            observed_attempts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4582,6 +4683,13 @@ impl StaticHeaderAuthenticator {
             .expect("auth challenges")
             .clone()
     }
+
+    fn observed_attempts(&self) -> Vec<ObservedAuthAttempt> {
+        self.observed_attempts
+            .lock()
+            .expect("auth attempts")
+            .clone()
+    }
 }
 
 impl Authenticator for StaticHeaderAuthenticator {
@@ -4594,6 +4702,7 @@ impl Authenticator for StaticHeaderAuthenticator {
         let calls = self.calls.clone();
         let observed_kinds = self.observed_kinds.clone();
         let observed_challenges = self.observed_challenges.clone();
+        let observed_attempts = self.observed_attempts.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::Relaxed);
             observed_kinds.lock().expect("auth kinds").push(ctx.kind());
@@ -4601,6 +4710,15 @@ impl Authenticator for StaticHeaderAuthenticator {
                 .lock()
                 .expect("auth challenges")
                 .push(ctx.challenges());
+            observed_attempts
+                .lock()
+                .expect("auth attempts")
+                .push(ObservedAuthAttempt {
+                    total_attempt: ctx.total_attempt(),
+                    retry_count: ctx.retry_count(),
+                    redirect_count: ctx.redirect_count(),
+                    auth_count: ctx.auth_count(),
+                });
             let Some(mut request) = ctx.try_clone_request() else {
                 return Ok(None);
             };

@@ -12,6 +12,7 @@ use tower::Service;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 
+use crate::auth::AuthAttemptState;
 use crate::client::EffectiveRequestConfig;
 use crate::client::{
     attach_request_admission, cache_request_addresses, clear_proxy_authorization_if_proxy_changed,
@@ -66,6 +67,7 @@ struct FreshConnectionArgs<'a> {
     candidate: &'a ResolvedAddress,
     request: &'a Request<RequestBody>,
     ctx: CallContext,
+    auth_attempts: AuthAttemptState,
     span: tracing::Span,
     route_plan: RoutePlan,
     connection_permit: ConnectionPermit,
@@ -234,7 +236,18 @@ impl TransportService {
             ctx.listener()
                 .pool_lookup(&ctx, prepared.pool_hit(), prepared.pool_connection_id());
             let selected = self
-                .acquire_connection(&prepared, &request, ctx.clone(), tracing::Span::current())
+                .acquire_connection(
+                    &prepared,
+                    &request,
+                    ctx.clone(),
+                    tracing::Span::current(),
+                    AuthAttemptState {
+                        total_attempt: attempt,
+                        retry_count: policy_trace.retry_count,
+                        redirect_count: policy_trace.redirect_count,
+                        auth_count: policy_trace.auth_count,
+                    },
+                )
                 .await?;
             let (response, request_permit) = send_bound_request(
                 request,
@@ -292,6 +305,7 @@ impl TransportService {
         request: &Request<RequestBody>,
         ctx: CallContext,
         span: tracing::Span,
+        auth_attempts: AuthAttemptState,
     ) -> Result<SelectedConnection, WireError> {
         let mut last_error = None;
         let pooled_address = prepared.pooled_address().cloned();
@@ -305,6 +319,7 @@ impl TransportService {
                     request,
                     ctx.clone(),
                     span.clone(),
+                    auth_attempts,
                 )
                 .await
             {
@@ -328,6 +343,7 @@ impl TransportService {
                     request,
                     ctx.clone(),
                     span.clone(),
+                    auth_attempts,
                 )
                 .await
             {
@@ -348,6 +364,7 @@ impl TransportService {
         request: &Request<RequestBody>,
         ctx: CallContext,
         span: tracing::Span,
+        auth_attempts: AuthAttemptState,
     ) -> Result<SelectedConnection, WireError> {
         let address = candidate.address();
         let mut request_permit = Some(self.request_admission.acquire(address.clone()).await?);
@@ -442,6 +459,7 @@ impl TransportService {
                     candidate,
                     request,
                     ctx,
+                    auth_attempts,
                     span,
                     route_plan: route_plan.take().ok_or_else(|| {
                         WireError::internal(
@@ -472,6 +490,7 @@ impl TransportService {
             args.ctx,
             args.request.uri().clone(),
             args.route_plan,
+            args.auth_attempts,
             self.connector.proxy_connect_deps(connect_timeout),
         )
         .instrument(connect_span)

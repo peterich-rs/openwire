@@ -206,6 +206,14 @@ follow-ups (pool reuse, interceptor chain integration).
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
+- CONNECT proxy `407` challenges are handled during tunnel establishment because
+  no end-to-end HTTP response exists yet. That tunnel-local proxy auth loop must
+  still receive the logical call counters from `FollowUpPolicyService`; the
+  `AuthContext` passed to the proxy authenticator carries the current total
+  attempt, retry count, redirect count, and logical auth count plus any completed
+  CONNECT-local auth retries. The same logical auth budget gates this loop, so
+  CONNECT tunnel proxy authentication cannot exceed the per-call
+  `max_auth_attempts` limit by resetting its own local counter.
 - `Client::execute` owns call cancellation, final call completion, and wraps the
   returned response body so `call_end` / `call_failed` reflect the whole call.
 - `Call::enqueue` is executor-backed dispatch for the same `Call::execute`
