@@ -2441,25 +2441,36 @@ git commit -m "feat(websocket): TransportService branch for upgrade and end-to-e
 ```rust
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub(crate) struct PongTracker {
-    last_pong: Arc<AtomicU64>, // millis since session start
-    start: Arc<Instant>,
+    generation: Arc<AtomicU64>,
+    notify: Arc<Notify>,
 }
 
 impl PongTracker {
     pub(crate) fn new() -> Self {
-        Self { last_pong: Arc::new(AtomicU64::new(0)), start: Arc::new(Instant::now()) }
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            notify: Arc::new(Notify::new()),
+        }
     }
     pub(crate) fn mark(&self) {
-        self.last_pong.store(self.start.elapsed().as_millis() as u64, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
     }
-    pub(crate) fn since_last_pong(&self) -> Duration {
-        let now = self.start.elapsed().as_millis() as u64;
-        let last = self.last_pong.load(Ordering::Acquire);
-        Duration::from_millis(now.saturating_sub(last))
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    async fn wait_for_pong_after(&self, generation: u64) {
+        loop {
+            let notified = self.notify.notified();
+            if self.generation() != generation {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 ```
@@ -2477,15 +2488,23 @@ pub(crate) async fn run_heartbeat(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // skip immediate first tick
     loop {
         ticker.tick().await;
+        let pong_generation = tracker.generation();
         if out.send(WriterCommand::Ping(bytes::Bytes::new())).await.is_err() { return; }
-        if tracker.since_last_pong() > pong_timeout {
-            let (ack_tx, _) = tokio::sync::oneshot::channel();
-            let _ = out.send(WriterCommand::Close {
-                code: 1011, reason: "ping timeout".into(), ack: ack_tx,
-            }).await;
-            return;
+
+        let timeout = tokio::time::sleep(pong_timeout);
+        tokio::pin!(timeout);
+        tokio::select! {
+            _ = tracker.wait_for_pong_after(pong_generation) => {}
+            _ = &mut timeout => {
+                if tracker.generation() == pong_generation {
+                    let _ = out.send(WriterCommand::PingTimeout).await;
+                    return;
+                }
+            }
+            _ = out.closed() => return,
         }
     }
 }
