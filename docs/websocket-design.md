@@ -408,7 +408,8 @@ branch verifies:
 - `status == 101 Switching Protocols`
 - `Connection` includes `upgrade` (case-insensitive, comma-list aware across
   one or more `Connection` field lines)
-- `Upgrade` is `websocket` (case-insensitive)
+- `Upgrade` includes `websocket` (case-insensitive, comma-list aware across
+  one or more `Upgrade` field lines)
 - `Sec-WebSocket-Accept` equals the value recorded in `CallContext`
 - No `Sec-WebSocket-Extensions`; v1 does not negotiate extensions, so any
   returned extension is treated as an unrequested extension and fails the

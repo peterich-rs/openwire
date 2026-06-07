@@ -168,10 +168,7 @@ pub(crate) fn validate_handshake_response<B>(
 
     let headers = response.headers();
 
-    let upgrade = headers
-        .get("upgrade")
-        .ok_or(HandshakeFailure::MissingUpgrade)?;
-    if !upgrade.as_bytes().eq_ignore_ascii_case(b"websocket") {
+    if !upgrade_has_websocket(headers) {
         return Err(HandshakeFailure::MissingUpgrade);
     }
 
@@ -187,26 +184,7 @@ pub(crate) fn validate_handshake_response<B>(
         return Err(HandshakeFailure::InvalidAccept);
     }
 
-    let subprotocol = match headers.get("sec-websocket-protocol") {
-        None => None,
-        Some(value) => {
-            let token = value
-                .to_str()
-                .map_err(|_| HandshakeFailure::Other("invalid subprotocol header".into()))?;
-            if token.contains(',') {
-                return Err(HandshakeFailure::Other(
-                    "multiple subprotocols returned".into(),
-                ));
-            }
-            if !offered_subprotocols.iter().any(|offered| offered == token) {
-                return Err(HandshakeFailure::SubprotocolMismatch {
-                    offered: offered_subprotocols.to_vec(),
-                    returned: token.to_string(),
-                });
-            }
-            Some(token.to_string())
-        }
-    };
+    let subprotocol = validate_selected_subprotocol(headers, offered_subprotocols)?;
 
     reject_unrequested_extensions(headers)?;
 
@@ -217,12 +195,55 @@ pub(crate) fn validate_handshake_response<B>(
 }
 
 fn connection_has_upgrade(headers: &HeaderMap) -> bool {
-    headers.get_all("connection").iter().any(|value| {
-        value.to_str().is_ok_and(|raw| {
-            raw.split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        })
+    headers
+        .get_all("connection")
+        .iter()
+        .any(|value| header_value_has_token(value, "upgrade"))
+}
+
+fn upgrade_has_websocket(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("upgrade")
+        .iter()
+        .any(|value| header_value_has_token(value, "websocket"))
+}
+
+fn header_value_has_token(value: &HeaderValue, expected: &str) -> bool {
+    value.to_str().is_ok_and(|raw| {
+        raw.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case(expected))
     })
+}
+
+fn validate_selected_subprotocol(
+    headers: &HeaderMap,
+    offered_subprotocols: &[String],
+) -> Result<Option<String>, HandshakeFailure> {
+    let mut selected = None;
+    for value in headers.get_all("sec-websocket-protocol") {
+        let token = value
+            .to_str()
+            .map_err(|_| HandshakeFailure::Other("invalid subprotocol header".into()))?;
+        if token.contains(',') || selected.is_some() {
+            return Err(HandshakeFailure::Other(
+                "multiple subprotocols returned".into(),
+            ));
+        }
+        selected = Some(token.to_string());
+    }
+
+    let Some(token) = selected else {
+        return Ok(None);
+    };
+
+    if !offered_subprotocols.iter().any(|offered| offered == &token) {
+        return Err(HandshakeFailure::SubprotocolMismatch {
+            offered: offered_subprotocols.to_vec(),
+            returned: token,
+        });
+    }
+
+    Ok(Some(token))
 }
 
 fn reject_unrequested_extensions(headers: &HeaderMap) -> Result<(), HandshakeFailure> {
@@ -318,6 +339,42 @@ mod response_tests {
     }
 
     #[test]
+    fn accepts_websocket_token_across_multiple_upgrade_fields() {
+        let mut response = ok_response("expected");
+        response.headers_mut().remove("upgrade");
+        response
+            .headers_mut()
+            .append("upgrade", HeaderValue::from_static("h2c"));
+        response
+            .headers_mut()
+            .append("upgrade", HeaderValue::from_static("WebSocket"));
+
+        assert!(validate_handshake_response(&response, "expected", &[]).is_ok());
+    }
+
+    #[test]
+    fn accepts_websocket_token_inside_upgrade_comma_list() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .insert("upgrade", HeaderValue::from_static("h2c, WebSocket"));
+
+        assert!(validate_handshake_response(&response, "expected", &[]).is_ok());
+    }
+
+    #[test]
+    fn rejects_upgrade_without_websocket_token() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .insert("upgrade", HeaderValue::from_static("h2c"));
+
+        let err = validate_handshake_response(&response, "expected", &[]).unwrap_err();
+
+        assert!(matches!(err, HandshakeFailure::MissingUpgrade));
+    }
+
+    #[test]
     fn rejects_missing_connection() {
         let mut response = ok_response("expected");
         response.headers_mut().remove("connection");
@@ -358,6 +415,39 @@ mod response_tests {
             .insert("sec-websocket-protocol", HeaderValue::from_static("v2"));
         let err = validate_handshake_response(&response, "expected", &["v1".into()]).unwrap_err();
         assert!(matches!(err, HandshakeFailure::SubprotocolMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_multiple_subprotocols_in_comma_list() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .insert("sec-websocket-protocol", HeaderValue::from_static("v1, v2"));
+
+        let err = validate_handshake_response(&response, "expected", &["v1".into(), "v2".into()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HandshakeFailure::Other(reason) if reason == "multiple subprotocols returned")
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_subprotocol_header_fields() {
+        let mut response = ok_response("expected");
+        response
+            .headers_mut()
+            .append("sec-websocket-protocol", HeaderValue::from_static("v1"));
+        response
+            .headers_mut()
+            .append("sec-websocket-protocol", HeaderValue::from_static("v2"));
+
+        let err = validate_handshake_response(&response, "expected", &["v1".into(), "v2".into()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HandshakeFailure::Other(reason) if reason == "multiple subprotocols returned")
+        );
     }
 
     #[test]
