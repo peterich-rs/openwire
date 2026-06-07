@@ -174,13 +174,16 @@ reuse:
 - response `Cache-Control: max-age`, `no-cache`, and `no-store`
 - `Expires` freshness when `max-age` is absent
 - `Age` reducing remaining `max-age` freshness
-- `Vary` matching against the original request headers, with `Vary: *`
-  treated as not reusable
+- multiple stored variants for one URI through `Vary` matching against the
+  original request headers, with `Vary: *` treated as not reusable
+- stale stored responses with `ETag` or `Last-Modified` validators are
+  revalidated with conditional GET requests, and `304 Not Modified` responses
+  refresh stored metadata before returning the cached body as `200 OK`
+- cached hits generate a current `Age` header
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
 responses, skips responses with `Set-Cookie`, skips authenticated requests, and
-does not yet implement validator revalidation, heuristic freshness, stale
-serving, or multiple stored variants for one URI.
+does not yet implement heuristic freshness or stale serving.
 
 ## Default Transport Settings
 

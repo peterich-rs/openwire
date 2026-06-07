@@ -147,9 +147,11 @@ coordinator; cache misses continue through the canonical request flow. The
 crate currently implements explicit freshness and reuse rules for private
 in-process caching: request `Cache-Control` directives such as `no-cache`,
 `no-store`, `max-age=0`, `min-fresh`, and `only-if-cached`; response
-`max-age`, `no-cache`, `no-store`, `Expires`, `Age`, and `Vary` matching. It
-does not yet implement validator revalidation, heuristic freshness, stale
-serving, or multiple stored variants per URI.
+`max-age`, `no-cache`, `no-store`, `Expires`, `Age`, and `Vary` matching,
+including multiple stored variants per URI. It also revalidates stale stored
+responses that carry `ETag` or `Last-Modified` validators, refreshing stored
+metadata on `304 Not Modified` before returning the cached body as `200 OK`.
+It does not yet implement heuristic freshness or stale serving.
 
 Default runtime stack from `ClientBuilder::default()`:
 

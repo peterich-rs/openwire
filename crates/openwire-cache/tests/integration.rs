@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, EXPIRES, VARY};
+use http::header::{
+    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    LAST_MODIFIED, VARY,
+};
 use http::{Request, StatusCode};
 use hyper::body::Incoming;
 use openwire::{Client, RequestBody};
@@ -327,6 +330,211 @@ async fn response_age_reduces_max_age_before_storage() {
 }
 
 #[tokio::test]
+async fn stale_etag_response_revalidates_with_if_none_match() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    let mut response = text_response(StatusCode::OK, "etag body");
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "max-age=0".parse().expect("header"));
+                    response
+                        .headers_mut()
+                        .insert(AGE, "30".parse().expect("age"));
+                    response
+                        .headers_mut()
+                        .insert(ETAG, "\"v1\"".parse().expect("etag"));
+                    return response;
+                }
+
+                assert_eq!(
+                    request.headers().get(IF_NONE_MATCH).expect("if-none-match"),
+                    "\"v1\""
+                );
+                let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"v1\"".parse().expect("etag"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/etag-revalidate")))
+        .await
+        .expect("first response");
+    assert_eq!(first.into_body().text().await.expect("body"), "etag body");
+
+    let revalidated = client
+        .execute(empty_request(server.http_url("/etag-revalidate")))
+        .await
+        .expect("revalidated response");
+    assert_eq!(revalidated.status(), StatusCode::OK);
+    let revalidated_age = revalidated
+        .headers()
+        .get(AGE)
+        .expect("age")
+        .to_str()
+        .expect("age string")
+        .parse::<u64>()
+        .expect("age seconds");
+    assert!(revalidated_age < 30);
+    assert_eq!(
+        revalidated.into_body().text().await.expect("body"),
+        "etag body"
+    );
+
+    let cached_after_304 = client
+        .execute(empty_request(server.http_url("/etag-revalidate")))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached_after_304.into_body().text().await.expect("body"),
+        "etag body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stale_last_modified_response_revalidates_with_if_modified_since() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let last_modified = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(120));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        let last_modified = last_modified.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            let last_modified = last_modified.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    let mut response = text_response(StatusCode::OK, "last-modified body");
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "max-age=0".parse().expect("header"));
+                    response
+                        .headers_mut()
+                        .insert(LAST_MODIFIED, last_modified.parse().expect("last-modified"));
+                    return response;
+                }
+
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(IF_MODIFIED_SINCE)
+                        .expect("if-modified-since")
+                        .to_str()
+                        .expect("header value"),
+                    last_modified
+                );
+                let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(LAST_MODIFIED, last_modified.parse().expect("last-modified"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/last-modified-revalidate")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "last-modified body"
+    );
+
+    let revalidated = client
+        .execute(empty_request(server.http_url("/last-modified-revalidate")))
+        .await
+        .expect("revalidated response");
+    assert_eq!(revalidated.status(), StatusCode::OK);
+    assert_eq!(
+        revalidated.into_body().text().await.expect("body"),
+        "last-modified body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn cached_hits_generate_current_age_header() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut response = text_response(StatusCode::OK, "aged cache hit");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .insert(AGE, "5".parse().expect("age"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/cache-age")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "aged cache hit"
+    );
+
+    let second = client
+        .execute(empty_request(server.http_url("/cache-age")))
+        .await
+        .expect("cached response");
+    let age = second
+        .headers()
+        .get(AGE)
+        .expect("age")
+        .to_str()
+        .expect("age string")
+        .parse::<u64>()
+        .expect("age seconds");
+    assert!(age >= 5);
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "aged cache hit"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn vary_header_matches_original_request_headers() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = spawn_http1({
@@ -373,6 +581,10 @@ async fn vary_header_matches_original_request_headers() {
     let fr_again = request_with_header(server.http_url("/vary"), ACCEPT_LANGUAGE, "fr");
     let fourth = client.execute(fr_again).await.expect("fourth response");
     assert_eq!(fourth.into_body().text().await.expect("body"), "fr");
+
+    let en_after_fr = request_with_header(server.http_url("/vary"), ACCEPT_LANGUAGE, "en");
+    let fifth = client.execute(en_after_fr).await.expect("fifth response");
+    assert_eq!(fifth.into_body().text().await.expect("body"), "en");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
