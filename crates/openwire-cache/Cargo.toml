@@ -14,6 +14,7 @@ http.workspace = true
 httpdate.workspace = true
 openwire = { path = "../openwire" }
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 hyper.workspace = true

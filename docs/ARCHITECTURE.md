@@ -174,7 +174,8 @@ the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
 stored responses when the cached response does not require validation; stale
 if-error and background stale revalidation are not implemented. Non-error `2xx`
 / `3xx` unsafe-method responses invalidate stored responses for the request
-target URI.
+target URI, plus same-host `Location` and `Content-Location` response URIs
+when present.
 
 Default runtime stack from `ClientBuilder::default()`:
 

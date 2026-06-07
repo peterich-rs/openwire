@@ -5,14 +5,16 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{
-    AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, DATE, ETAG, EXPIRES,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, PRAGMA, SET_COOKIE, TRANSFER_ENCODING, VARY,
+    AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_LOCATION, DATE,
+    ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, PRAGMA, SET_COOKIE,
+    TRANSFER_ENCODING, VARY,
 };
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use openwire::{BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody, WireError};
 use tokio::sync::RwLock;
+use url::Url;
 
 const MAX_DELTA_SECONDS: u64 = 2_147_483_648;
 const LAST_MODIFIED_HEURISTIC_DENOMINATOR: u64 = 10;
@@ -47,8 +49,8 @@ where
     ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let invalidation_key = request_method_invalidates_cache(exchange.request().method())
-                .then(|| cache_key(exchange.request().uri()));
+            let invalidation_target = request_method_invalidates_cache(exchange.request().method())
+                .then(|| exchange.request().uri().clone());
             let request_policy = request_cache_policy(exchange.request());
             let cache_key = request_policy
                 .is_cacheable
@@ -82,9 +84,11 @@ where
             }
 
             let response = next.run(exchange).await?;
-            if let Some(invalidation_key) = invalidation_key.as_ref() {
+            if let Some(invalidation_target) = invalidation_target.as_ref() {
                 if response_status_invalidates_cache(response.status()) {
-                    store.remove(invalidation_key).await;
+                    for key in invalidation_keys(invalidation_target, response.headers()) {
+                        store.remove(&key).await;
+                    }
                 }
             }
 
@@ -665,6 +669,38 @@ fn response_status_invalidates_cache(status: StatusCode) -> bool {
     status.is_success() || status.is_redirection()
 }
 
+fn invalidation_keys(target_uri: &Uri, response_headers: &HeaderMap) -> Vec<String> {
+    let mut keys = vec![cache_key(target_uri)];
+    for name in [LOCATION, CONTENT_LOCATION] {
+        for value in response_headers.get_all(name) {
+            let Some(uri) = same_host_invalidation_uri(target_uri, value) else {
+                continue;
+            };
+            let key = cache_key(&uri);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn same_host_invalidation_uri(target_uri: &Uri, value: &HeaderValue) -> Option<Uri> {
+    let target = Url::parse(&target_uri.to_string()).ok()?;
+    let value = value.to_str().ok()?;
+    let uri = target.join(value).ok()?;
+    if !same_host(&target, &uri) {
+        return None;
+    }
+    uri.as_str().parse().ok()
+}
+
+fn same_host(left: &Url, right: &Url) -> bool {
+    left.host_str()
+        .zip(right.host_str())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 fn response_freshness_lifetime(
     headers: &HeaderMap,
     directives: &CacheDirectives,
@@ -773,7 +809,10 @@ fn gateway_timeout_response() -> Response<ResponseBody> {
 mod tests {
     use std::time::Duration;
 
-    use super::{parse_delta_seconds, MAX_DELTA_SECONDS};
+    use http::header::{CONTENT_LOCATION, LOCATION};
+    use http::{HeaderMap, Uri};
+
+    use super::{invalidation_keys, parse_delta_seconds, MAX_DELTA_SECONDS};
 
     #[test]
     fn delta_seconds_are_clamped_for_overflow_safety() {
@@ -781,6 +820,34 @@ mod tests {
         assert_eq!(
             parse_delta_seconds("999999999999999999999999999"),
             Some(Duration::from_secs(MAX_DELTA_SECONDS))
+        );
+    }
+
+    #[test]
+    fn invalidation_keys_include_same_host_location_uris() {
+        let target: Uri = "http://example.com/mutate".parse().expect("target");
+        let mut headers = HeaderMap::new();
+        headers.append(LOCATION, "/resource".parse().expect("location"));
+        headers.append(
+            CONTENT_LOCATION,
+            "http://example.com/representation"
+                .parse()
+                .expect("content-location"),
+        );
+        headers.append(
+            LOCATION,
+            "http://elsewhere.example/resource"
+                .parse()
+                .expect("cross-host location"),
+        );
+
+        assert_eq!(
+            invalidation_keys(&target, &headers),
+            vec![
+                "http://example.com/mutate".to_owned(),
+                "http://example.com/resource".to_owned(),
+                "http://example.com/representation".to_owned(),
+            ]
         );
     }
 }
