@@ -115,7 +115,13 @@ pub(crate) fn decode_frame(
             if buf.len() < 4 {
                 return Ok(None);
             }
-            (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
+            let payload_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            if payload_len <= 125 {
+                return Err(WebSocketEngineError::InvalidFrame(
+                    "non-minimal payload length encoding".into(),
+                ));
+            }
+            (4, payload_len)
         }
         127 => {
             if buf.len() < 10 {
@@ -123,7 +129,24 @@ pub(crate) fn decode_frame(
             }
             let mut v = [0u8; 8];
             v.copy_from_slice(&buf[2..10]);
-            (10, u64::from_be_bytes(v) as usize)
+            let payload_len = u64::from_be_bytes(v);
+            if payload_len & (1 << 63) != 0 {
+                return Err(WebSocketEngineError::InvalidFrame(
+                    "invalid 64-bit payload length".into(),
+                ));
+            }
+            if payload_len <= u16::MAX as u64 {
+                return Err(WebSocketEngineError::InvalidFrame(
+                    "non-minimal payload length encoding".into(),
+                ));
+            }
+            let payload_len = usize::try_from(payload_len).map_err(|_| {
+                WebSocketEngineError::PayloadTooLarge {
+                    limit: max_frame_size,
+                    received: usize::MAX,
+                }
+            })?;
+            (10, payload_len)
         }
         _ => unreachable!("len_field is at most 7 bits"),
     };
@@ -266,6 +289,61 @@ mod decode_tests {
         buf.extend_from_slice(&[0u8; 200]);
         let err = decode_frame(&mut buf, 100).unwrap_err();
         assert!(matches!(err, WebSocketEngineError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn decodes_16bit_length_for_payload_126() {
+        let mut buf = BytesMut::from(&[0x82u8, 126, 0, 126][..]);
+        buf.extend_from_slice(&[0u8; 126]);
+
+        let frame = decode_frame(&mut buf, 1024).unwrap().expect("frame ready");
+
+        assert_eq!(frame.opcode, Opcode::Binary);
+        assert_eq!(frame.payload.len(), 126);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn decodes_64bit_length_for_payload_65536() {
+        let mut buf = BytesMut::from(&[0x82u8, 127, 0, 0, 0, 0, 0, 1, 0, 0][..]);
+        buf.extend_from_slice(&[0u8; 65_536]);
+
+        let frame = decode_frame(&mut buf, 65_536)
+            .unwrap()
+            .expect("frame ready");
+
+        assert_eq!(frame.opcode, Opcode::Binary);
+        assert_eq!(frame.payload.len(), 65_536);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn rejects_16bit_length_for_short_payloads() {
+        let mut buf = BytesMut::from(&[0x81u8, 126, 0, 125][..]);
+        buf.extend_from_slice(&[0u8; 125]);
+
+        let err = decode_frame(&mut buf, 1024).unwrap_err();
+
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn rejects_64bit_length_for_16bit_payloads() {
+        let mut buf = BytesMut::from(&[0x82u8, 127, 0, 0, 0, 0, 0, 0, 0, 126][..]);
+        buf.extend_from_slice(&[0u8; 126]);
+
+        let err = decode_frame(&mut buf, 1024).unwrap_err();
+
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn rejects_64bit_length_with_high_bit_set() {
+        let mut buf = BytesMut::from(&[0x82u8, 127, 0x80, 0, 0, 0, 0, 0, 0, 0][..]);
+
+        let err = decode_frame(&mut buf, usize::MAX).unwrap_err();
+
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
     }
 
     #[test]
