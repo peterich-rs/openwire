@@ -1188,6 +1188,7 @@ dependencies = [
  "openwire-rustls",
  "openwire-test",
  "tokio",
+ "url",
 ]
 
 [[package]]

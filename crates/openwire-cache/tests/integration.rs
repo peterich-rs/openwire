@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use http::header::{
-    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    LAST_MODIFIED, PRAGMA, VARY,
+    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES, HOST,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, PRAGMA, VARY,
 };
 use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
@@ -355,6 +355,180 @@ async fn successful_unsafe_method_invalidates_cached_target_uri() {
         "cached-body-3"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn successful_unsafe_method_invalidates_same_host_location_uris() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if request.method() == Method::POST {
+                    let host = request
+                        .headers()
+                        .get(HOST)
+                        .expect("host header")
+                        .to_str()
+                        .expect("host value");
+                    let mut response = text_response(StatusCode::CREATED, "created");
+                    response.headers_mut().insert(
+                        LOCATION,
+                        format!("http://{host}/location-resource")
+                            .parse()
+                            .expect("location"),
+                    );
+                    response.headers_mut().insert(
+                        CONTENT_LOCATION,
+                        "/content-location-resource"
+                            .parse()
+                            .expect("content-location"),
+                    );
+                    return response;
+                }
+
+                let mut response = text_response(StatusCode::OK, format!("{path}-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let location_uri = server.http_url("/location-resource");
+    let content_location_uri = server.http_url("/content-location-resource");
+    assert_eq!(
+        client
+            .execute(empty_request(&location_uri))
+            .await
+            .expect("first location response")
+            .into_body()
+            .text()
+            .await
+            .expect("body"),
+        "/location-resource-1"
+    );
+    assert_eq!(
+        client
+            .execute(empty_request(&content_location_uri))
+            .await
+            .expect("first content-location response")
+            .into_body()
+            .text()
+            .await
+            .expect("body"),
+        "/content-location-resource-2"
+    );
+
+    let post = client
+        .execute(method_request(
+            server.http_url("/unsafe-create"),
+            Method::POST,
+        ))
+        .await
+        .expect("post response");
+    assert_eq!(post.status(), StatusCode::CREATED);
+    assert_eq!(post.into_body().text().await.expect("body"), "created");
+
+    assert_eq!(
+        client
+            .execute(empty_request(&location_uri))
+            .await
+            .expect("refreshed location response")
+            .into_body()
+            .text()
+            .await
+            .expect("body"),
+        "/location-resource-4"
+    );
+    assert_eq!(
+        client
+            .execute(empty_request(&content_location_uri))
+            .await
+            .expect("refreshed content-location response")
+            .into_body()
+            .text()
+            .await
+            .expect("body"),
+        "/content-location-resource-5"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn unsafe_method_does_not_invalidate_cross_host_location_uri() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if request.method() == Method::POST {
+                    let mut response = text_response(StatusCode::OK, "updated elsewhere");
+                    response.headers_mut().insert(
+                        LOCATION,
+                        "http://untrusted.example/cross-host-resource"
+                            .parse()
+                            .expect("location"),
+                    );
+                    return response;
+                }
+
+                let mut response = text_response(StatusCode::OK, format!("cached-body-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/cross-host-resource");
+
+    let first = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "cached-body-1"
+    );
+
+    let post = client
+        .execute(method_request(
+            server.http_url("/unsafe-cross-host"),
+            Method::POST,
+        ))
+        .await
+        .expect("post response");
+    assert_eq!(
+        post.into_body().text().await.expect("body"),
+        "updated elsewhere"
+    );
+
+    let cached = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached.into_body().text().await.expect("body"),
+        "cached-body-1"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
