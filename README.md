@@ -223,14 +223,16 @@ body and headers untouched so the caller owns the wire encoding semantics.
 
 `openwire-cache` provides an application interceptor for private, in-process
 response caching. It currently caches replayable `GET` responses with explicit
-freshness metadata and honors the core RFC 9111 controls needed to avoid unsafe
-reuse:
+or conservative heuristic freshness metadata and honors the core RFC 9111
+controls needed to avoid unsafe reuse:
 
 - request `Cache-Control: no-cache`, `no-store`, `max-age=0`,
   `min-fresh`, and `only-if-cached`
 - response `Cache-Control: max-age`, `no-cache`, and `no-store`
 - `Expires` freshness when `max-age` is absent
 - `Age` reducing remaining `max-age` freshness
+- `Date` apparent age and Last-Modified heuristic freshness when explicit
+  freshness is absent
 - multiple stored variants for one URI through `Vary` matching against the
   original request headers, with `Vary: *` treated as not reusable
 - stale stored responses with `ETag` or `Last-Modified` validators are
@@ -240,7 +242,7 @@ reuse:
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
 responses, skips responses with `Set-Cookie`, skips authenticated requests, and
-does not yet implement heuristic freshness or stale serving.
+does not yet implement stale serving.
 
 ## Default Transport Settings
 
