@@ -253,6 +253,8 @@ The engine is responsible for:
 - Frame masking on send (client always masks; server never masks in v1).
 - Fragmentation handling on receive (re-assembly into a single `EngineFrame`
   per logical message, capped by `max_message_size`).
+- Payload length validation on receive, including RFC 6455's shortest-encoding
+  requirement and the 64-bit length high-bit constraint.
 - Control-frame validation (≤125 bytes, never fragmented). Public sender APIs
   and engine sink adapters reject outbound control frames that would violate
   that payload budget before they are written.
@@ -332,7 +334,9 @@ Implements RFC 6455 §5–§8 with the following surface:
 - Client sends: every frame is masked with a freshly generated 32-bit key
   (`getrandom` already used elsewhere in the workspace for TLS; reuse).
 - Client receives: any masked frame from the server is a protocol violation.
-- Length encoding: 7-bit, 7+16-bit, 7+64-bit per RFC 6455 §5.2.
+- Length encoding: 7-bit, 7+16-bit, 7+64-bit per RFC 6455 §5.2. Incoming
+  frames that use a longer length form than necessary, or set the high bit in
+  the 64-bit form, are protocol violations.
 - Fragmentation: control frames must not be fragmented; data frames
   reassemble across continuation frames; reassembled message is rejected if
   it exceeds `max_message_size`.
