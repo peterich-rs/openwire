@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use http::header::{
     ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    LAST_MODIFIED, VARY,
+    LAST_MODIFIED, PRAGMA, VARY,
 };
 use http::{Request, StatusCode};
 use hyper::body::Incoming;
@@ -154,6 +154,112 @@ async fn request_no_cache_bypasses_cache_and_refreshes_entry() {
         .expect("cached response");
     assert_eq!(cached.into_body().text().await.expect("body"), "body-2");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn request_pragma_no_cache_without_cache_control_bypasses_cache_and_refreshes_entry() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = text_response(StatusCode::OK, format!("pragma-body-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/pragma-refresh")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "pragma-body-1"
+    );
+
+    let refresh = client
+        .execute(request_with_header(
+            server.http_url("/pragma-refresh"),
+            PRAGMA,
+            "no-cache",
+        ))
+        .await
+        .expect("refresh response");
+    assert_eq!(
+        refresh.into_body().text().await.expect("body"),
+        "pragma-body-2"
+    );
+
+    let cached = client
+        .execute(empty_request(server.http_url("/pragma-refresh")))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached.into_body().text().await.expect("body"),
+        "pragma-body-2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn request_cache_control_takes_precedence_over_pragma_no_cache() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response =
+                    text_response(StatusCode::OK, format!("cache-control-body-{hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/pragma-precedence")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "cache-control-body-1"
+    );
+
+    let cached = client
+        .execute(request_with_headers(
+            server.http_url("/pragma-precedence"),
+            CACHE_CONTROL,
+            "max-age=60",
+            PRAGMA,
+            "no-cache",
+        ))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached.into_body().text().await.expect("body"),
+        "cache-control-body-1"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1206,5 +1312,19 @@ fn request_with_header(
     request
         .headers_mut()
         .insert(name, value.parse().expect("header value"));
+    request
+}
+
+fn request_with_headers(
+    uri: impl AsRef<str>,
+    first_name: http::header::HeaderName,
+    first_value: &'static str,
+    second_name: http::header::HeaderName,
+    second_value: &'static str,
+) -> Request<RequestBody> {
+    let mut request = request_with_header(uri, first_name, first_value);
+    request
+        .headers_mut()
+        .insert(second_name, second_value.parse().expect("header value"));
     request
 }
