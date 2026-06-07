@@ -480,11 +480,13 @@ the same close validation and also rejects oversized `Ping` / `Pong` payloads.
 ### 4.9 Heartbeat
 
 When `ping_interval` is set, a background timer task periodically enqueues
-`Ping(b"")` to the writer queue. If `pong_timeout` elapses without a matching
-pong, the writer enqueues a `Close { code: 1011, reason: "ping timeout" }`
-and the call fails with `WebSocketError::Timeout(Ping)`. The receiver
-task marks the most recent inbound pong timestamp; the heartbeat task
-inspects it via an atomic.
+`Ping(b"")` to the writer queue. Each ping records the current pong
+generation, then waits for a later `Pong` or for `pong_timeout` to elapse; the
+timeout window starts after the ping is enqueued, not at session start. If no
+matching pong arrives, the heartbeat task tells the writer to fail the session
+with `WebSocketError::Timeout(Ping)` and attempt a `Close { code: 1011,
+reason: "ping timeout" }`. The receiver task marks inbound pong frames by
+incrementing an atomic generation and notifying the heartbeat task.
 
 ### 4.10 Drop / cancel semantics
 

@@ -1,14 +1,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use openwire_core::websocket::{
-    BoxEngineSink, BoxEngineStream, CloseInitiator, EngineFrame, Message, WebSocketChannel,
-    WebSocketEngineError, WebSocketError,
+    BoxEngineSink, BoxEngineStream, CloseInitiator, EngineFrame, Message, TimeoutKind,
+    WebSocketChannel, WebSocketEngineError, WebSocketError,
 };
 use openwire_core::{CallContext, SharedEventListener};
 
@@ -30,6 +30,7 @@ pub(crate) enum WriterCommand {
         code: u16,
         reason: String,
     },
+    PingTimeout,
     Cancel,
 }
 
@@ -117,6 +118,27 @@ async fn run_writer(
             }
             WriterCommand::CloseAck { code, reason } => {
                 let _ = sink.send(EngineFrame::Close { code, reason }).await;
+                let _ = sink.flush().await;
+                return;
+            }
+            WriterCommand::PingTimeout => {
+                if session.remote_close_started() {
+                    continue;
+                }
+                session.mark_local_close_started();
+                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
+                    let error = WebSocketError::Timeout(TimeoutKind::Ping);
+                    listener.websocket_failed(ctx, &error);
+                }
+                let _ = receiver_tx
+                    .send(Err(WebSocketError::Timeout(TimeoutKind::Ping)))
+                    .await;
+                let _ = sink
+                    .send(EngineFrame::Close {
+                        code: 1011,
+                        reason: "ping timeout".into(),
+                    })
+                    .await;
                 let _ = sink.flush().await;
                 return;
             }
@@ -374,27 +396,35 @@ impl SessionState {
 
 #[derive(Clone)]
 pub(crate) struct PongTracker {
-    last_pong_ms: Arc<AtomicU64>,
-    start: Arc<Instant>,
+    generation: Arc<AtomicU64>,
+    notify: Arc<Notify>,
 }
 
 impl PongTracker {
     pub(crate) fn new() -> Self {
         Self {
-            last_pong_ms: Arc::new(AtomicU64::new(0)),
-            start: Arc::new(Instant::now()),
+            generation: Arc::new(AtomicU64::new(0)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
     pub(crate) fn mark(&self) {
-        self.last_pong_ms
-            .store(self.start.elapsed().as_millis() as u64, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
     }
 
-    pub(crate) fn since_last_pong(&self) -> Duration {
-        let now = self.start.elapsed().as_millis() as u64;
-        let last = self.last_pong_ms.load(Ordering::Acquire);
-        Duration::from_millis(now.saturating_sub(last))
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_pong_after(&self, generation: u64) {
+        loop {
+            let notified = self.notify.notified();
+            if self.generation() != generation {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -410,19 +440,22 @@ pub(crate) async fn run_heartbeat(
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        let pong_generation = tracker.generation();
         if out.send(WriterCommand::Ping(Bytes::new())).await.is_err() {
             return;
         }
-        if tracker.since_last_pong() > pong_timeout {
-            let (ack_tx, _) = tokio::sync::oneshot::channel();
-            let _ = out
-                .send(WriterCommand::Close {
-                    code: 1011,
-                    reason: "ping timeout".into(),
-                    ack: ack_tx,
-                })
-                .await;
-            return;
+
+        let timeout = tokio::time::sleep(pong_timeout);
+        tokio::pin!(timeout);
+        tokio::select! {
+            _ = tracker.wait_for_pong_after(pong_generation) => {}
+            _ = &mut timeout => {
+                if tracker.generation() == pong_generation {
+                    let _ = out.send(WriterCommand::PingTimeout).await;
+                    return;
+                }
+            }
+            _ = out.closed() => return,
         }
     }
 }
@@ -611,6 +644,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_reports_ping_timeout_and_sends_close() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<EngineFrame>>> = Default::default();
+        let sink: BoxEngineSink = Box::pin(CapturingSink {
+            captured: captured.clone(),
+        });
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WriterCommand>(4);
+        let (recv_tx, mut recv_rx) = mpsc::channel::<Result<Message, WebSocketError>>(4);
+        let writer = tokio::spawn(run_writer(
+            sink,
+            cmd_rx,
+            Duration::from_millis(50),
+            recv_tx,
+            None,
+            None,
+            SessionState::default(),
+        ));
+
+        cmd_tx
+            .send(WriterCommand::PingTimeout)
+            .await
+            .expect("ping timeout");
+
+        match recv_rx.recv().await.expect("timeout error") {
+            Err(WebSocketError::Timeout(TimeoutKind::Ping)) => {}
+            other => panic!("expected ping timeout, got {other:?}"),
+        }
+
+        writer.await.expect("writer joined");
+        let captured = captured.lock().unwrap();
+        assert!(matches!(
+            captured.as_slice(),
+            [EngineFrame::Close { code: 1011, reason }] if reason == "ping timeout"
+        ));
+    }
+
+    #[tokio::test]
     async fn reader_sends_close_ack_for_remote_close() {
         let stream: BoxEngineStream = Box::pin(stream::iter([Ok(EngineFrame::Close {
             code: 1000,
@@ -675,5 +744,69 @@ mod tests {
             cmd_rx.recv().await.expect("cancel"),
             WriterCommand::Cancel
         ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_window_starts_after_ping_send() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCommand>(4);
+        let tracker = PongTracker::new();
+        let heartbeat = tokio::spawn(run_heartbeat(
+            Duration::from_millis(80),
+            Duration::from_millis(40),
+            tracker,
+            cmd_tx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(150), cmd_rx.recv())
+                .await
+                .expect("first ping should arrive"),
+            Some(WriterCommand::Ping(payload)) if payload.is_empty()
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(15), cmd_rx.recv())
+                .await
+                .is_err(),
+            "ping timeout must not be queued immediately after the first ping"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv())
+                .await
+                .expect("ping timeout should arrive"),
+            Some(WriterCommand::PingTimeout)
+        ));
+
+        heartbeat.await.expect("heartbeat joined");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pong_allows_next_ping() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCommand>(4);
+        let tracker = PongTracker::new();
+        let heartbeat_tracker = tracker.clone();
+        let heartbeat = tokio::spawn(run_heartbeat(
+            Duration::from_millis(30),
+            Duration::from_millis(100),
+            heartbeat_tracker,
+            cmd_tx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv())
+                .await
+                .expect("first ping should arrive"),
+            Some(WriterCommand::Ping(payload)) if payload.is_empty()
+        ));
+
+        tracker.mark();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv())
+                .await
+                .expect("second ping should arrive after pong"),
+            Some(WriterCommand::Ping(payload)) if payload.is_empty()
+        ));
+
+        heartbeat.abort();
     }
 }
