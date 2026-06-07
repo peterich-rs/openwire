@@ -205,7 +205,7 @@ fn decode_layer(reader: BoxAsyncBufRead, encoding: ResponseEncoding) -> BoxAsync
 }
 
 fn wire_error_to_io(error: WireError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error)
+    io::Error::other(error)
 }
 
 fn io_error_to_wire(error: io::Error, label: &str) -> WireError {
