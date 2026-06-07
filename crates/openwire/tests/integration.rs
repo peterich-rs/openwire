@@ -126,6 +126,168 @@ async fn call_timeout_uses_configured_timer() {
 }
 
 #[tokio::test]
+async fn canceled_call_fails_before_network_chain() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let requests = requests.clone();
+        move |_request| {
+            let requests = requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::Relaxed);
+                ok_text("should not run")
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let call = client.new_call(empty_request(server.http_url("/cancel-before")));
+    let handle = call.handle();
+
+    assert!(!call.is_executed());
+    call.cancel();
+    assert!(call.is_canceled());
+
+    let error = call.execute().await.expect_err("canceled call should fail");
+
+    assert_eq!(error.kind(), WireErrorKind::Canceled);
+    assert!(handle.is_executed());
+    assert!(handle.is_canceled());
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert_event_subsequence(
+        &events.events(),
+        &["call_start GET", "call_failed Canceled"],
+    );
+}
+
+#[tokio::test]
+async fn call_handle_can_cancel_in_flight_execute() {
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+    let server = spawn_http1({
+        let seen_tx = seen_tx.clone();
+        move |_request| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                if let Some(sender) = seen_tx.lock().expect("seen lock").take() {
+                    let _ = sender.send(());
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                ok_text("too late")
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let call = client.new_call(empty_request(server.http_url("/cancel-running")));
+    let handle = call.handle();
+    let task = tokio::spawn(async move { call.execute().await });
+
+    seen_rx.await.expect("server saw request");
+    handle.cancel();
+    let error = task
+        .await
+        .expect("execute task")
+        .expect_err("cancel should fail in-flight call");
+
+    assert_eq!(error.kind(), WireErrorKind::Canceled);
+    assert!(handle.is_executed());
+    assert!(handle.is_canceled());
+    assert_event_subsequence(
+        &events.events(),
+        &["call_start GET", "call_failed Canceled"],
+    );
+}
+
+#[tokio::test]
+async fn cancel_after_response_headers_fails_body_read() {
+    let server = spawn_http1(|_request| async move { ok_text("cancelable body") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let call = client.new_call(empty_request(server.http_url("/cancel-body")));
+    let handle = call.handle();
+
+    let response = call.execute().await.expect("response headers");
+    handle.cancel();
+    let error = response
+        .into_body()
+        .text()
+        .await
+        .expect_err("canceled body should fail");
+
+    assert_eq!(error.kind(), WireErrorKind::Canceled);
+    assert_event_subsequence(
+        &events.events(),
+        &[
+            "call_start GET",
+            "response_headers_end 200 OK",
+            "call_failed Canceled",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn queued_call_executes_on_client_executor() {
+    let server = spawn_http1(|_request| async move { ok_text("queued ok") }).await;
+    let client = Client::builder().build().expect("client");
+
+    let queued = client
+        .new_call(empty_request(server.http_url("/queued")))
+        .enqueue()
+        .expect("queued call");
+
+    assert!(queued.is_executed());
+    let response = queued.await_response().await.expect("queued response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "queued ok");
+}
+
+#[tokio::test]
+async fn queued_call_can_be_canceled() {
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+    let server = spawn_http1({
+        let seen_tx = seen_tx.clone();
+        move |_request| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                if let Some(sender) = seen_tx.lock().expect("seen lock").take() {
+                    let _ = sender.send(());
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                ok_text("too late")
+            }
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+    let queued = client
+        .new_call(empty_request(server.http_url("/queued-cancel")))
+        .enqueue()
+        .expect("queued call");
+
+    seen_rx.await.expect("server saw request");
+    queued.cancel();
+    let error = queued
+        .await_response()
+        .await
+        .expect_err("cancel should fail queued call");
+
+    assert_eq!(error.kind(), WireErrorKind::Canceled);
+}
+
+#[tokio::test]
 async fn follows_redirects_for_get_requests() {
     let server = spawn_http1(|request: Request<Incoming>| async move {
         match request.uri().path() {
