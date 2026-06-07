@@ -39,6 +39,7 @@ impl ReassemblyState {
                 if frame.fin {
                     self.deliver_single(frame.opcode, frame.payload)
                 } else {
+                    Self::check_message_size(self.max_message_size, frame.payload.len())?;
                     self.in_progress = Some(InProgress {
                         opcode: frame.opcode,
                         buffer: BytesMut::from(&frame.payload[..]),
@@ -69,17 +70,18 @@ impl ReassemblyState {
         &mut self,
         frame: DecodedFrame,
     ) -> Result<Option<EngineFrame>, WebSocketEngineError> {
+        let max_message_size = self.max_message_size;
         let state = self
             .in_progress
             .as_mut()
             .expect("checked by caller before calling append");
-        let new_len = state.buffer.len() + frame.payload.len();
-        if new_len > self.max_message_size {
+        let Some(new_len) = state.buffer.len().checked_add(frame.payload.len()) else {
             return Err(WebSocketEngineError::PayloadTooLarge {
                 limit: self.max_message_size,
-                received: new_len,
+                received: usize::MAX,
             });
-        }
+        };
+        Self::check_message_size(max_message_size, new_len)?;
         state.buffer.extend_from_slice(&frame.payload);
 
         if frame.fin {
@@ -92,17 +94,26 @@ impl ReassemblyState {
         }
     }
 
+    fn check_message_size(
+        max_message_size: usize,
+        received: usize,
+    ) -> Result<(), WebSocketEngineError> {
+        if received > max_message_size {
+            Err(WebSocketEngineError::PayloadTooLarge {
+                limit: max_message_size,
+                received,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     fn deliver_single(
         &self,
         opcode: Opcode,
         payload: Bytes,
     ) -> Result<Option<EngineFrame>, WebSocketEngineError> {
-        if payload.len() > self.max_message_size {
-            return Err(WebSocketEngineError::PayloadTooLarge {
-                limit: self.max_message_size,
-                received: payload.len(),
-            });
-        }
+        Self::check_message_size(self.max_message_size, payload.len())?;
         match opcode {
             Opcode::Text => {
                 let text = std::str::from_utf8(&payload)
@@ -201,6 +212,23 @@ mod tests {
             .feed(frame(true, Opcode::Continuation, &[4, 5]))
             .unwrap_err();
         assert!(matches!(err, WebSocketEngineError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn rejects_message_over_limit_on_initial_fragment() {
+        let mut session = ReassemblyState::new(2);
+        let err = session
+            .feed(frame(false, Opcode::Binary, &[1, 2, 3]))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            WebSocketEngineError::PayloadTooLarge {
+                limit: 2,
+                received: 3
+            }
+        ));
+        session.end_of_stream().unwrap();
     }
 
     #[test]

@@ -499,6 +499,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_rejects_initial_fragment_over_message_limit() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        // First Binary fragment alone exceeds max_message_size, even though
+        // the frame itself is under max_frame_size.
+        server_io
+            .write_all(&[0x02, 0x03, 1, 2, 3])
+            .await
+            .expect("server write");
+        drop(server_io);
+
+        let engine = NativeEngine::new();
+        let cfg = WebSocketEngineConfig {
+            role: Role::Client,
+            subprotocol: None,
+            extensions: vec![],
+            max_frame_size: 1024,
+            max_message_size: 2,
+        };
+        let mut channel = engine
+            .upgrade(box_connection(client_io), cfg)
+            .await
+            .expect("upgrade");
+
+        let err = channel
+            .recv
+            .next()
+            .await
+            .expect("frame result")
+            .expect_err("oversized initial fragment must be rejected");
+        assert!(matches!(
+            err,
+            WebSocketEngineError::PayloadTooLarge {
+                limit: 2,
+                received: 3
+            }
+        ));
+        assert!(channel.recv.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn engine_rejects_eof_during_partial_frame() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
         // Header declares a two-byte Text payload but only one byte arrives.

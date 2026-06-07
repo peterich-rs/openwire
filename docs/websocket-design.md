@@ -345,8 +345,8 @@ Implements RFC 6455 §5–§8 with the following surface:
   stream.
 - Fragmentation: control frames must not be fragmented; data frames
   reassemble across continuation frames; reassembled message is rejected if
-  it exceeds `max_message_size`. EOF before the final continuation frame is a
-  protocol violation.
+  the accumulated payload exceeds `max_message_size`, including the initial
+  fragment. EOF before the final continuation frame is a protocol violation.
 - UTF-8: `Text` frames are validated per RFC 6455 §8.1 using `std::str::from_utf8`
   on the reassembled payload (we do not stream-validate fragments).
 - Close: outgoing close is validated before it enters the writer queue. The
