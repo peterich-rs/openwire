@@ -123,14 +123,17 @@ async fn invalid_subprotocol_rejected_before_connect() {
 
 #[tokio::test]
 async fn server_initiated_close_reaches_client() {
-    let server = spawn_websocket_handler(|mut websocket| async move {
-        // Send one message then close gracefully.
-        let _ = websocket
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                "from server".into(),
-            ))
-            .await;
-        let _ = websocket
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(1);
+    let server = spawn_websocket_handler(move |mut websocket| {
+        let ack_tx = ack_tx.clone();
+        async move {
+            // Send one message then close gracefully.
+            let _ = websocket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    "from server".into(),
+                ))
+                .await;
+            let _ = websocket
             .send(tokio_tungstenite::tungstenite::Message::Close(Some(
                 tokio_tungstenite::tungstenite::protocol::CloseFrame {
                     code:
@@ -139,6 +142,15 @@ async fn server_initiated_close_reaches_client() {
                 },
             )))
             .await;
+            let ack = match tokio::time::timeout(Duration::from_secs(1), websocket.next()).await {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(Some(frame))))) => frame
+                    .code
+                    == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal
+                    && frame.reason == "server done",
+                _ => false,
+            };
+            let _ = ack_tx.send(ack).await;
+        }
     })
     .await;
 
@@ -161,6 +173,12 @@ async fn server_initiated_close_reaches_client() {
         }
         other => panic!("expected ClosedByPeer, got {other:?}"),
     }
+
+    let acked = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
+        .await
+        .expect("server should observe close ack")
+        .expect("ack result");
+    assert!(acked, "server should receive matching close ack");
 }
 
 #[tokio::test]
