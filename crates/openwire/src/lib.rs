@@ -15,7 +15,7 @@ mod transport;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
-pub use client::{Call, CallOptions, Client, ClientBuilder};
+pub use client::{Call, CallHandle, CallOptions, Client, ClientBuilder, QueuedCall};
 pub use connection::{
     Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
     ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,

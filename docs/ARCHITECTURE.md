@@ -70,10 +70,21 @@ flowchart TD
     M --> N[hyper::client::conn HTTP/1.1 or HTTP/2 binding]
     N --> O[Observed response body wrapper]
     O --> P[Connection release bookkeeping]
-    D --> Q[Cookie persistence / auth / redirect follow-up decision]
+D --> Q[Cookie persistence / auth / redirect follow-up decision]
 ```
 
 No feature should bypass this chain.
+
+`Call::execute()` and `Call::enqueue()` both enter this same chain. Queued calls
+only move dispatch onto the client's configured `WireExecutor`; they do not get
+a separate transport path. `CallHandle::cancel()` races against the in-flight
+execution at the `Client::execute` boundary, and the response body wrapper keeps
+observing cancellation after response headers have been returned so `call_failed`
+still reflects body-phase cancellation.
+
+`Call::try_clone()` is a request-template operation, not a transport shortcut.
+It creates a fresh unexecuted call only when the request body is replayable, and
+the cloned call re-enters the canonical flow when executed.
 
 `BridgeInterceptor` owns HTTP request/response normalization that is above the
 transport byte stream but below user-facing application interceptors. That
@@ -195,8 +206,10 @@ follow-ups (pool reuse, interceptor chain integration).
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
-- `Client::execute` owns final call completion and wraps the returned response
-  body so `call_end` / `call_failed` reflect the whole call.
+- `Client::execute` owns call cancellation, final call completion, and wraps the
+  returned response body so `call_end` / `call_failed` reflect the whole call.
+- `Call::enqueue` is executor-backed dispatch for the same `Call::execute`
+  behavior, not a separate policy or transport implementation.
 - `ResponseLease` and `ObservedIncomingBody` own final release bookkeeping.
 - HTTP/1.1 reuse is single-exchange and response-body-lifecycle-driven.
 - HTTP/2 multiplexing is governed by connection health, allocation tracking,

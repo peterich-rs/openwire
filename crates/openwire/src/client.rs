@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_channel::oneshot;
 use futures_util::future::{select, Either};
+use futures_util::task::AtomicWaker;
 use http::header::PROXY_AUTHORIZATION;
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
@@ -46,6 +49,7 @@ pub struct Client {
 
 struct ClientInner {
     event_listener_factory: SharedEventListenerFactory,
+    executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
     request_config: EffectiveRequestConfig,
     service: BoxWireService,
@@ -60,6 +64,27 @@ pub struct Call {
     client: Client,
     request: Request<RequestBody>,
     options: CallOptions,
+    state: Arc<CallState>,
+}
+
+/// A cloneable handle for observing and canceling a logical HTTP call.
+///
+/// The handle stays valid after the `Call` has been moved into `execute()` or
+/// `enqueue()`, which makes it the OkHttp-style cancellation surface for Rust
+/// async tasks.
+#[derive(Clone)]
+pub struct CallHandle {
+    state: Arc<CallState>,
+}
+
+/// A background call started by `Call::enqueue()`.
+///
+/// Dropping this handle does not request cancellation. Use `cancel()` when the
+/// in-flight work should be stopped.
+pub struct QueuedCall {
+    handle: CallHandle,
+    receiver: oneshot::Receiver<Result<Response<ResponseBody>, WireError>>,
+    _task: BoxTaskHandle,
 }
 
 #[derive(Clone)]
@@ -126,6 +151,13 @@ struct PoolReaperController {
 #[derive(Default)]
 struct PoolReaperState {
     handle: Option<BoxTaskHandle>,
+}
+
+#[derive(Default)]
+struct CallState {
+    executed: AtomicBool,
+    canceled: AtomicBool,
+    waker: AtomicWaker,
 }
 
 impl ClientBuilder {
@@ -429,6 +461,7 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner {
                 event_listener_factory: self.event_listener_factory,
+                executor: self.executor,
                 timer: self.timer,
                 request_config,
                 service,
@@ -491,6 +524,7 @@ impl Client {
             client: self.clone(),
             request,
             options: CallOptions::default(),
+            state: Arc::new(CallState::default()),
         }
     }
 
@@ -649,7 +683,63 @@ impl PoolReaperController {
     }
 }
 
+impl CallState {
+    fn cancel(&self) {
+        self.canceled.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
+    fn is_executed(&self) -> bool {
+        self.executed.load(Ordering::Acquire)
+    }
+
+    fn poll_canceled(&self, cx: &mut std::task::Context<'_>) -> bool {
+        if self.is_canceled() {
+            return true;
+        }
+
+        self.waker.register(cx.waker());
+        self.is_canceled()
+    }
+}
+
 impl Call {
+    /// Returns a cloneable handle that can cancel or inspect this call after the
+    /// call object has been moved into execution.
+    pub fn handle(&self) -> CallHandle {
+        CallHandle {
+            state: self.state.clone(),
+        }
+    }
+
+    /// Requests cancellation for this logical call.
+    pub fn cancel(&self) {
+        self.state.cancel();
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.state.is_canceled()
+    }
+
+    pub fn is_executed(&self) -> bool {
+        self.state.is_executed()
+    }
+
+    /// Creates a fresh, unexecuted call with the same request and options when
+    /// the request body is replayable.
+    pub fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            client: self.client.clone(),
+            request: clone_request(&self.request)?,
+            options: self.options,
+            state: Arc::new(CallState::default()),
+        })
+    }
+
     pub fn options(mut self, options: CallOptions) -> Self {
         self.options.apply(options);
         self
@@ -695,7 +785,44 @@ impl Call {
         self
     }
 
-    pub async fn execute(mut self) -> Result<Response<ResponseBody>, WireError> {
+    /// Queues this call on the client's configured executor and returns a handle
+    /// that can be awaited for the response.
+    pub fn enqueue(self) -> Result<QueuedCall, WireError> {
+        self.mark_executed()?;
+        let handle = self.handle();
+        let executor = self.client.inner.executor.clone();
+        let (sender, receiver) = oneshot::channel();
+        let task = executor.spawn(Box::pin(async move {
+            let result = self.execute_marked().await;
+            let _ = sender.send(result);
+        }))?;
+
+        Ok(QueuedCall {
+            handle,
+            receiver,
+            _task: task,
+        })
+    }
+
+    pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
+        self.mark_executed()?;
+        self.execute_marked().await
+    }
+
+    fn mark_executed(&self) -> Result<(), WireError> {
+        if self
+            .state
+            .executed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(WireError::invalid_request("call has already been executed"))
+        }
+    }
+
+    async fn execute_marked(mut self) -> Result<Response<ResponseBody>, WireError> {
         let request_config = self
             .client
             .inner
@@ -730,11 +857,16 @@ impl Call {
                     .await
             };
 
-            let result =
-                with_call_deadline(self.client.inner.timer.clone(), ctx.deadline(), execute).await;
+            let execute =
+                with_call_deadline(self.client.inner.timer.clone(), ctx.deadline(), execute);
+            let result = with_call_cancellation(self.state.clone(), execute).await;
 
             match result {
-                Ok(response) => Ok(attach_call_lifecycle(response, ctx.clone())),
+                Ok(response) => Ok(attach_call_lifecycle(
+                    response,
+                    ctx.clone(),
+                    self.state.clone(),
+                )),
                 Err(error) => {
                     ctx.listener().call_failed(&ctx, &error);
                     Err(error)
@@ -744,6 +876,47 @@ impl Call {
         .instrument(span)
         .with_current_subscriber()
         .await
+    }
+}
+
+impl CallHandle {
+    pub fn cancel(&self) {
+        self.state.cancel();
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.state.is_canceled()
+    }
+
+    pub fn is_executed(&self) -> bool {
+        self.state.is_executed()
+    }
+}
+
+impl QueuedCall {
+    pub fn handle(&self) -> CallHandle {
+        self.handle.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.handle.cancel();
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.handle.is_canceled()
+    }
+
+    pub fn is_executed(&self) -> bool {
+        self.handle.is_executed()
+    }
+
+    pub async fn await_response(self) -> Result<Response<ResponseBody>, WireError> {
+        match self.receiver.await {
+            Ok(result) => result,
+            Err(_closed) => Err(WireError::canceled(
+                "queued call ended before producing a response",
+            )),
+        }
     }
 }
 
@@ -767,11 +940,12 @@ pub(crate) fn attach_request_admission(
 fn attach_call_lifecycle(
     response: Response<ResponseBody>,
     ctx: CallContext,
+    state: Arc<CallState>,
 ) -> Response<ResponseBody> {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        ResponseBody::new(CallLifecycleBody::new(body, ctx).boxed()),
+        ResponseBody::new(CallLifecycleBody::new(body, ctx, state).boxed()),
     )
 }
 
@@ -1006,6 +1180,58 @@ where
     }
 }
 
+async fn with_call_cancellation<F>(
+    state: Arc<CallState>,
+    future: F,
+) -> Result<Response<ResponseBody>, WireError>
+where
+    F: std::future::Future<Output = Result<Response<ResponseBody>, WireError>>,
+{
+    if state.is_canceled() {
+        return Err(call_canceled_error());
+    }
+
+    match select(Box::pin(future), Box::pin(CallCanceled { state })).await {
+        Either::Left((result, _canceled)) => result,
+        Either::Right((_ready, _future)) => Err(call_canceled_error()),
+    }
+}
+
+fn clone_request(request: &Request<RequestBody>) -> Option<Request<RequestBody>> {
+    let mut cloned = Request::builder()
+        .method(request.method().clone())
+        .uri(request.uri().clone())
+        .version(request.version())
+        .body(request.body().try_clone()?)
+        .ok()?;
+    *cloned.headers_mut() = request.headers().clone();
+    *cloned.extensions_mut() = request.extensions().clone();
+    Some(cloned)
+}
+
+fn call_canceled_error() -> WireError {
+    WireError::canceled("call canceled")
+}
+
+struct CallCanceled {
+    state: Arc<CallState>,
+}
+
+impl std::future::Future for CallCanceled {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.state.poll_canceled(cx) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
 fn spawn_pool_reaper(
     executor: Arc<dyn WireExecutor>,
     timer: SharedTimer,
@@ -1037,14 +1263,16 @@ fn pool_reaper_cadence(idle_timeout: Duration) -> Duration {
 struct CallLifecycleBody {
     inner: Option<ResponseBody>,
     ctx: CallContext,
+    state: Arc<CallState>,
     finished: bool,
 }
 
 impl CallLifecycleBody {
-    fn new(inner: ResponseBody, ctx: CallContext) -> Self {
+    fn new(inner: ResponseBody, ctx: CallContext, state: Arc<CallState>) -> Self {
         Self {
             inner: Some(inner),
             ctx,
+            state,
             finished: false,
         }
     }
@@ -1073,7 +1301,13 @@ impl CallLifecycleBody {
         }
         self.finished = true;
         drop(self.inner.take());
-        self.ctx.listener().call_end(&self.ctx);
+        if self.state.is_canceled() {
+            self.ctx
+                .listener()
+                .call_failed(&self.ctx, &call_canceled_error());
+        } else {
+            self.ctx.listener().call_end(&self.ctx);
+        }
     }
 }
 
@@ -1094,6 +1328,11 @@ impl Body for CallLifecycleBody {
         let this = self.get_mut();
         if this.finished {
             return std::task::Poll::Ready(None);
+        }
+        if this.state.poll_canceled(cx) {
+            let error = call_canceled_error();
+            this.finish_with_error(&error);
+            return std::task::Poll::Ready(Some(Err(error)));
         }
         let Some(inner) = this.inner.as_mut() else {
             return std::task::Poll::Ready(None);
@@ -1161,6 +1400,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use futures_util::stream;
     use http::header::PROXY_AUTHORIZATION;
     use http::Request;
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
@@ -1492,6 +1733,53 @@ mod tests {
         assert_eq!(effective.max_retries, 0);
         assert!(effective.retry_canceled_requests);
         assert!(effective.allow_insecure_redirects);
+    }
+
+    #[test]
+    fn call_try_clone_preserves_replayable_request_and_options_with_fresh_state() {
+        let client = crate::Client::builder().build().expect("client");
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/resource")
+            .header("x-test", "yes")
+            .body(RequestBody::from_static(b"hello"))
+            .expect("request");
+        let call = client
+            .new_call(request)
+            .call_timeout(Duration::from_secs(1))
+            .max_retries(0);
+        call.cancel();
+
+        let cloned = call.try_clone().expect("replayable clone");
+
+        assert!(call.is_canceled());
+        assert!(!cloned.is_canceled());
+        assert!(!cloned.is_executed());
+        assert_eq!(cloned.options.call_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(cloned.options.max_retries, Some(0));
+        assert_eq!(cloned.request.method(), http::Method::POST);
+        assert_eq!(
+            cloned
+                .request
+                .headers()
+                .get("x-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn call_try_clone_rejects_streaming_request_body() {
+        let client = crate::Client::builder().build().expect("client");
+        let request = Request::builder()
+            .uri("http://example.com/stream")
+            .body(RequestBody::from_stream(stream::empty::<
+                Result<Bytes, WireError>,
+            >()))
+            .expect("request");
+        let call = client.new_call(request);
+
+        assert!(call.try_clone().is_none());
     }
 
     #[test]
