@@ -343,10 +343,9 @@ Implements RFC 6455 §5–§8 with the following surface:
 
 Out of scope for native v1:
 
-- `permessage-deflate` (RFC 7692). The engine config carries the negotiated
-  extension list; `NativeEngine` rejects with `WebSocketEngineError::UnsupportedExtension`
-  if any extension survives negotiation. (Negotiation prevents this in
-  practice: §4.7.2.)
+- `permessage-deflate` (RFC 7692). The client does not send
+  `Sec-WebSocket-Extensions` offers in v1, so any extension returned by the
+  server is rejected during handshake validation before engine upgrade.
 - Per-message interleaving across fragments (sending a control frame in the
   middle of a fragmented data message is **received** correctly per RFC 6455,
   but the native engine never **emits** interleaved fragments — every send is
@@ -393,8 +392,9 @@ branch verifies:
 - `Connection` includes `upgrade` (case-insensitive, comma-list aware)
 - `Upgrade` is `websocket` (case-insensitive)
 - `Sec-WebSocket-Accept` equals the value recorded in `CallContext`
-- No `Sec-WebSocket-Extensions` other than ones explicitly accepted by the
-  selected engine
+- No `Sec-WebSocket-Extensions`; v1 does not negotiate extensions, so any
+  returned extension is treated as an unrequested extension and fails the
+  handshake
 
 A non-101 response is fed back to the follow-up coordinator with normal HTTP
 semantics: 3xx → redirect, 401 / 407 → re-auth, 5xx + retry policy → retry.
