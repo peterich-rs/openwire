@@ -120,13 +120,13 @@ connect timeout, retry policy, redirect policy, etc.).
 pub struct WebSocketCall<'a> { /* … */ }
 
 impl<'a> WebSocketCall<'a> {
-    pub fn handshake_timeout(self, d: Duration) -> Self;          // default: from call_timeout
-    pub fn close_timeout(self, d: Duration) -> Self;              // default: 1s
-    pub fn max_frame_size(self, n: usize) -> Self;                // default: 1 MiB
+    pub fn handshake_timeout(self, d: Duration) -> Self;          // default: 30s
+    pub fn close_timeout(self, d: Duration) -> Self;              // default: 10s
+    pub fn max_frame_size(self, n: usize) -> Self;                // default: 16 MiB
     pub fn max_message_size(self, n: usize) -> Self;              // default: 16 MiB
-    pub fn send_queue_size(self, n: usize) -> Self;               // default: 256 messages
+    pub fn send_queue_size(self, n: usize) -> Self;               // default: 32 messages
     pub fn ping_interval(self, d: Duration) -> Self;              // default: None (disabled)
-    pub fn pong_timeout(self, d: Duration) -> Self;               // default: 30s when ping is enabled
+    pub fn pong_timeout(self, d: Duration) -> Self;               // default: ping_interval * 2
     pub fn subprotocols<I, S>(self, p: I) -> Self
         where I: IntoIterator<Item = S>, S: Into<String>;
     pub fn engine(self, e: Arc<dyn WebSocketEngine>) -> Self;
@@ -542,14 +542,17 @@ pub enum CloseInitiator { Local, Remote }
 ```
 
 All methods have empty default impls (additive change; existing impls compile
-unchanged). Existing HTTP events fire normally during the handshake itself —
+unchanged). Existing HTTP events fire normally during the handshake itself -
 `dns_start/end`, `connect_start/end`, `tls_start/end`, `request_headers_*`,
 `response_headers_*` all fire as for any HTTP/1.1 GET. `response_body_end`
 does **not** fire on a successful upgrade (the response has no body to
-consume). `call_end` fires when the WebSocket close handshake completes
-(both sides exchanged Close frames or the timeout elapsed); `call_failed`
-fires for handshake failures and for protocol-level failures during the
-session.
+consume). Once `call_start` has fired, every WebSocket call terminates the
+shared call lifecycle exactly once: `call_end` fires when openwire observes a
+graceful close, and `call_failed` fires for connect, handshake, local cancel,
+heartbeat timeout, protocol, engine, or IO failures before graceful close.
+`websocket_failed` carries the precise `WebSocketError` for those WebSocket
+failures. A peer EOF before a Close frame is an abnormal protocol termination,
+not a clean receiver EOF.
 
 ### 5.2 Tracing spans
 
@@ -570,13 +573,13 @@ inner channel. Engines therefore never need to know about `EventListener`.
 
 | Knob | Client default | Per-call override | Rationale |
 | --- | --- | --- | --- |
-| `websocket_handshake_timeout` | inherits `call_timeout`, fall back to 30 s | yes | parity with HTTP |
-| `websocket_close_timeout` | 1 s | yes | matches OkHttp's default cancel grace |
-| `websocket_max_frame_size` | 1 MiB | yes | DoS / memory cap |
+| `websocket_handshake_timeout` | 30 s | yes | bounds connect + 101 upgrade |
+| `websocket_close_timeout` | 10 s | yes | cancel grace after local close |
+| `websocket_max_frame_size` | 16 MiB | yes | DoS / memory cap |
 | `websocket_max_message_size` | 16 MiB | yes | DoS / memory cap on reassembled payload |
-| `websocket_send_queue_size` | 256 messages | yes | bound writer task backlog |
+| `websocket_send_queue_size` | 32 messages | yes | bound writer task backlog |
 | `websocket_ping_interval` | None | yes | OkHttp parity (off by default) |
-| `websocket_pong_timeout` | 30 s | yes | only effective when ping enabled |
+| `websocket_pong_timeout` | `ping_interval * 2` | yes | only effective when ping enabled |
 | `websocket_subprotocols` | empty | yes | offer list |
 | `websocket_engine` | `NativeEngine` | yes (`engine(Arc::new(...))`) | pluggability |
 | `websocket_deliver_control_frames` | false | yes | rare advanced use case |

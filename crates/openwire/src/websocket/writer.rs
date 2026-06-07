@@ -10,7 +10,7 @@ use openwire_core::websocket::{
     BoxEngineSink, BoxEngineStream, CloseInitiator, EngineFrame, Message, TimeoutKind,
     WebSocketChannel, WebSocketEngineError, WebSocketError,
 };
-use openwire_core::{CallContext, SharedEventListener};
+use openwire_core::{CallContext, SharedEventListener, WireError, WireErrorKind};
 
 use crate::websocket::instrumented::instrument_channel;
 
@@ -54,9 +54,7 @@ async fn run_writer(
                 }
                 if let Err(error) = sink.send(message.into()).await {
                     let mapped = map_engine_error(error);
-                    if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                        listener.websocket_failed(ctx, &mapped);
-                    }
+                    emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
                     let _ = receiver_tx.send(Err(mapped)).await;
                     return;
                 }
@@ -67,9 +65,7 @@ async fn run_writer(
                 }
                 if let Err(error) = sink.send(EngineFrame::Ping(payload)).await {
                     let mapped = map_engine_error(error);
-                    if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                        listener.websocket_failed(ctx, &mapped);
-                    }
+                    emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
                     let _ = receiver_tx.send(Err(mapped)).await;
                     return;
                 }
@@ -80,9 +76,7 @@ async fn run_writer(
                 }
                 if let Err(error) = sink.send(EngineFrame::Pong(payload)).await {
                     let mapped = map_engine_error(error);
-                    if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                        listener.websocket_failed(ctx, &mapped);
-                    }
+                    emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
                     let _ = receiver_tx.send(Err(mapped)).await;
                     return;
                 }
@@ -108,12 +102,13 @@ async fn run_writer(
                     }
                 })
                 .await;
-                let _ = ack.send(());
                 if session.try_mark_closed() {
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                         listener.websocket_closed(ctx, final_code, &final_reason);
                     }
+                    emit_call_end(ctx.as_ref(), &session);
                 }
+                let _ = ack.send(());
                 return;
             }
             WriterCommand::CloseAck { code, reason } => {
@@ -126,10 +121,8 @@ async fn run_writer(
                     continue;
                 }
                 session.mark_local_close_started();
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    let error = WebSocketError::Timeout(TimeoutKind::Ping);
-                    listener.websocket_failed(ctx, &error);
-                }
+                let error = WebSocketError::Timeout(TimeoutKind::Ping);
+                emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &error, &session);
                 let _ = receiver_tx
                     .send(Err(WebSocketError::Timeout(TimeoutKind::Ping)))
                     .await;
@@ -144,6 +137,8 @@ async fn run_writer(
             }
             WriterCommand::Cancel => {
                 let _ = sink.flush().await;
+                let error = WebSocketError::LocalCancelled;
+                emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &error, &session);
                 return;
             }
         }
@@ -199,6 +194,7 @@ async fn run_reader(
                     if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
                         listener.websocket_closed(ctx, code, &reason);
                     }
+                    emit_call_end(ctx.as_ref(), &session);
                 }
                 let _ = out
                     .send(Err(WebSocketError::ClosedByPeer {
@@ -222,26 +218,33 @@ async fn run_reader(
             }
             Err(WebSocketEngineError::Io(error)) => {
                 let mapped = WebSocketError::Io(error);
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_failed(ctx, &mapped);
-                }
+                emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
                 let _ = out.send(Err(mapped)).await;
                 let _ = auto_pong.send(WriterCommand::Cancel).await;
                 return;
             }
             Err(other) => {
                 let mapped = WebSocketError::Engine(other);
-                if let (Some(ctx), Some(listener)) = (ctx.as_ref(), listener.as_ref()) {
-                    listener.websocket_failed(ctx, &mapped);
-                }
+                emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
                 let _ = out.send(Err(mapped)).await;
                 let _ = auto_pong.send(WriterCommand::Cancel).await;
                 return;
             }
         }
     }
-    // Stream ended (EOF). Wake the writer so any pending close handshake
-    // doesn't wait the full close_timeout when the peer never sent Close.
+    if session.local_close_started() {
+        let _ = auto_pong.send(WriterCommand::Cancel).await;
+        return;
+    }
+
+    // EOF before either side starts a Close handshake is an abnormal WebSocket
+    // termination. Surface it as a protocol failure and wake the writer so it
+    // can stop promptly.
+    let mapped = WebSocketError::Engine(WebSocketEngineError::InvalidFrame(
+        "websocket stream ended before close frame".into(),
+    ));
+    emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &mapped, &session);
+    let _ = out.send(Err(mapped)).await;
     let _ = auto_pong.send(WriterCommand::Cancel).await;
 }
 
@@ -249,6 +252,49 @@ fn map_engine_error(error: WebSocketEngineError) -> WebSocketError {
     match error {
         WebSocketEngineError::Io(io) => WebSocketError::Io(io),
         other => WebSocketError::Engine(other),
+    }
+}
+
+pub(crate) fn websocket_error_as_wire_error(error: &WebSocketError) -> WireError {
+    match error {
+        WebSocketError::Io(error) => error.clone(),
+        WebSocketError::Timeout(_) => WireError::timeout(error.to_string()),
+        WebSocketError::LocalCancelled => {
+            WireError::new(WireErrorKind::Canceled, "websocket call cancelled")
+        }
+        WebSocketError::Handshake { .. }
+        | WebSocketError::Engine(_)
+        | WebSocketError::ClosedByPeer { .. } => {
+            WireError::new(WireErrorKind::Protocol, error.to_string())
+        }
+    }
+}
+
+fn emit_terminal_failure(
+    ctx: Option<&CallContext>,
+    listener: Option<&SharedEventListener>,
+    error: &WebSocketError,
+    session: &SessionState,
+) {
+    let Some(ctx) = ctx else {
+        return;
+    };
+    if !session.try_mark_call_terminal() {
+        return;
+    }
+    if let Some(listener) = listener {
+        listener.websocket_failed(ctx, error);
+    }
+    let wire_error = websocket_error_as_wire_error(error);
+    ctx.listener().call_failed(ctx, &wire_error);
+}
+
+fn emit_call_end(ctx: Option<&CallContext>, session: &SessionState) {
+    let Some(ctx) = ctx else {
+        return;
+    };
+    if session.try_mark_call_terminal() {
+        ctx.listener().call_end(ctx);
     }
 }
 
@@ -370,6 +416,7 @@ struct SessionState {
     local_close_started: Arc<AtomicBool>,
     remote_close_started: Arc<AtomicBool>,
     closed_emitted: Arc<AtomicBool>,
+    call_terminal_emitted: Arc<AtomicBool>,
 }
 
 impl SessionState {
@@ -391,6 +438,10 @@ impl SessionState {
 
     fn try_mark_closed(&self) -> bool {
         !self.closed_emitted.swap(true, Ordering::AcqRel)
+    }
+
+    fn try_mark_call_terminal(&self) -> bool {
+        !self.call_terminal_emitted.swap(true, Ordering::AcqRel)
     }
 }
 
