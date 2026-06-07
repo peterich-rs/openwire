@@ -706,15 +706,35 @@ fn response_freshness_lifetime(
     directives: &CacheDirectives,
 ) -> Option<Duration> {
     let now = SystemTime::now();
+    if cache_control_directive_count(headers, "max-age") > 1 {
+        return Some(Duration::ZERO);
+    }
     if let Some(max_age) = directives.max_age {
         return Some(max_age);
     }
 
+    if header_value_count(headers, EXPIRES) > 1 {
+        return Some(Duration::ZERO);
+    }
     if let Some(freshness_lifetime) = explicit_expires_lifetime(headers, now) {
         return Some(freshness_lifetime);
     }
 
     heuristic_freshness_lifetime(headers, now).filter(|lifetime| !lifetime.is_zero())
+}
+
+fn cache_control_directive_count(headers: &HeaderMap, name: &str) -> usize {
+    headers
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(cache_control_directives)
+        .filter(|directive| directive.name == name)
+        .count()
+}
+
+fn header_value_count(headers: &HeaderMap, name: HeaderName) -> usize {
+    headers.get_all(name).iter().count()
 }
 
 fn explicit_expires_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
