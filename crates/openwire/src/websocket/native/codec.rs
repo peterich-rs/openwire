@@ -31,15 +31,6 @@ impl Opcode {
     }
 }
 
-/// RFC 6455 §7.4 close codes accepted on the wire. The 1004/1005/1006 codes
-/// are reserved for in-process signaling and must not appear in close frames.
-pub(crate) fn close_code_is_valid(code: u16) -> bool {
-    matches!(
-        code,
-        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 3000..=4999
-    )
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameHeader {
     pub fin: bool,
@@ -178,15 +169,6 @@ mod tests {
         ] {
             assert_eq!(Opcode::from_byte(op as u8), Some(op));
         }
-    }
-
-    #[test]
-    fn close_code_rejects_reserved_and_unknown() {
-        assert!(close_code_is_valid(1000));
-        assert!(!close_code_is_valid(1004));
-        assert!(!close_code_is_valid(2999));
-        assert!(close_code_is_valid(3000));
-        assert!(!close_code_is_valid(5000));
     }
 }
 

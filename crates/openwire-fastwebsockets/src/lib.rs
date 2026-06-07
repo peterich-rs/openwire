@@ -37,8 +37,9 @@ use fastwebsockets::WebSocketWrite as FastWriteHalf;
 use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use openwire_core::websocket::{
-    BoxEngineSink, BoxEngineStream, EngineFrame, Role, WebSocketChannel, WebSocketEngine,
-    WebSocketEngineConfig, WebSocketEngineError,
+    validate_close_frame, validate_outbound_engine_frame, BoxEngineSink, BoxEngineStream,
+    EngineFrame, Role, WebSocketChannel, WebSocketEngine, WebSocketEngineConfig,
+    WebSocketEngineError,
 };
 use openwire_core::{BoxConnection, BoxFuture, WireError, WireErrorKind};
 use openwire_tokio::TokioIo;
@@ -193,6 +194,7 @@ where
         if me.buffered.is_some() {
             return Err(closed_sink_error("write already buffered"));
         }
+        validate_outbound_engine_frame(&item)?;
         me.buffered = Some(item);
         Ok(())
     }
@@ -318,13 +320,10 @@ fn parse_close_payload(payload: &[u8]) -> Result<(u16, String), WebSocketEngineE
     }
 
     let code = u16::from_be_bytes([payload[0], payload[1]]);
-    if !fastwebsockets::CloseCode::from(code).is_allowed() {
-        return Err(WebSocketEngineError::InvalidCloseCode(code));
-    }
-
     let reason = std::str::from_utf8(&payload[2..])
         .map_err(|_| WebSocketEngineError::InvalidUtf8)?
         .to_string();
+    validate_close_frame(code, &reason)?;
     Ok((code, reason))
 }
 
