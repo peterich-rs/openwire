@@ -210,6 +210,9 @@ follow-ups (pool reuse, interceptor chain integration).
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
+- Forward-proxy HTTP `407` follow-ups are only attempted when the transport
+  response carries a selected proxy route. Direct-origin `407` responses remain
+  caller-visible responses and do not invoke the proxy authenticator.
 - CONNECT proxy `407` challenges are handled during tunnel establishment because
   no end-to-end HTTP response exists yet. That tunnel-local proxy auth loop must
   still receive the logical call counters from `FollowUpPolicyService`; the
