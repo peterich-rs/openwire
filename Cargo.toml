@@ -32,6 +32,7 @@ getrandom = "0.2"
 http = "1.3.1"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
+httpdate = "1.0.3"
 hyper = { version = "1.8.1", features = ["full"] }
 pin-project-lite = "0.2.16"
 rcgen = "0.14.5"
