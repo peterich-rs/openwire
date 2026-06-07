@@ -172,7 +172,8 @@ impl AuthContext {
     /// Parses the applicable authentication challenges from the response.
     ///
     /// Origin contexts read `WWW-Authenticate`; proxy contexts read
-    /// `Proxy-Authenticate`. Invalid or non-UTF-8 challenge fields are skipped.
+    /// `Proxy-Authenticate`. Invalid, non-UTF-8, or non-token challenge fields
+    /// are skipped.
     pub fn challenges(&self) -> Vec<AuthChallenge> {
         let header = match self.kind {
             AuthKind::Origin => WWW_AUTHENTICATE,
@@ -387,18 +388,10 @@ fn is_token_char(ch: char) -> bool {
                 | '+'
                 | '-'
                 | '.'
-                | '/'
-                | ':'
-                | '?'
-                | '@'
-                | '['
-                | ']'
                 | '^'
                 | '_'
                 | '`'
-                | '{'
                 | '|'
-                | '}'
                 | '~'
         )
 }
@@ -426,7 +419,7 @@ mod tests {
     use http::header::{PROXY_AUTHENTICATE, WWW_AUTHENTICATE};
     use http::{HeaderMap, Method, Request, StatusCode, Version};
 
-    use super::{parse_auth_challenge_header, AuthContext, AuthKind};
+    use super::{is_token_char, parse_auth_challenge_header, AuthContext, AuthKind};
     use crate::RequestBody;
 
     #[test]
@@ -500,6 +493,31 @@ mod tests {
         );
         let ctx = test_context(AuthKind::Origin, headers);
         assert!(ctx.challenges().is_empty());
+    }
+
+    #[test]
+    fn token_chars_match_http_tchar() {
+        for ch in
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~".chars()
+        {
+            assert!(is_token_char(ch), "{ch:?} should be accepted");
+        }
+
+        for ch in "()<>@,;:\\\"/[]?={} \t\r\n".chars() {
+            assert!(!is_token_char(ch), "{ch:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_token_chars_in_challenge_scheme_and_param_names() {
+        let challenges = parse_auth_challenge_header(
+            r#"Bad/Scheme realm="ignored", Basic realm="simple", bad/name="ignored""#,
+        );
+
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].scheme(), "Basic");
+        assert_eq!(challenges[0].realm(), Some("simple"));
+        assert_eq!(challenges[0].parameter("bad/name"), None);
     }
 
     fn test_context(kind: AuthKind, response_headers: HeaderMap) -> AuthContext {
