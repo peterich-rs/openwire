@@ -24,12 +24,13 @@ pub use connection::{
 pub use cookie::Jar;
 pub use logging::{HttpLogger, LogLevel, LoggerInterceptor, StderrLogger};
 pub use openwire_core::{
-    AuthContext, AuthKind, Authenticator, BoxFuture, BoxTaskHandle, CallContext, CallId, Connected,
-    Connection, ConnectionId, ConnectionInfo, CookieJar, DnsResolver, EstablishmentStage,
-    EventListener, EventListenerFactory, Exchange, HyperExecutor, Interceptor, Next,
-    NoopEventListener, NoopEventListenerFactory, RedirectContext, RedirectDecision, RedirectPolicy,
-    RequestBody, ResponseBody, RetryContext, RetryPolicy, SharedTimer, TaskHandle, TcpConnector,
-    TlsAlpnPreference, TlsConnector, WireError, WireErrorKind, WireExecutor,
+    AuthChallenge, AuthChallengeParam, AuthContext, AuthKind, Authenticator, BoxFuture,
+    BoxTaskHandle, CallContext, CallId, Connected, Connection, ConnectionId, ConnectionInfo,
+    CookieJar, DnsResolver, EstablishmentStage, EventListener, EventListenerFactory, Exchange,
+    HyperExecutor, Interceptor, Next, NoopEventListener, NoopEventListenerFactory, RedirectContext,
+    RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext, RetryPolicy,
+    SharedTimer, TaskHandle, TcpConnector, TlsAlpnPreference, TlsConnector, WireError,
+    WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

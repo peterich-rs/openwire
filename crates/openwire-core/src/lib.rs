@@ -15,7 +15,7 @@ pub mod websocket;
 use std::future::Future;
 use std::pin::Pin;
 
-pub use auth::{AuthContext, AuthKind, Authenticator};
+pub use auth::{AuthChallenge, AuthChallengeParam, AuthContext, AuthKind, Authenticator};
 pub use body::{RequestBody, ResponseBody};
 pub use context::{next_connection_id, CallContext, CallId, ConnectionId};
 pub use cookie::CookieJar;

@@ -141,7 +141,7 @@ These are the intended customization points:
 | `Interceptor` | application or network request/response interception |
 | `EventListener` / `EventListenerFactory` | call-level and transport-level observability |
 | `CookieJar` | request cookie application and response cookie persistence |
-| `Authenticator` | origin and proxy authentication follow-ups |
+| `Authenticator` | origin and proxy authentication follow-ups, with `AuthContext::challenges()` exposing RFC 9110 / RFC 7235 `WWW-Authenticate` and `Proxy-Authenticate` challenges |
 | `RetryPolicy` | retry decisions |
 | `RedirectPolicy` | redirect decisions |
 | `ProxySelector` | per-attempt ordered proxy candidate resolution |
