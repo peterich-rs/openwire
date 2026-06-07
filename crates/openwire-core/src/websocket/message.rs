@@ -5,6 +5,7 @@ use super::error::WebSocketEngineError;
 
 pub const MAX_CONTROL_FRAME_PAYLOAD_BYTES: usize = 125;
 pub const MAX_CLOSE_REASON_BYTES: usize = 123;
+const CLOSE_NO_STATUS_CODE: u16 = 1005;
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -107,6 +108,11 @@ pub fn validate_outbound_engine_frame(frame: &EngineFrame) -> Result<(), WebSock
     match frame {
         EngineFrame::Ping(payload) => validate_control_payload_len("ping", payload.len()),
         EngineFrame::Pong(payload) => validate_control_payload_len("pong", payload.len()),
+        EngineFrame::Close { code, reason }
+            if *code == CLOSE_NO_STATUS_CODE && reason.is_empty() =>
+        {
+            Ok(())
+        }
         EngineFrame::Close { code, reason } => validate_close_frame(*code, reason),
         EngineFrame::Text(_) | EngineFrame::Binary(_) => Ok(()),
     }
@@ -197,6 +203,31 @@ mod tests {
                 reason: String::new(),
             }),
             Err(WebSocketEngineError::InvalidCloseCode(1006))
+        ));
+    }
+
+    #[test]
+    fn outbound_engine_close_can_represent_no_status_ack() {
+        validate_outbound_engine_frame(&EngineFrame::Close {
+            code: 1005,
+            reason: String::new(),
+        })
+        .expect("1005 is the internal empty-close sentinel for engine acks");
+
+        assert!(matches!(
+            validate_outbound_engine_frame(&EngineFrame::Close {
+                code: 1005,
+                reason: "not allowed without a wire code".into(),
+            }),
+            Err(WebSocketEngineError::InvalidCloseCode(1005))
+        ));
+
+        assert!(matches!(
+            validate_outbound_message(&Message::Close {
+                code: 1005,
+                reason: String::new(),
+            }),
+            Err(WebSocketEngineError::InvalidCloseCode(1005))
         ));
     }
 

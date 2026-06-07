@@ -353,14 +353,19 @@ Implements RFC 6455 §5–§8 with the following surface:
   code must be valid on the wire and the reason must fit the 123-byte reason
   budget so the control-frame payload stays ≤125 bytes. Invalid values return
   an error and are not sent. Incoming close is surfaced to the receiver and
-  wakes the writer cancellation path. After a local close completes, both
-  halves of the channel return `Ok(None)` / `Poll::Ready(Ok(()))`.
+  wakes the writer cancellation path. A received close with no status code is
+  represented internally as `1005`, but the close acknowledgement is encoded
+  as an empty close payload; `1005` is never sent as a wire status code. After
+  a local close completes, both halves of the channel return `Ok(None)` /
+  `Poll::Ready(Ok(()))`.
   Sending `Message::Close` through the generic `send` path uses the same
   validation, so it cannot bypass the close-frame limits.
 - Close codes: validated against the wire-safe RFC 6455 / IANA close-code
   table at the public sender boundary and in inbound engine parsing. Current
   assigned codes `1012`, `1013`, and `1014` are accepted; signal-only reserved
-  codes such as `1005`, `1006`, and `1015` are rejected on the wire.
+  codes such as `1005`, `1006`, and `1015` are rejected on the wire. `1005`
+  may appear only inside the engine/session boundary as the RFC "no status
+  received" sentinel for empty close frames.
 
 Out of scope for native v1:
 
@@ -450,6 +455,7 @@ The writer task owns the engine's `BoxSink<EngineFrame>` and consumes from a
 - `Ping(Bytes)` — heartbeat
 - `Close { code, reason }` — explicit close from user `close()`
 - `CloseAck { code, reason }` — automatic acknowledgement for a remote close
+  (`code == 1005 && reason.is_empty()` means "ack with an empty close payload")
 - `Cancel` — abort without sending close
 
 The writer task processes commands FIFO. `WebSocketSender::send_*` validates
@@ -470,8 +476,10 @@ close. On timeout, it forces socket teardown.
 When the receiver task observes a remote close before local close has started,
 it enqueues `CloseAck` with the peer's code and reason. The writer drops any
 later queued data/control sends, writes that close acknowledgement, flushes,
-and exits without waiting for `close_timeout`. If local close is already in
-progress, the receiver still enqueues `Cancel` to wake the writer's wait loop.
+and exits without waiting for `close_timeout`. If the peer close had no status
+code, the `CloseAck` carries the internal `1005` sentinel and the engine writes
+an empty close payload. If local close is already in progress, the
+receiver still enqueues `Cancel` to wake the writer's wait loop.
 `WebSocketSender::close` validates the close code and reason byte length
 before it marks the sender closed, so a rejected close leaves the sender
 usable and does not enqueue a frame. The generic `send(Message)` path applies

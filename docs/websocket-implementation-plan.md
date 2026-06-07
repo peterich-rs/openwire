@@ -2843,6 +2843,11 @@ The `todo!()` is **not allowed** in the final commit — the engineer fully writ
 | `Close(None)` | `Close { code: 1005, reason: String::new() }` |
 | `Frame(_)` | unreachable in `WebSocketStream` API |
 
+`1005` is the internal "no status received" sentinel for an empty close
+payload. Engines may surface it inbound and writer `CloseAck` may carry it
+back to the engine, but it must be encoded as an empty close payload and never
+as a two-byte wire close code.
+
 Errors from `tokio_tungstenite::Error` map: `Io(e)` → `WebSocketEngineError::Io(WireError::from(e))`, `Protocol(e)` → `InvalidFrame(e.to_string())`, `Utf8` → `InvalidUtf8`, `Capacity(c)` → `PayloadTooLarge { ... }` (best-effort with limits), others → `InvalidFrame(format!(...))`.
 
 - [ ] **Step 3: Run the integration test suite against `TungsteniteEngine`**

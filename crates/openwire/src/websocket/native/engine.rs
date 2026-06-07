@@ -161,6 +161,7 @@ impl Sink<EngineFrame> for NativeSink {
             EngineFrame::Binary(bytes) | EngineFrame::Ping(bytes) | EngineFrame::Pong(bytes) => {
                 bytes
             }
+            EngineFrame::Close { code: 1005, reason } if reason.is_empty() => Bytes::new(),
             EngineFrame::Close { code, reason } => {
                 let mut payload = BytesMut::with_capacity(2 + reason.len());
                 payload.extend_from_slice(&code.to_be_bytes());
@@ -406,6 +407,40 @@ mod tests {
         let key = [header[2], header[3], header[4], header[5]];
         let unmasked = [payload[0] ^ key[0], payload[1] ^ key[1]];
         assert_eq!(&unmasked, b"hi");
+    }
+
+    #[tokio::test]
+    async fn engine_writes_empty_close_for_no_status_ack() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+
+        let engine = NativeEngine::new();
+        let cfg = WebSocketEngineConfig {
+            role: Role::Client,
+            subprotocol: None,
+            extensions: vec![],
+            max_frame_size: 1024,
+            max_message_size: 1024,
+        };
+        let mut channel = engine
+            .upgrade(box_connection(client_io), cfg)
+            .await
+            .expect("upgrade");
+        channel
+            .send
+            .send(EngineFrame::Close {
+                code: 1005,
+                reason: String::new(),
+            })
+            .await
+            .expect("send empty close ack");
+        channel.send.flush().await.expect("flush");
+
+        let mut frame = [0u8; 6];
+        tokio::io::AsyncReadExt::read_exact(&mut server_io, &mut frame)
+            .await
+            .expect("server read close frame");
+        assert_eq!(frame[0], 0x88);
+        assert_eq!(frame[1], 0x80, "masked close frame with zero payload");
     }
 
     #[tokio::test]
