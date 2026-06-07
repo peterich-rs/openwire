@@ -158,10 +158,11 @@ coordinator; cache misses continue through the canonical request flow. The
 crate currently implements explicit and conservative heuristic freshness rules
 for private in-process caching: request `Cache-Control` directives such as
 `no-cache`, `no-store`, `max-age=0`, `max-stale`, `min-fresh`, and
-`only-if-cached`; response `max-age`, `must-revalidate`, `no-cache`,
+`only-if-cached`, plus HTTP/1.0-compatible request `Pragma: no-cache` when
+`Cache-Control` is absent; response `max-age`, `must-revalidate`, `no-cache`,
 `no-store`, `Expires`, `Date` apparent age, Last-Modified heuristic freshness,
-`Age`, and `Vary` matching, including multiple stored variants per URI. It
-also revalidates stale stored responses that carry `ETag` or `Last-Modified`
+`Age`, and `Vary` matching, including multiple stored variants per URI. It also
+revalidates stale stored responses that carry `ETag` or `Last-Modified`
 validators, refreshing stored metadata on `304 Not Modified` before returning
 the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
 stored responses when the cached response does not require validation; stale
