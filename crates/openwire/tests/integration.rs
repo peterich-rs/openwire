@@ -11,8 +11,8 @@ use futures_util::stream;
 #[cfg(feature = "websocket")]
 use futures_util::StreamExt;
 use http::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HOST, TE,
-    TRANSFER_ENCODING, UPGRADE, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HOST,
+    PROXY_AUTHENTICATE, TE, TRANSFER_ENCODING, UPGRADE, USER_AGENT,
 };
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
@@ -32,7 +32,7 @@ use openwire_core::WireExecutor;
 use openwire_test::spawn_wss_echo_with_alpn;
 use openwire_test::{
     collect_request_body, ok_text, spawn_http1, spawn_https_http1, spawn_https_http2_with_hosts,
-    RecordingEventListenerFactory, StaticDnsResolver,
+    text_response, RecordingEventListenerFactory, StaticDnsResolver,
 };
 use openwire_tokio::TokioTcpConnector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2445,6 +2445,36 @@ async fn declining_proxy_authenticator_returns_407_response() {
     let response = client.execute(request).await.expect("response");
     assert_eq!(authenticator.calls(), 1);
     assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+}
+
+#[tokio::test]
+async fn direct_407_does_not_invoke_proxy_authenticator() {
+    let server = spawn_http1(|_request| async move {
+        let mut response = text_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "direct 407");
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            "Basic realm=\"origin\"".parse().expect("challenge"),
+        );
+        response
+    })
+    .await;
+    let authenticator = DecliningAuthenticator::default();
+    let client = Client::builder()
+        .proxy_authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/direct-407")))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert_eq!(
+        response.into_body().text().await.expect("body"),
+        "direct 407"
+    );
+    assert_eq!(authenticator.calls(), 0);
 }
 
 #[tokio::test]
