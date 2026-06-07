@@ -97,6 +97,12 @@ path, with `Content-Encoding` and compressed `Content-Length` removed before the
 response reaches application interceptors or callers. Network interceptors still
 observe the normalized request and wire response for each network attempt.
 
+The transport protocol-binding step applies protocol-specific final shaping.
+Direct HTTP/1.1 requests are converted to origin-form before they enter hyper's
+HTTP/1.1 client binding. HTTP/2 requests keep their absolute URI but strip
+connection-specific fields, including fields named by `Connection`; `TE` is
+preserved only for the RFC 9113 `trailers` value.
+
 ## 4. Transport Layering
 
 ```mermaid
@@ -208,6 +214,9 @@ follow-ups (pool reuse, interceptor chain integration).
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
+- Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
+  and HTTP URI authorities that include userinfo before bridge normalization can
+  derive `Host` or transport can route the request.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
 - Forward-proxy HTTP `407` follow-ups are only attempted when the transport

@@ -12,7 +12,7 @@ use futures_util::stream;
 use futures_util::StreamExt;
 use http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HOST,
-    PROXY_AUTHENTICATE, TRANSFER_ENCODING, USER_AGENT,
+    PROXY_AUTHENTICATE, TE, TRANSFER_ENCODING, UPGRADE, USER_AGENT,
 };
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
@@ -58,6 +58,38 @@ async fn basic_get_returns_body() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "hello openwire");
+}
+
+#[tokio::test]
+async fn request_uri_userinfo_is_rejected_before_network() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ok_text("should not be reached")
+            }
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://user:pass@127.0.0.1:{}/userinfo",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("userinfo must be rejected before network");
+
+    assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+    assert!(
+        error.message().contains("must not include userinfo"),
+        "error = {error}",
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -3001,6 +3033,98 @@ async fn shared_client_coalesces_https_http2_connections_across_verified_authori
             .filter(|event| event.starts_with("connect_end "))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn http2_send_path_strips_connection_specific_request_headers() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct HeaderSnapshot {
+        has_connection: bool,
+        has_keep_alive: bool,
+        has_proxy_connection: bool,
+        has_transfer_encoding: bool,
+        has_upgrade: bool,
+        has_connection_nominated_header: bool,
+        te_values: Vec<String>,
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let server_observed = observed.clone();
+    let server = spawn_https_http2_with_hosts(&["h2.test"], move |request| {
+        let observed = server_observed.clone();
+        async move {
+            let headers = request.headers();
+            let snapshot = HeaderSnapshot {
+                has_connection: headers.contains_key(CONNECTION),
+                has_keep_alive: headers.contains_key("keep-alive"),
+                has_proxy_connection: headers.contains_key("proxy-connection"),
+                has_transfer_encoding: headers.contains_key(TRANSFER_ENCODING),
+                has_upgrade: headers.contains_key(UPGRADE),
+                has_connection_nominated_header: headers.contains_key("x-hop"),
+                te_values: headers
+                    .get_all(TE)
+                    .iter()
+                    .map(|value| value.to_str().expect("te header").to_owned())
+                    .collect(),
+            };
+            *observed.lock().expect("observed headers") = Some(snapshot);
+            ok_text("h2 headers")
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([(
+            "h2.test".to_owned(),
+            server.addr(),
+        )]))
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .uri(format!(
+            "https://h2.test:{}/connection-specific-headers",
+            server.addr().port()
+        ))
+        .header(CONNECTION, "keep-alive, x-hop, upgrade")
+        .header("keep-alive", "timeout=5")
+        .header("proxy-connection", "keep-alive")
+        .header(TRANSFER_ENCODING, "chunked")
+        .header(UPGRADE, "websocket")
+        .header("x-hop", "secret")
+        .header(TE, "gzip")
+        .header(TE, "trailers")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.version(), Version::HTTP_2);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "h2 headers");
+
+    let snapshot = observed
+        .lock()
+        .expect("observed headers")
+        .take()
+        .expect("observed headers");
+    assert_eq!(
+        snapshot,
+        HeaderSnapshot {
+            has_connection: false,
+            has_keep_alive: false,
+            has_proxy_connection: false,
+            has_transfer_encoding: false,
+            has_upgrade: false,
+            has_connection_nominated_header: false,
+            te_values: vec!["trailers".to_owned()],
+        }
     );
 }
 

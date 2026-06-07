@@ -1,5 +1,5 @@
-use http::header::CONNECTION;
-use http::{HeaderMap, HeaderValue, Request, Response, Version};
+use http::header::{CONNECTION, TE, TRANSFER_ENCODING, UPGRADE};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 #[cfg(feature = "websocket")]
@@ -149,6 +149,11 @@ pub(super) fn prepare_bound_request(
     protocol: ConnectionProtocol,
     route_kind: &RouteKind,
 ) -> Result<Request<RequestBody>, WireError> {
+    if protocol == ConnectionProtocol::Http2 {
+        strip_http2_connection_specific_headers(request.headers_mut());
+        return Ok(request);
+    }
+
     if protocol != ConnectionProtocol::Http1
         || matches!(route_kind, RouteKind::HttpForwardProxy { .. })
     {
@@ -167,6 +172,73 @@ pub(super) fn prepare_bound_request(
         )
     })?;
     Ok(request)
+}
+
+fn strip_http2_connection_specific_headers(headers: &mut HeaderMap) {
+    let connection_nominated = connection_nominated_headers(headers);
+    let te_values = headers.get_all(TE).iter().cloned().collect::<Vec<_>>();
+
+    headers.remove(TE);
+    headers.remove(CONNECTION);
+    headers.remove(keep_alive_header());
+    headers.remove(proxy_connection_header());
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(UPGRADE);
+
+    let te_was_nominated = connection_nominated.contains(&TE);
+    for name in connection_nominated {
+        headers.remove(name);
+    }
+
+    if !te_was_nominated {
+        append_http2_te_trailers(headers, te_values);
+    }
+}
+
+fn connection_nominated_headers(headers: &HeaderMap) -> Vec<HeaderName> {
+    let mut out = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let Ok(name) = HeaderName::from_bytes(token.as_bytes()) else {
+                continue;
+            };
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn append_http2_te_trailers(headers: &mut HeaderMap, te_values: Vec<HeaderValue>) {
+    let has_trailers = te_values.iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|token| token.eq_ignore_ascii_case("trailers"))
+        })
+    });
+
+    if has_trailers {
+        headers.insert(TE, HeaderValue::from_static("trailers"));
+    }
+}
+
+fn keep_alive_header() -> HeaderName {
+    HeaderName::from_static("keep-alive")
+}
+
+fn proxy_connection_header() -> HeaderName {
+    HeaderName::from_static("proxy-connection")
 }
 
 pub(super) fn http1_exchange_allows_reuse(
@@ -287,4 +359,85 @@ pub(super) fn connection_info_from_connected(connected: &Connected) -> Connectio
 
 pub(super) fn coalescing_info_from_connected(connected: &Connected) -> CoalescingInfo {
     connected.coalescing_info().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use http::header::{CONNECTION, TE, TRANSFER_ENCODING, UPGRADE};
+    use http::Request;
+
+    use super::prepare_bound_request;
+    use crate::connection::{ConnectionProtocol, RouteKind};
+    use openwire_core::RequestBody;
+
+    #[test]
+    fn http2_bound_request_strips_connection_specific_headers() {
+        let request = Request::builder()
+            .uri("https://example.test/resource")
+            .header(CONNECTION, "keep-alive, x-hop, upgrade")
+            .header("keep-alive", "timeout=5")
+            .header("proxy-connection", "keep-alive")
+            .header(TRANSFER_ENCODING, "chunked")
+            .header(UPGRADE, "websocket")
+            .header("x-hop", "secret")
+            .header(TE, "gzip")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let prepared = prepare_bound_request(request, ConnectionProtocol::Http2, &direct_route())
+            .expect("prepared request");
+        let headers = prepared.headers();
+
+        assert!(headers.get(CONNECTION).is_none());
+        assert!(headers.get("keep-alive").is_none());
+        assert!(headers.get("proxy-connection").is_none());
+        assert!(headers.get(TRANSFER_ENCODING).is_none());
+        assert!(headers.get(UPGRADE).is_none());
+        assert!(headers.get("x-hop").is_none());
+        assert!(headers.get(TE).is_none());
+    }
+
+    #[test]
+    fn http2_bound_request_preserves_te_trailers_only() {
+        let request = Request::builder()
+            .uri("https://example.test/resource")
+            .header(TE, "gzip, trailers")
+            .header(TE, "trailers")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let prepared = prepare_bound_request(request, ConnectionProtocol::Http2, &direct_route())
+            .expect("prepared request");
+        let te_values = prepared
+            .headers()
+            .get_all(TE)
+            .iter()
+            .map(|value| value.to_str().expect("te header"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(te_values, vec!["trailers"]);
+    }
+
+    #[test]
+    fn http2_bound_request_strips_connection_nominated_te() {
+        let request = Request::builder()
+            .uri("https://example.test/resource")
+            .header(CONNECTION, "te")
+            .header(TE, "trailers")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        let prepared = prepare_bound_request(request, ConnectionProtocol::Http2, &direct_route())
+            .expect("prepared request");
+
+        assert!(prepared.headers().get(TE).is_none());
+    }
+
+    fn direct_route() -> RouteKind {
+        RouteKind::Direct {
+            target: SocketAddr::from(([127, 0, 0, 1], 443)),
+        }
+    }
 }
