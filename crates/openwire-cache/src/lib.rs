@@ -47,6 +47,8 @@ where
     ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
         let store = self.store.clone();
         Box::pin(async move {
+            let invalidation_key = request_method_invalidates_cache(exchange.request().method())
+                .then(|| cache_key(exchange.request().uri()));
             let request_policy = request_cache_policy(exchange.request());
             let cache_key = request_policy
                 .is_cacheable
@@ -80,6 +82,12 @@ where
             }
 
             let response = next.run(exchange).await?;
+            if let Some(invalidation_key) = invalidation_key.as_ref() {
+                if response_status_invalidates_cache(response.status()) {
+                    store.remove(invalidation_key).await;
+                }
+            }
+
             let Some(cache_key) = cache_key else {
                 return Ok(response);
             };
@@ -644,6 +652,17 @@ fn response_is_storable(
         && !directives.no_store
         && (!directives.no_cache || validators.has_any())
         && (!freshness_lifetime.is_zero() || validators.has_any())
+}
+
+fn request_method_invalidates_cache(method: &Method) -> bool {
+    !matches!(
+        method,
+        &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
+    )
+}
+
+fn response_status_invalidates_cache(status: StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
 }
 
 fn response_freshness_lifetime(

@@ -166,7 +166,9 @@ revalidates stale stored responses that carry `ETag` or `Last-Modified`
 validators, refreshing stored metadata on `304 Not Modified` before returning
 the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
 stored responses when the cached response does not require validation; stale
-if-error and background stale revalidation are not implemented.
+if-error and background stale revalidation are not implemented. Non-error `2xx`
+/ `3xx` unsafe-method responses invalidate stored responses for the request
+target URI.
 
 Default runtime stack from `ClientBuilder::default()`:
 
