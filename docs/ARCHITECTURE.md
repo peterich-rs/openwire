@@ -48,7 +48,7 @@ flowchart LR
 | `crates/openwire-core` | shared body types, errors, call metadata, event traits, executor/timer traits, transport traits, policy traits |
 | `crates/openwire-tokio` | Tokio executor, timer, I/O adapter, system DNS, TCP connector |
 | `crates/openwire-rustls` | default Rustls-backed TLS connector |
-| `crates/openwire-cache` | application-layer cache interceptor and store |
+| `crates/openwire-cache` | application-layer cache interceptor and store, with conservative RFC 9111 freshness and reuse handling |
 | `crates/openwire-test` | local test support |
 
 ## 3. Canonical Request Flow
@@ -151,6 +151,18 @@ These are the intended customization points:
 | `RoutePlanner` | direct and proxy route construction |
 | `WireExecutor` | background task spawning |
 | `hyper::rt::Timer` | timer integration |
+
+`openwire-cache` is intentionally an application interceptor rather than a
+transport feature. Fresh cache hits short-circuit before the follow-up
+coordinator; cache misses continue through the canonical request flow. The
+crate currently implements explicit freshness and reuse rules for private
+in-process caching: request `Cache-Control` directives such as `no-cache`,
+`no-store`, `max-age=0`, `min-fresh`, and `only-if-cached`; response
+`max-age`, `no-cache`, `no-store`, `Expires`, `Age`, and `Vary` matching,
+including multiple stored variants per URI. It also revalidates stale stored
+responses that carry `ETag` or `Last-Modified` validators, refreshing stored
+metadata on `304 Not Modified` before returning the cached body as `200 OK`.
+It does not yet implement heuristic freshness or stale serving.
 
 Default runtime stack from `ClientBuilder::default()`:
 

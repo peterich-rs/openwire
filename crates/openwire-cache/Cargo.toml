@@ -11,6 +11,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 http.workspace = true
+httpdate.workspace = true
 openwire = { path = "../openwire" }
 tokio.workspace = true
 
