@@ -357,8 +357,10 @@ Implements RFC 6455 §5–§8 with the following surface:
   halves of the channel return `Ok(None)` / `Poll::Ready(Ok(()))`.
   Sending `Message::Close` through the generic `send` path uses the same
   validation, so it cannot bypass the close-frame limits.
-- Close codes: validated against the reserved-range table in RFC 6455 §7.4 at
-  the public sender boundary and in inbound engine parsing.
+- Close codes: validated against the wire-safe RFC 6455 / IANA close-code
+  table at the public sender boundary and in inbound engine parsing. Current
+  assigned codes `1012`, `1013`, and `1014` are accepted; signal-only reserved
+  codes such as `1005`, `1006`, and `1015` are rejected on the wire.
 
 Out of scope for native v1:
 

@@ -235,6 +235,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_accepts_iana_registered_wire_codes() {
+        for code in [1012u16, 1013, 1014] {
+            let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
+            let sender = WebSocketSender::new(tx);
+
+            let close = tokio::spawn({
+                let sender = sender.clone();
+                async move { sender.close(code, "").await }
+            });
+
+            match rx.recv().await.expect("close command") {
+                WriterCommand::Close {
+                    code: actual,
+                    reason,
+                    ack,
+                } => {
+                    assert_eq!(actual, code);
+                    assert!(reason.is_empty());
+                    let _ = ack.send(());
+                }
+                _ => panic!("expected close command"),
+            }
+
+            close.await.expect("close joined").expect("close succeeds");
+            assert!(sender.is_closed());
+        }
+    }
+
+    #[tokio::test]
     async fn send_rejects_invalid_control_messages_without_enqueueing() {
         let invalid_messages = [
             Message::Close {

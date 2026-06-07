@@ -278,4 +278,26 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, WebSocketEngineError::InvalidCloseCode(_)));
     }
+
+    #[test]
+    fn accepts_iana_registered_close_codes() {
+        for code in [1012u16, 1013, 1014] {
+            let mut session = ReassemblyState::new(1024);
+            let result = session
+                .feed(frame(true, Opcode::Close, &code.to_be_bytes()))
+                .unwrap()
+                .unwrap();
+
+            match result {
+                EngineFrame::Close {
+                    code: actual,
+                    reason,
+                } => {
+                    assert_eq!(actual, code);
+                    assert!(reason.is_empty());
+                }
+                other => panic!("expected close, got {other:?}"),
+            }
+        }
+    }
 }
