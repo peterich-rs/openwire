@@ -167,7 +167,8 @@ for private in-process caching: request `Cache-Control` directives such as
 `only-if-cached`, plus HTTP/1.0-compatible request `Pragma: no-cache` when
 `Cache-Control` is absent; response `max-age`, `must-revalidate`, `no-cache`,
 `no-store`, `Expires`, `Date` apparent age, Last-Modified heuristic freshness,
-`Age`, and `Vary` matching, including multiple stored variants per URI. It also
+`Age`, invalid duplicate freshness fields, and `Vary` matching, including
+multiple stored variants per URI. It also
 revalidates stale stored responses that carry `ETag` or `Last-Modified`
 validators, refreshing stored metadata on `304 Not Modified` before returning
 the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale

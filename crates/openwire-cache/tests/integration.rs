@@ -921,6 +921,148 @@ async fn cache_control_max_age_overrides_expired_expires() {
 }
 
 #[tokio::test]
+async fn duplicate_response_max_age_directives_are_stale() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response =
+                    text_response(StatusCode::OK, format!("duplicate max-age {hit}"));
+                response.headers_mut().insert(
+                    CACHE_CONTROL,
+                    "max-age=0, max-age=60".parse().expect("header"),
+                );
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/duplicate-max-age")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "duplicate max-age 1"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/duplicate-max-age")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "duplicate max-age 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn duplicate_response_max_age_across_header_fields_is_stale() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response =
+                    text_response(StatusCode::OK, format!("duplicate max-age field {hit}"));
+                response
+                    .headers_mut()
+                    .append(CACHE_CONTROL, "max-age=0".parse().expect("header"));
+                response
+                    .headers_mut()
+                    .append(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/duplicate-max-age-fields")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "duplicate max-age field 1"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/duplicate-max-age-fields")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "duplicate max-age field 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn duplicate_expires_headers_are_stale_when_max_age_is_absent() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response =
+                    text_response(StatusCode::OK, format!("duplicate expires {hit}"));
+                response.headers_mut().append(
+                    EXPIRES,
+                    httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60))
+                        .parse()
+                        .expect("expires"),
+                );
+                response.headers_mut().append(
+                    EXPIRES,
+                    httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120))
+                        .parse()
+                        .expect("expires"),
+                );
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(server.http_url("/duplicate-expires")))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "duplicate expires 1"
+    );
+    let second = client
+        .execute(empty_request(server.http_url("/duplicate-expires")))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "duplicate expires 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn response_age_reduces_max_age_before_storage() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = spawn_http1({
