@@ -227,8 +227,9 @@ or conservative heuristic freshness metadata and honors the core RFC 9111
 controls needed to avoid unsafe reuse:
 
 - request `Cache-Control: no-cache`, `no-store`, `max-age=0`,
-  `min-fresh`, and `only-if-cached`
-- response `Cache-Control: max-age`, `no-cache`, and `no-store`
+  `max-stale`, `min-fresh`, and `only-if-cached`
+- response `Cache-Control: max-age`, `must-revalidate`, `no-cache`, and
+  `no-store`
 - `Expires` freshness when `max-age` is absent
 - `Age` reducing remaining `max-age` freshness
 - `Date` apparent age and Last-Modified heuristic freshness when explicit
@@ -238,11 +239,13 @@ controls needed to avoid unsafe reuse:
 - stale stored responses with `ETag` or `Last-Modified` validators are
   revalidated with conditional GET requests, and `304 Not Modified` responses
   refresh stored metadata before returning the cached body as `200 OK`
+- stale stored responses are served only when the request explicitly permits
+  them with `max-stale` and the cached response does not require validation
 - cached hits generate a current `Age` header
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
 responses, skips responses with `Set-Cookie`, skips authenticated requests, and
-does not yet implement stale serving.
+does not yet implement stale-if-error or background stale revalidation.
 
 ## Default Transport Settings
 

@@ -157,13 +157,15 @@ transport feature. Fresh cache hits short-circuit before the follow-up
 coordinator; cache misses continue through the canonical request flow. The
 crate currently implements explicit and conservative heuristic freshness rules
 for private in-process caching: request `Cache-Control` directives such as
-`no-cache`, `no-store`, `max-age=0`, `min-fresh`, and `only-if-cached`;
-response `max-age`, `no-cache`, `no-store`, `Expires`, `Date` apparent age,
-Last-Modified heuristic freshness, `Age`, and `Vary` matching, including
-multiple stored variants per URI. It also revalidates stale stored responses
-that carry `ETag` or `Last-Modified` validators, refreshing stored metadata on
-`304 Not Modified` before returning the cached body as `200 OK`. It does not
-yet implement stale serving.
+`no-cache`, `no-store`, `max-age=0`, `max-stale`, `min-fresh`, and
+`only-if-cached`; response `max-age`, `must-revalidate`, `no-cache`,
+`no-store`, `Expires`, `Date` apparent age, Last-Modified heuristic freshness,
+`Age`, and `Vary` matching, including multiple stored variants per URI. It
+also revalidates stale stored responses that carry `ETag` or `Last-Modified`
+validators, refreshing stored metadata on `304 Not Modified` before returning
+the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
+stored responses when the cached response does not require validation; stale
+if-error and background stale revalidation are not implemented.
 
 Default runtime stack from `ClientBuilder::default()`:
 
