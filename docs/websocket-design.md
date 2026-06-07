@@ -340,10 +340,13 @@ Implements RFC 6455 §5–§8 with the following surface:
 - Client receives: any masked frame from the server is a protocol violation.
 - Length encoding: 7-bit, 7+16-bit, 7+64-bit per RFC 6455 §5.2. Incoming
   frames that use a longer length form than necessary, or set the high bit in
-  the 64-bit form, are protocol violations.
+  the 64-bit form, are protocol violations. EOF with a partially buffered
+  frame is also treated as a protocol violation rather than a clean end of
+  stream.
 - Fragmentation: control frames must not be fragmented; data frames
   reassemble across continuation frames; reassembled message is rejected if
-  it exceeds `max_message_size`.
+  it exceeds `max_message_size`. EOF before the final continuation frame is a
+  protocol violation.
 - UTF-8: `Text` frames are validated per RFC 6455 §8.1 using `std::str::from_utf8`
   on the reassembled payload (we do not stream-validate fragments).
 - Close: outgoing close is validated before it enters the writer queue. The

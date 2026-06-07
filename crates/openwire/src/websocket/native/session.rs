@@ -55,6 +55,16 @@ impl ReassemblyState {
         }
     }
 
+    pub(crate) fn end_of_stream(&self) -> Result<(), WebSocketEngineError> {
+        if self.in_progress.is_some() {
+            Err(WebSocketEngineError::InvalidFrame(
+                "incomplete fragmented message".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn append_continuation(
         &mut self,
         frame: DecodedFrame,
@@ -239,6 +249,24 @@ mod tests {
         session.feed(frame(false, Opcode::Text, b"He")).unwrap();
         let err = session.feed(frame(true, Opcode::Binary, b"!")).unwrap_err();
         assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn rejects_end_of_stream_during_fragmented_message() {
+        let mut session = ReassemblyState::new(1024);
+        assert!(session
+            .feed(frame(false, Opcode::Text, b"He"))
+            .unwrap()
+            .is_none());
+
+        let err = session.end_of_stream().unwrap_err();
+        assert!(matches!(err, WebSocketEngineError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn accepts_end_of_stream_without_pending_fragment() {
+        let session = ReassemblyState::new(1024);
+        session.end_of_stream().unwrap();
     }
 
     #[test]
