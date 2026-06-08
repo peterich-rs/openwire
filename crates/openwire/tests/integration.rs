@@ -3725,13 +3725,44 @@ async fn success_events_follow_stable_order() {
             "dns_start",
             "dns_end",
             "connect_end",
-            "request_body_end 0",
             "connection_acquired ",
+            "request_headers_start",
+            "request_headers_end",
+            "request_body_end 0",
             "response_headers_start",
             "response_headers_end 200 OK",
             "response_body_end 7",
             "connection_released ",
             "call_end",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn request_send_events_surround_transport_handoff() {
+    let server = spawn_http1(|_request| async move { ok_text("sent") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/request-send-events")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "connection_acquired ",
+            "request_headers_start",
+            "request_headers_end",
+            "request_body_end 0",
+            "response_headers_start",
+            "response_headers_end 200 OK",
         ],
     );
 }
@@ -4102,6 +4133,54 @@ async fn streaming_request_bodies_are_not_retried_on_connection_failure() {
     let error = client.execute(request).await.expect_err("should fail");
     assert_eq!(error.kind(), WireErrorKind::Connect);
     assert_eq!(connector.attempts(), 1);
+}
+
+#[tokio::test]
+async fn post_send_failure_marks_request_committed_for_retry_policy() {
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let server = spawn_raw_http1_close_after_request_head(accepted_connections.clone()).await;
+    let events = RecordingEventListenerFactory::default();
+    let policy = RetryIfUncommittedPolicy::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .retry_policy(policy.clone())
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/drop-after-send",
+            server.addr().port()
+        ))
+        .body(RequestBody::from_static(b"committed"))
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("server closes before response headers");
+
+    assert!(error.request_committed(), "error = {error:?}");
+    assert_eq!(policy.observed_request_committed(), vec![true]);
+    assert_eq!(accepted_connections.load(Ordering::Relaxed), 1);
+
+    let events = events.events();
+    assert_event_subsequence(
+        &events,
+        &[
+            "connection_acquired ",
+            "request_headers_start",
+            "request_headers_end",
+            "connection_released ",
+            "call_failed ",
+        ],
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("retry ")),
+        "events = {events:?}",
+    );
 }
 
 #[tokio::test]
@@ -5240,6 +5319,31 @@ impl RetryPolicy for NeverRetryPolicy {
 }
 
 #[derive(Clone, Default)]
+struct RetryIfUncommittedPolicy {
+    request_committed: Arc<Mutex<Vec<bool>>>,
+}
+
+impl RetryIfUncommittedPolicy {
+    fn observed_request_committed(&self) -> Vec<bool> {
+        self.request_committed
+            .lock()
+            .expect("request committed observations")
+            .clone()
+    }
+}
+
+impl RetryPolicy for RetryIfUncommittedPolicy {
+    fn should_retry(&self, ctx: &RetryContext<'_>) -> Option<&'static str> {
+        let request_committed = ctx.error().request_committed();
+        self.request_committed
+            .lock()
+            .expect("request committed observations")
+            .push(request_committed);
+        (!request_committed && ctx.attempt() == 0).then_some("uncommitted")
+    }
+}
+
+#[derive(Clone, Default)]
 struct StopRedirectPolicy {
     calls: Arc<AtomicUsize>,
 }
@@ -6001,6 +6105,57 @@ async fn spawn_raw_http1_headers_then_stall_body(delay: Duration) -> RawHttpServ
                         .await;
                     let _ = stream.flush().await;
                     tokio::time::sleep(delay).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_raw_http1_close_after_request_head(
+    accepted_connections: Arc<AtomicUsize>,
+) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else {
+                        break;
+                    };
+                    accepted_connections.fetch_add(1, Ordering::Relaxed);
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 256];
+                    let deadline = tokio::time::sleep(Duration::from_millis(500));
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            _ = &mut deadline => break,
+                            read = stream.read(&mut buffer) => {
+                                let Ok(bytes_read) = read else {
+                                    break;
+                                };
+                                if bytes_read == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..bytes_read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let _ = stream.shutdown().await;
                 }
             }
