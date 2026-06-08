@@ -26,6 +26,8 @@ blocks, and stable observability hooks.
   replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
   bridge normalization or network I/O
+- synthesized `Host` headers follow scheme-based URI normalization by omitting
+  default `:80` / `:443` ports while preserving caller-supplied `Host` values
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
   through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
