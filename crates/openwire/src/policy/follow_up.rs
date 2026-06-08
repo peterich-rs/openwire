@@ -183,8 +183,6 @@ impl Service<Exchange> for FollowUpPolicyService {
                             RedirectDecision::Error(error) => return Err(error),
                         }
 
-                        ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
-
                         let next_attempt = attempt + 1;
                         policy_trace.retry_count = retries;
                         policy_trace.redirect_count = redirects + 1;
@@ -199,12 +197,17 @@ impl Service<Exchange> for FollowUpPolicyService {
                             "following redirect",
                         );
 
-                        request = snapshot.into_redirect_request(
+                        let Some(next_request) = snapshot.into_redirect_request(
                             response.status(),
-                            next_uri,
+                            next_uri.clone(),
                             policy_trace,
                             selected_proxy,
-                        )?;
+                        )?
+                        else {
+                            return Ok(response);
+                        };
+                        ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
+                        request = next_request;
                         redirects += 1;
                         attempt = next_attempt;
                     }
@@ -427,7 +430,7 @@ impl RequestSnapshot {
         next_uri: Uri,
         policy_trace: PolicyTraceContext,
         selected_proxy: Option<SelectedProxy>,
-    ) -> Result<Request<RequestBody>, WireError> {
+    ) -> Result<Option<Request<RequestBody>>, WireError> {
         let same_origin = same_origin(&self.uri, &next_uri)?;
         let should_switch_to_get = matches!(
             status,
@@ -441,9 +444,10 @@ impl RequestSnapshot {
         );
 
         let body = if preserve_body {
-            self.body.ok_or_else(|| {
-                WireError::redirect("cannot follow redirect for a non-replayable request body")
-            })?
+            let Some(body) = self.body else {
+                return Ok(None);
+            };
+            body
         } else if should_switch_to_get {
             RequestBody::absent()
         } else {
@@ -478,7 +482,7 @@ impl RequestSnapshot {
         *request.extensions_mut() = self.extensions;
         reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
         request.extensions_mut().insert(policy_trace);
-        Ok(request)
+        Ok(Some(request))
     }
 }
 
@@ -527,7 +531,8 @@ fn validate_request_uri(uri: &Uri) -> Result<(), WireError> {
 fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::MOVED_PERMANENTLY
+        StatusCode::MULTIPLE_CHOICES
+            | StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::SEE_OTHER
             | StatusCode::TEMPORARY_REDIRECT
@@ -659,7 +664,8 @@ mod tests {
                 PolicyTraceContext::default(),
                 None,
             )
-            .expect("redirect request");
+            .expect("redirect request")
+            .expect("followable redirect");
 
         assert_eq!(
             request
@@ -681,7 +687,8 @@ mod tests {
                 PolicyTraceContext::default(),
                 None,
             )
-            .expect("redirect request");
+            .expect("redirect request")
+            .expect("followable redirect");
 
         assert!(request.headers().get(COOKIE).is_none());
     }
@@ -699,7 +706,8 @@ mod tests {
                 PolicyTraceContext::default(),
                 None,
             )
-            .expect("redirect request");
+            .expect("redirect request")
+            .expect("followable redirect");
 
         assert_eq!(
             request
@@ -708,6 +716,29 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Basic cHJveHk6c2VjcmV0")
         );
+    }
+
+    #[test]
+    fn preserve_body_redirect_stops_for_non_replayable_body() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://source.test/start")
+            .body(RequestBody::from_stream(futures_util::stream::empty::<
+                Result<bytes::Bytes, WireError>,
+            >()))
+            .expect("request");
+        let snapshot = RequestSnapshot::capture(&request);
+
+        let next = snapshot
+            .into_redirect_request(
+                StatusCode::TEMPORARY_REDIRECT,
+                "http://source.test/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                None,
+            )
+            .expect("redirect request");
+
+        assert!(next.is_none());
     }
 
     struct ReadinessTrackingService {
