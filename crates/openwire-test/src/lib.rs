@@ -164,6 +164,14 @@ impl EventListener for RecordingEventListener {
         self.push(format!("connect_end {} {}", connection_id.as_u64(), addr));
     }
 
+    fn request_headers_start(&self, _ctx: &CallContext) {
+        self.push("request_headers_start");
+    }
+
+    fn request_headers_end(&self, _ctx: &CallContext) {
+        self.push("request_headers_end");
+    }
+
     fn request_body_end(&self, _ctx: &CallContext, bytes_sent: u64) {
         self.push(format!("request_body_end {bytes_sent}"));
     }
