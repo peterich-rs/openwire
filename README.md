@@ -23,8 +23,12 @@ blocks, and stable observability hooks.
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
   with structured HTTP authentication challenge parsing, plus immediate
   response-status retries for replayable `408` and `503 Retry-After: 0`
+- HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
+  replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
   bridge normalization or network I/O
+- synthesized `Host` headers follow scheme-based URI normalization by omitting
+  default `:80` / `:443` ports while preserving caller-supplied `Host` values
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
   through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,

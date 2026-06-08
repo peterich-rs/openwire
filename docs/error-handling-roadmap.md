@@ -52,6 +52,17 @@ Implemented on 2026-03-27:
 - `cargo test --workspace` is green on the implementation that matches this
   document
 
+Implemented on 2026-06-08:
+
+- transport request-send observability now emits `connection_acquired`,
+  `request_headers_start`, and `request_headers_end` at the hyper send
+  boundary instead of inferring acquisition after response headers arrive
+- send-path failures reported after hyper accepts a request are surfaced with
+  `request_committed = true`; failures where hyper recovers the request remain
+  uncommitted
+- retry policy tests now cover the committed send-failure boundary for
+  non-idempotent replayable requests
+
 Still intentionally deferred:
 
 - attempt-span and event-listener vocabulary are not yet fully aligned with the
@@ -137,8 +148,9 @@ whether the model should exist.
 ### Gap 2: Request commitment is only partially surfaced today
 
 `request_method` is now available to retry policy, and `request_committed` now
-exists on the error object, but request commitment is not yet populated at
-every failure site where it could help future custom policies.
+exists on the error object. Transport send failures now populate request
+commitment from hyper's recovered-request signal, but broader coverage is still
+needed for lower-level body streaming and extension-originated failures.
 
 ### Gap 3: Extension attribution is best-effort, not guaranteed
 
