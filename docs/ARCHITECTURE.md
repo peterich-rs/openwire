@@ -252,7 +252,10 @@ follow-ups (pool reuse, interceptor chain integration).
   attempt, retry count, redirect count, and logical auth count plus any completed
   CONNECT-local auth retries. The same logical auth budget gates this loop, so
   CONNECT tunnel proxy authentication cannot exceed the per-call
-  `max_auth_attempts` limit by resetting its own local counter.
+  `max_auth_attempts` limit by resetting its own local counter. CONNECT retry
+  headers are sanitized to the synthetic tunnel `Host` plus proxy-authentication
+  headers, so origin auth, cookies, body framing, and other request headers are
+  not forwarded into the proxy tunnel handshake.
 - `Client::execute` owns call cancellation, final call completion, and wraps the
   returned response body so `call_end` / `call_failed` reflect the whole call.
 - `Call::enqueue` is executor-backed dispatch for the same `Call::execute`

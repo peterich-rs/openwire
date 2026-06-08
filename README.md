@@ -229,7 +229,10 @@ uses those same logical counters; repeated CONNECT 407 tunnel retries add their
 tunnel-local proxy auth count to the logical auth count before calling the
 authenticator again. `ClientBuilder::max_auth_attempts` is a per-logical-call
 budget, so CONNECT proxy authentication also stops once the logical auth count
-plus completed CONNECT-local retries reaches that limit.
+plus completed CONNECT-local retries reaches that limit. CONNECT retries send
+only the synthetic tunnel `Host` plus proxy-authentication headers; origin
+`Authorization`, cookies, body framing, and other request headers returned by a
+proxy authenticator are not forwarded into the proxy tunnel handshake.
 
 ## Transparent Compression
 
