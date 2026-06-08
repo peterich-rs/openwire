@@ -4,8 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/publish-crates.sh --dry-run [--allow-dirty]
-  scripts/publish-crates.sh --publish [--allow-dirty] [--no-wait]
+  scripts/publish-crates.sh --dry-run [--allow-dirty] [--start-at CRATE]
+  scripts/publish-crates.sh --publish [--allow-dirty] [--no-wait] [--start-at CRATE]
 
 Options:
   --dry-run      Run a first-release-safe package preflight. Cargo checks package
@@ -15,6 +15,8 @@ Options:
   --allow-dirty  Pass --allow-dirty through to cargo package/publish.
   --no-wait      Do not wait for each published crate version to become visible
                  before publishing the next dependent crate.
+  --start-at      Start at this crate in the publish order. This is for resuming
+                 after a partial staged publish.
   -h, --help     Show this help text.
 USAGE
 }
@@ -22,6 +24,7 @@ USAGE
 mode=""
 allow_dirty=0
 wait_for_registry=1
+start_at=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +39,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-wait)
       wait_for_registry=0
+      ;;
+    --start-at)
+      if [[ $# -lt 2 ]]; then
+        echo "--start-at requires a crate name" >&2
+        exit 2
+      fi
+      start_at="$2"
+      shift
       ;;
     -h | --help)
       usage
@@ -65,6 +76,25 @@ readonly publish_order=(
   openwire-fastwebsockets
   openwire-tungstenite
 )
+
+selected_publish_order=()
+if [[ -n "$start_at" ]]; then
+  found_start=0
+  for crate in "${publish_order[@]}"; do
+    if [[ "$crate" == "$start_at" ]]; then
+      found_start=1
+    fi
+    if [[ "$found_start" -eq 1 ]]; then
+      selected_publish_order+=("$crate")
+    fi
+  done
+  if [[ "$found_start" -ne 1 ]]; then
+    echo "--start-at crate is not in publish order: $start_at" >&2
+    exit 2
+  fi
+else
+  selected_publish_order=("${publish_order[@]}")
+fi
 
 cargo_args=()
 if [[ "$allow_dirty" -eq 1 ]]; then
@@ -128,8 +158,11 @@ wait_until_visible() {
 assert_internal_dependency_versions_match
 
 echo "OpenWire release version: ${workspace_version}"
+if [[ -n "$start_at" ]]; then
+  echo "Starting at crate: ${start_at}"
+fi
 
-for crate in "${publish_order[@]}"; do
+for crate in "${selected_publish_order[@]}"; do
   echo "==> ${mode}: ${crate}"
   if [[ "$mode" == "dry-run" ]]; then
     cargo package -p "$crate" --list "${cargo_args[@]}" >/dev/null

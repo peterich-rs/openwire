@@ -12,6 +12,10 @@ on:
         required: true
         type: boolean
         default: true
+      start_at:
+        description: Optional crate name to resume from in publish order
+        required: false
+        default: ""
 
 concurrency:
   group: publish-crates-${{ github.ref }}
@@ -41,6 +45,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
+          START_AT: ${{ inputs.start_at }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set -euo pipefail
@@ -48,16 +53,32 @@ jobs:
           test "$workspace_version" = "$INPUT_VERSION"
 
           if [[ "$DRY_RUN" != "true" ]]; then
-            test "${GITHUB_REF}" = "refs/tags/v${INPUT_VERSION}"
             test -n "${CARGO_REGISTRY_TOKEN:-}"
+            if [[ "${GITHUB_REF}" != "refs/tags/v${INPUT_VERSION}" ]]; then
+              test -n "$START_AT"
+              test "${GITHUB_REF}" = "refs/heads/main"
+            fi
           fi
 
       - name: Package preflight
         if: ${{ inputs.dry_run }}
-        run: scripts/publish-crates.sh --dry-run
+        env:
+          START_AT: ${{ inputs.start_at }}
+        run: |
+          if [[ -n "$START_AT" ]]; then
+            scripts/publish-crates.sh --dry-run --start-at "$START_AT"
+          else
+            scripts/publish-crates.sh --dry-run
+          fi
 
       - name: Publish crates
         if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: scripts/publish-crates.sh --publish
+          START_AT: ${{ inputs.start_at }}
+        run: |
+          if [[ -n "$START_AT" ]]; then
+            scripts/publish-crates.sh --publish --start-at "$START_AT"
+          else
+            scripts/publish-crates.sh --publish
+          fi

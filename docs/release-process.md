@@ -81,6 +81,21 @@ visible through Cargo before publishing the next dependent crate.
 The same workflow can be run with `dry_run=true` on a branch or tag to execute
 the package preflight without requiring a crates.io token.
 
+## Resuming a Partial Publish
+
+crates.io rate-limits publishing many brand-new crate names in a short window.
+If a staged publish fails after some crates have already uploaded, wait until
+the time reported by crates.io and rerun `Publish Crates` from `main` with:
+
+- `version` set to the same workspace version
+- `dry_run=false`
+- `start_at` set to the first crate that did not publish
+
+For example, if the first five `0.1.0` crates published and the rate limit
+stopped at `openwire-fastwebsockets`, rerun with
+`start_at=openwire-fastwebsockets`. The workflow only allows non-tag publishing
+when `start_at` is set and the ref is `main`.
+
 ## Post-Publish Verification
 
 After the workflow finishes, verify the registry and downstream install path:
