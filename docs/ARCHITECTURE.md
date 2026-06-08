@@ -119,6 +119,14 @@ HTTP/1.1 client binding. HTTP/2 requests keep their absolute URI but strip
 connection-specific fields, including fields named by `Connection`; `TE` is
 preserved only for the RFC 9113 `trailers` value.
 
+Transport observability is anchored at the same binding boundary. Once a
+connection sender is acquired, `connection_acquired` is emitted before
+`request_headers_start`; `request_headers_end` means the request has been
+handed to hyper's connection sender. If hyper later reports a send failure
+without recovering the request message, the surfaced `WireError` is marked
+`request_committed` so retry policy can distinguish unapplied failures from
+potentially applied requests.
+
 ## 4. Transport Layering
 
 ```mermaid
