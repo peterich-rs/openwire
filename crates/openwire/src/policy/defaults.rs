@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::StatusCode;
 use openwire_core::{
     EstablishmentStage, FailurePhase, RedirectContext, RedirectDecision, RedirectPolicy,
-    RetryContext, RetryPolicy, WireError, WireErrorKind,
+    ResponseRetryContext, RetryAfter, RetryContext, RetryPolicy, WireError, WireErrorKind,
 };
 
 #[derive(Clone, Default)]
@@ -174,6 +174,30 @@ impl RetryPolicy for DefaultRetryPolicy {
             _ => None,
         }
     }
+
+    fn should_retry_response(&self, ctx: &ResponseRetryContext<'_>) -> Option<&'static str> {
+        if !ctx.is_body_replayable() || ctx.retry_count() as usize >= self.max_retries {
+            return None;
+        }
+
+        match ctx.response_status() {
+            StatusCode::REQUEST_TIMEOUT
+                if self.retry_on_connection_failure
+                    && !matches!(
+                        ctx.retry_after(),
+                        Some(RetryAfter::Delayed | RetryAfter::Invalid)
+                    ) =>
+            {
+                Some("http_408")
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+                if matches!(ctx.retry_after(), Some(RetryAfter::Immediate)) =>
+            {
+                Some("http_503")
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -310,8 +334,8 @@ mod tests {
 
     use super::{DefaultRedirectPolicy, DefaultRetryPolicy};
     use openwire_core::{
-        RedirectContext, RedirectDecision, RedirectPolicy, RetryContext, RetryPolicy, WireError,
-        WireErrorKind,
+        RedirectContext, RedirectDecision, RedirectPolicy, ResponseRetryContext, RetryAfter,
+        RetryContext, RetryPolicy, WireError, WireErrorKind,
     };
 
     #[test]
@@ -326,6 +350,55 @@ mod tests {
 
         assert_eq!(policy.should_retry(&first), Some("canceled"));
         assert_eq!(policy.should_retry(&second), None);
+    }
+
+    #[test]
+    fn default_retry_policy_handles_response_status_retries() {
+        let policy = DefaultRetryPolicy::default();
+        let method = Method::POST;
+
+        let request_timeout =
+            ResponseRetryContext::new(http::StatusCode::REQUEST_TIMEOUT, 0, true, &method, None);
+        assert_eq!(
+            policy.should_retry_response(&request_timeout),
+            Some("http_408")
+        );
+
+        let request_timeout_with_delay = ResponseRetryContext::new(
+            http::StatusCode::REQUEST_TIMEOUT,
+            0,
+            true,
+            &method,
+            Some(RetryAfter::Delayed),
+        );
+        assert_eq!(
+            policy.should_retry_response(&request_timeout_with_delay),
+            None
+        );
+
+        let service_unavailable = ResponseRetryContext::new(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            0,
+            true,
+            &method,
+            Some(RetryAfter::Immediate),
+        );
+        assert_eq!(
+            policy.should_retry_response(&service_unavailable),
+            Some("http_503")
+        );
+
+        let service_unavailable_without_header = ResponseRetryContext::new(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            0,
+            true,
+            &method,
+            None,
+        );
+        assert_eq!(
+            policy.should_retry_response(&service_unavailable_without_header),
+            None
+        );
     }
 
     #[test]

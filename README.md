@@ -21,7 +21,8 @@ blocks, and stable observability hooks.
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
-  with structured HTTP authentication challenge parsing
+  with structured HTTP authentication challenge parsing, plus immediate
+  response-status retries for replayable `408` and `503 Retry-After: 0`
 - request validation rejects HTTP URI authorities that include userinfo before
   bridge normalization or network I/O
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
@@ -98,6 +99,7 @@ let response = client
     .new_call(request)
     .call_timeout(Duration::from_secs(2))
     .connect_timeout(Duration::from_millis(250))
+    .max_retries(1)
     .follow_redirects(false)
     .execute()
     .await?;

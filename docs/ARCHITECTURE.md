@@ -159,7 +159,7 @@ These are the intended customization points:
 | `EventListener` / `EventListenerFactory` | call-level and transport-level observability |
 | `CookieJar` | request cookie application and response cookie persistence |
 | `Authenticator` | origin and proxy authentication follow-ups, with `AuthContext::challenges()` exposing RFC 9110 / RFC 7235 `WWW-Authenticate` and `Proxy-Authenticate` challenges |
-| `RetryPolicy` | retry decisions |
+| `RetryPolicy` | connection-failure and response-status retry decisions |
 | `RedirectPolicy` | redirect decisions |
 | `ProxySelector` | per-attempt ordered proxy candidate resolution |
 | `DnsResolver` | host resolution |
@@ -229,6 +229,11 @@ follow-ups (pool reuse, interceptor chain integration).
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
+  Response-status retries are policy decisions after cookie persistence and
+  authentication handling and before redirect handling. The default retry policy
+  only retries replayable `408 Request Timeout` responses and `503 Service
+  Unavailable` responses that explicitly carry `Retry-After: 0`; delayed,
+  invalid, or duplicate `Retry-After` values remain caller-visible responses.
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
   and HTTP URI authorities that include userinfo before bridge normalization can
   derive `Host` or transport can route the request.

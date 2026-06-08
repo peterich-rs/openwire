@@ -1,12 +1,13 @@
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 use http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, RETRY_AFTER, SET_COOKIE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
     AuthKind, BoxFuture, BoxWireService, CookieJar, Exchange, RedirectContext, RedirectDecision,
-    RequestBody, ResponseBody, RetryContext, WireError,
+    RequestBody, ResponseBody, ResponseRetryContext, RetryAfter, RetryContext, WireError,
 };
 use tower::Service;
 use url::Url;
@@ -142,6 +143,32 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 "following authentication challenge",
                             );
                             request = next_request;
+                            attempt = next_attempt;
+                            continue;
+                        }
+
+                        if let Some(reason) =
+                            retry_response_reason(&snapshot, &response, retries, &config.retry)
+                        {
+                            retries += 1;
+                            let next_attempt = attempt + 1;
+                            policy_trace.retry_count = retries;
+                            policy_trace.redirect_count = redirects;
+                            policy_trace.auth_count = auths;
+                            ctx.listener().retry(&ctx, retries, reason);
+                            tracing::debug!(
+                                call_id = ctx.call_id().as_u64(),
+                                attempt = next_attempt,
+                                retry_count = policy_trace.retry_count,
+                                redirect_count = policy_trace.redirect_count,
+                                auth_count = policy_trace.auth_count,
+                                response_status = %response.status(),
+                                retry_reason = reason,
+                                "retrying request after retryable response status",
+                            );
+
+                            drop(response);
+                            request = snapshot.to_retry_request(policy_trace)?;
                             attempt = next_attempt;
                             continue;
                         }
@@ -341,6 +368,48 @@ async fn authenticate_response(
     }
 
     Ok(None)
+}
+
+fn retry_response_reason(
+    snapshot: &RequestSnapshot,
+    response: &Response<ResponseBody>,
+    retries: u32,
+    config: &RetryPolicyConfig,
+) -> Option<&'static str> {
+    config
+        .policy()
+        .should_retry_response(&ResponseRetryContext::new(
+            response.status(),
+            retries,
+            snapshot.is_replayable(),
+            &snapshot.method,
+            retry_after(response),
+        ))
+}
+
+fn retry_after(response: &Response<ResponseBody>) -> Option<RetryAfter> {
+    let mut values = response.headers().get_all(RETRY_AFTER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return Some(RetryAfter::Invalid);
+    }
+
+    let Ok(value) = value.to_str() else {
+        return Some(RetryAfter::Invalid);
+    };
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(if seconds == 0 {
+            RetryAfter::Immediate
+        } else {
+            RetryAfter::Delayed
+        });
+    }
+
+    match httpdate::parse_http_date(value) {
+        Ok(instant) if instant <= SystemTime::now() => Some(RetryAfter::Immediate),
+        Ok(_) => Some(RetryAfter::Delayed),
+        Err(_) => Some(RetryAfter::Invalid),
+    }
 }
 
 fn store_response_cookies(
@@ -594,19 +663,20 @@ fn same_origin(left: &Uri, right: &Uri) -> Result<bool, WireError> {
 #[cfg(test)]
 mod tests {
     use std::task::{Context, Poll};
+    use std::time::{Duration, SystemTime};
 
-    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, RETRY_AFTER};
     use http::{HeaderValue, Request, Response, StatusCode};
     use openwire_core::{
         BoxFuture, BoxWireService, CallContext, Exchange, NoopEventListenerFactory, ResponseBody,
-        WireError,
+        RetryAfter, WireError,
     };
     use tower::util::BoxCloneSyncService;
     use tower::{Service, ServiceExt};
 
     use super::{
-        same_origin, validate_request_uri, AuthPolicyConfig, FollowUpPolicyService, PolicyConfig,
-        PolicyTraceContext, RequestSnapshot,
+        retry_after, same_origin, validate_request_uri, AuthPolicyConfig, FollowUpPolicyService,
+        PolicyConfig, PolicyTraceContext, RequestSnapshot,
     };
     use crate::policy::{RedirectPolicyConfig, RetryPolicyConfig};
     use crate::RequestBody;
@@ -708,6 +778,48 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Basic cHJveHk6c2VjcmV0")
         );
+    }
+
+    #[test]
+    fn retry_after_classifies_delta_seconds_and_http_dates() {
+        let mut response = Response::new(ResponseBody::empty());
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(retry_after(&response), Some(RetryAfter::Immediate));
+
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("5"));
+        assert_eq!(retry_after(&response), Some(RetryAfter::Delayed));
+
+        let past = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(60));
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&past).expect("past retry-after"),
+        );
+        assert_eq!(retry_after(&response), Some(RetryAfter::Immediate));
+
+        let future = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&future).expect("future retry-after"),
+        );
+        assert_eq!(retry_after(&response), Some(RetryAfter::Delayed));
+    }
+
+    #[test]
+    fn retry_after_treats_invalid_or_duplicate_values_as_invalid() {
+        let mut response = Response::new(ResponseBody::empty());
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("soon"));
+        assert_eq!(retry_after(&response), Some(RetryAfter::Invalid));
+
+        response
+            .headers_mut()
+            .append(RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(retry_after(&response), Some(RetryAfter::Invalid));
     }
 
     struct ReadinessTrackingService {
