@@ -86,6 +86,11 @@ D --> Q[Cookie persistence / auth / redirect follow-up decision]
 
 No feature should bypass this chain.
 
+HTTP/2 `421 Misdirected Request` recovery stays inside this chain. Transport
+marks responses that arrived over a coalesced HTTP/2 connection; after cookie
+persistence and authentication handling, `FollowUpPolicyService` may retry a
+replayable `421` request on a non-coalesced connection before redirect handling.
+
 `Call::execute()` and `Call::enqueue()` both enter this same chain. Queued calls
 only move dispatch onto the client's configured `WireExecutor`; they do not get
 a separate transport path. `CallHandle::cancel()` races against the in-flight
@@ -113,6 +118,14 @@ Direct HTTP/1.1 requests are converted to origin-form before they enter hyper's
 HTTP/1.1 client binding. HTTP/2 requests keep their absolute URI but strip
 connection-specific fields, including fields named by `Connection`; `TE` is
 preserved only for the RFC 9113 `trailers` value.
+
+Transport observability is anchored at the same binding boundary. Once a
+connection sender is acquired, `connection_acquired` is emitted before
+`request_headers_start`; `request_headers_end` means the request has been
+handed to hyper's connection sender. If hyper later reports a send failure
+without recovering the request message, the surfaced `WireError` is marked
+`request_committed` so retry policy can distinguish unapplied failures from
+potentially applied requests.
 
 ## 4. Transport Layering
 
@@ -240,6 +253,12 @@ follow-ups (pool reuse, interceptor chain integration).
   derive `Host` or transport can route the request.
 - `TransportService` owns connection acquisition, route execution, protocol
   binding, and bound request dispatch.
+- HTTP/2 coalescing remains a transport optimization. `TransportService` tags
+  caller-visible responses that used a coalesced HTTP/2 connection, while
+  `FollowUpPolicyService` retries only replayable `421 Misdirected Request`
+  responses carrying that internal tag. The retry request carries an internal
+  no-coalescing marker so the next attempt opens or reuses an exact-authority
+  connection instead of another coalesced route.
 - Forward-proxy HTTP `407` follow-ups are only attempted when the transport
   response carries a selected proxy route. Direct-origin `407` responses remain
   caller-visible responses and do not invoke the proxy authenticator.

@@ -23,7 +23,6 @@ use super::bindings::{ConnectionBindings, ConnectionTaskRegistry};
 pub(super) struct BoundResponse {
     pub(super) response: Response<Incoming>,
     pub(super) release: ResponseLease,
-    pub(super) reused: bool,
 }
 
 pub(super) struct ResponseLease {
