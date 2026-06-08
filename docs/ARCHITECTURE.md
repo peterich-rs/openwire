@@ -105,7 +105,10 @@ the cloned call re-enters the canonical flow when executed.
 `BridgeInterceptor` owns HTTP request/response normalization that is above the
 transport byte stream but below user-facing application interceptors. That
 includes `Host`, `User-Agent`, request body framing headers, WebSocket handshake
-headers, and transparent compression. When the default `compression` feature is
+headers, and transparent compression. When OpenWire synthesizes `Host`, it uses
+the URI authority's normal form by omitting default `:80` / `:443` ports while
+preserving explicit caller-supplied `Host` values. When the default
+`compression` feature is
 enabled, bridge injects `Accept-Encoding: br, gzip, deflate, zstd` only for
 requests that did not already specify `Accept-Encoding` and are not range
 requests. Matching compressed responses are decoded as a stream on the return
