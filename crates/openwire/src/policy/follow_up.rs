@@ -20,6 +20,7 @@ use crate::connection::CachedAddresses;
 use crate::cookie::SharedCookieJar;
 use crate::proxy::SelectedProxy;
 use crate::trace::PolicyTraceContext;
+use crate::transport::{CoalescedConnectionRetryable, NoCoalescedConnections};
 
 #[derive(Clone)]
 pub(crate) struct PolicyConfig {
@@ -142,6 +143,35 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 "following authentication challenge",
                             );
                             request = next_request;
+                            attempt = next_attempt;
+                            continue;
+                        }
+
+                        if should_retry_misdirected_request(
+                            &snapshot,
+                            &response,
+                            retries,
+                            &config.retry,
+                        ) {
+                            retries += 1;
+                            let next_attempt = attempt + 1;
+                            policy_trace.retry_count = retries;
+                            policy_trace.redirect_count = redirects;
+                            policy_trace.auth_count = auths;
+                            ctx.listener().retry(&ctx, retries, "misdirected_request");
+                            tracing::debug!(
+                                call_id = ctx.call_id().as_u64(),
+                                attempt = next_attempt,
+                                retry_count = policy_trace.retry_count,
+                                redirect_count = policy_trace.redirect_count,
+                                auth_count = policy_trace.auth_count,
+                                response_status = %response.status(),
+                                "retrying request after HTTP/2 misdirected request",
+                            );
+
+                            drop(response);
+                            request = snapshot.to_retry_request(policy_trace)?;
+                            request.extensions_mut().insert(NoCoalescedConnections);
                             attempt = next_attempt;
                             continue;
                         }
@@ -341,6 +371,21 @@ async fn authenticate_response(
     }
 
     Ok(None)
+}
+
+fn should_retry_misdirected_request(
+    snapshot: &RequestSnapshot,
+    response: &Response<ResponseBody>,
+    retry_count: u32,
+    retry: &RetryPolicyConfig,
+) -> bool {
+    response.status() == StatusCode::MISDIRECTED_REQUEST
+        && snapshot.is_replayable()
+        && retry_count < retry.default_config().max_retries() as u32
+        && response
+            .extensions()
+            .get::<CoalescedConnectionRetryable>()
+            .is_some()
 }
 
 fn store_response_cookies(

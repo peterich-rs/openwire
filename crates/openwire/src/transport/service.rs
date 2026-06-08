@@ -39,6 +39,12 @@ use super::protocol::{
     map_hyper_error, prepare_bound_request,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoalescedConnectionRetryable;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NoCoalescedConnections;
+
 struct SelectedConnection {
     address: Address,
     selected_proxy: Option<SelectedProxy>,
@@ -46,6 +52,7 @@ struct SelectedConnection {
     binding: Option<AcquiredBinding>,
     request_permit: Option<crate::connection::RequestAdmissionPermit>,
     reused: bool,
+    coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
     availability: ConnectionAvailability,
@@ -58,6 +65,7 @@ struct SelectedConnectionInit {
     binding: AcquiredBinding,
     request_permit: crate::connection::RequestAdmissionPermit,
     reused: bool,
+    coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
     availability: ConnectionAvailability,
@@ -81,6 +89,7 @@ type SelectedConnectionSendParts = (
     AcquiredBinding,
     crate::connection::RequestAdmissionPermit,
     bool,
+    bool,
     Arc<ExchangeFinder>,
     Arc<ConnectionBindings>,
     ConnectionAvailability,
@@ -95,6 +104,7 @@ impl SelectedConnection {
             binding: Some(init.binding),
             request_permit: Some(init.request_permit),
             reused: init.reused,
+            coalesced: init.coalesced,
             exchange_finder: init.exchange_finder,
             bindings: init.bindings,
             availability: init.availability,
@@ -129,6 +139,7 @@ impl SelectedConnection {
             binding,
             request_permit,
             self.reused,
+            self.coalesced,
             self.exchange_finder.clone(),
             self.bindings.clone(),
             self.availability.clone(),
@@ -378,6 +389,7 @@ impl TransportService {
                             binding,
                             request_permit: request_permit.take().expect("request permit"),
                             reused: true,
+                            coalesced: false,
                             exchange_finder: self.exchange_finder.clone(),
                             bindings: self.bindings.clone(),
                             availability: self.connection_availability.clone(),
@@ -425,7 +437,7 @@ impl TransportService {
                 WireError::internal("route plan missing", io::Error::other("route plan missing"))
             })?;
             if let Some(selected) =
-                self.try_acquire_coalesced(candidate, route_plan_ref, &mut request_permit)
+                self.try_acquire_coalesced(candidate, route_plan_ref, request, &mut request_permit)
             {
                 return Ok(selected);
             }
@@ -558,6 +570,7 @@ impl TransportService {
             binding,
             request_permit: args.request_permit,
             reused: false,
+            coalesced: false,
             exchange_finder: self.exchange_finder.clone(),
             bindings: self.bindings.clone(),
             availability: self.connection_availability.clone(),
@@ -568,8 +581,17 @@ impl TransportService {
         &self,
         candidate: &ResolvedAddress,
         route_plan: &RoutePlan,
+        request: &Request<RequestBody>,
         request_permit: &mut Option<crate::connection::RequestAdmissionPermit>,
     ) -> Option<SelectedConnection> {
+        if request
+            .extensions()
+            .get::<NoCoalescedConnections>()
+            .is_some()
+        {
+            return None;
+        }
+
         let connection = self
             .exchange_finder
             .pool()
@@ -583,6 +605,7 @@ impl TransportService {
                     binding,
                     request_permit: request_permit.take().expect("request permit"),
                     reused: true,
+                    coalesced: true,
                     exchange_finder: self.exchange_finder.clone(),
                     bindings: self.bindings.clone(),
                     availability: self.connection_availability.clone(),
@@ -753,6 +776,7 @@ async fn send_bound_request(
         binding,
         request_permit,
         reused,
+        coalesced,
         exchange_finder,
         bindings,
         availability,
@@ -840,6 +864,11 @@ async fn send_bound_request(
             response.extensions_mut().insert(info);
             if let Some(selected_proxy) = selected_proxy {
                 response.extensions_mut().insert(selected_proxy);
+            }
+            if coalesced {
+                response
+                    .extensions_mut()
+                    .insert(CoalescedConnectionRetryable);
             }
             Ok((
                 BoundResponse {
