@@ -1,11 +1,16 @@
 [package]
 name = "openwire-test"
+description = "Local test support utilities for the OpenWire workspace"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+publish = false
 
 [features]
 websocket = ["dep:tokio-tungstenite", "openwire-core/websocket"]
@@ -16,8 +21,8 @@ futures-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
-openwire-core = { path = "../openwire-core" }
-openwire-tokio = { path = "../openwire-tokio" }
+openwire-core.workspace = true
+openwire-tokio.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 tokio.workspace = true

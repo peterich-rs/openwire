@@ -273,7 +273,7 @@ impl EventListener for RecordingEventListener {
         kind: openwire_core::websocket::MessageKind,
         payload_len: usize,
     ) {
-        self.push(format!("websocket_message_sent {:?} {payload_len}", kind));
+        self.push(format!("websocket_message_sent {kind:?} {payload_len}"));
     }
 
     #[cfg(feature = "websocket")]
@@ -283,10 +283,7 @@ impl EventListener for RecordingEventListener {
         kind: openwire_core::websocket::MessageKind,
         payload_len: usize,
     ) {
-        self.push(format!(
-            "websocket_message_received {:?} {payload_len}",
-            kind
-        ));
+        self.push(format!("websocket_message_received {kind:?} {payload_len}"));
     }
 
     #[cfg(feature = "websocket")]
@@ -307,7 +304,7 @@ impl EventListener for RecordingEventListener {
         reason: &str,
         initiator: openwire_core::websocket::CloseInitiator,
     ) {
-        self.push(format!("websocket_closing {:?} {code} {reason}", initiator));
+        self.push(format!("websocket_closing {initiator:?} {code} {reason}"));
     }
 
     #[cfg(feature = "websocket")]

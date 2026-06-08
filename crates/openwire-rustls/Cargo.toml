@@ -1,11 +1,15 @@
 [package]
 name = "openwire-rustls"
+description = "Rustls TLS connector integration for OpenWire"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [features]
 default = ["platform-verifier"]
@@ -16,8 +20,8 @@ bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
-openwire-core = { path = "../openwire-core" }
-openwire-tokio = { path = "../openwire-tokio" }
+openwire-core.workspace = true
+openwire-tokio.workspace = true
 pin-project-lite.workspace = true
 rustls.workspace = true
 rustls-webpki.workspace = true

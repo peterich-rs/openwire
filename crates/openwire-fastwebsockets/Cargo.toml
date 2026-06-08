@@ -1,23 +1,27 @@
 [package]
 name = "openwire-fastwebsockets"
+description = "fastwebsockets engine adapter for OpenWire WebSocket clients"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
 bytes.workspace = true
 fastwebsockets.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
-openwire-core = { path = "../openwire-core", features = ["websocket"] }
-openwire-tokio = { path = "../openwire-tokio" }
+openwire-core = { workspace = true, features = ["websocket"] }
+openwire-tokio.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 http.workspace = true
-openwire = { path = "../openwire", features = ["websocket"] }
-openwire-test = { path = "../openwire-test", features = ["websocket"] }
+openwire = { workspace = true, features = ["websocket"] }
+openwire-test = { workspace = true, features = ["websocket"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-tungstenite = "0.24"

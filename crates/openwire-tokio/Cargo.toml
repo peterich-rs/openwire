@@ -1,15 +1,19 @@
 [package]
 name = "openwire-tokio"
+description = "Tokio executor, timer, DNS, TCP, and I/O adapters for OpenWire"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
 hyper.workspace = true
-openwire-core = { path = "../openwire-core" }
+openwire-core.workspace = true
 pin-project-lite.workspace = true
 tokio.workspace = true
 tracing.workspace = true

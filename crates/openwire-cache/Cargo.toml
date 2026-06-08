@@ -1,22 +1,26 @@
 [package]
 name = "openwire-cache"
+description = "Application-layer HTTP cache interceptor for OpenWire"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 http.workspace = true
 httpdate.workspace = true
-openwire = { path = "../openwire" }
+openwire.workspace = true
 tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 hyper.workspace = true
-openwire-rustls = { path = "../openwire-rustls" }
-openwire-test = { path = "../openwire-test" }
+openwire-rustls.workspace = true
+openwire-test.workspace = true
