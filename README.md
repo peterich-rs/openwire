@@ -48,12 +48,27 @@ blocks, and stable observability hooks.
 - `crates/openwire`: public client API, policy layer, transport integration
 - `crates/openwire-cache`: cache interceptor and in-memory cache store
 - `crates/openwire-core`: shared body, error, event, executor/timer, transport, and policy traits
+- `crates/openwire-fastwebsockets`: optional `fastwebsockets` WebSocket engine adapter
 - `crates/openwire-tokio`: Tokio executor, timer, I/O, DNS, and TCP adapters
 - `crates/openwire-rustls`: default Rustls TLS connector
+- `crates/openwire-tungstenite`: optional `tokio-tungstenite` WebSocket engine adapter
 - `crates/openwire-test`: local test support
 
 Tokio-specific adapters are imported from `openwire-tokio` directly; `openwire`
 keeps the client API and higher-level policy / planning surfaces.
+
+## Installation
+
+The first planned crates.io release is `0.1.0`:
+
+```toml
+[dependencies]
+openwire = "0.1.0"
+```
+
+Optional companion crates are published with the same workspace version, for
+example `openwire-cache = "0.1.0"` or `openwire-tungstenite = "0.1.0"`.
+Release and versioning steps are documented in `docs/release-process.md`.
 
 ## Quick Start
 

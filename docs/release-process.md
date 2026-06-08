@@ -1,0 +1,95 @@
+# Release Process
+
+OpenWire publishes the user-facing crates through crates.io so downstream users
+can depend on standard registry versions instead of Git source paths. The first
+planned release is `0.1.0`.
+
+## Published Crates
+
+Publish the workspace crates in dependency order:
+
+1. `openwire-core`
+2. `openwire-tokio`
+3. `openwire-rustls`
+4. `openwire`
+5. `openwire-cache`
+6. `openwire-fastwebsockets`
+7. `openwire-tungstenite`
+
+`openwire-test` is local test support and has `publish = false`. Published
+crate dev-dependencies that point at `openwire-test` remain path-only so Cargo
+does not emit a registry dependency on a non-published crate.
+
+## Versioning
+
+All publishable crates use the workspace version from the root
+`[workspace.package]` table. The same version must also be set on the internal
+workspace dependencies in root `[workspace.dependencies]` so packaged manifests
+can resolve each OpenWire crate from crates.io after publication.
+
+For a version bump:
+
+1. Update `version` in root `[workspace.package]`.
+2. Update the `version = "..."`
+   fields for `openwire`, `openwire-cache`, `openwire-core`,
+   `openwire-fastwebsockets`, `openwire-rustls`, `openwire-tokio`, and
+   `openwire-tungstenite` in root `[workspace.dependencies]`.
+3. Update README installation examples and any release notes that name the
+   version.
+4. Run `scripts/publish-crates.sh --dry-run` to verify that package metadata and
+   internal dependency versions are consistent.
+
+## Pull Request Preflight
+
+Run the normal CI gates before publishing:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+scripts/publish-crates.sh --dry-run
+```
+
+The dry-run script is intentionally first-release safe. Cargo requires each
+versioned internal dependency to already exist in the registry when generating a
+full tarball for dependent crates, so before a staged release it checks package
+file lists for every publishable crate and builds the `openwire-core` tarball.
+The actual publish command still runs Cargo's full publish verification for each
+crate after its dependencies have been published.
+
+## Publishing
+
+Set the repository secret `CRATES_IO_TOKEN` to a crates.io API token with
+publish permission for all published OpenWire crates.
+
+After the release PR is merged:
+
+1. Create and push a release tag that matches the workspace version:
+
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+2. Run the `Publish Crates` GitHub Actions workflow on that tag with
+   `version=0.1.0` and `dry_run=false`.
+
+The workflow refuses to publish unless it is running on `refs/tags/v<version>`.
+It publishes crates in dependency order and waits for each version to become
+visible through Cargo before publishing the next dependent crate.
+
+The same workflow can be run with `dry_run=true` on a branch or tag to execute
+the package preflight without requiring a crates.io token.
+
+## Post-Publish Verification
+
+After the workflow finishes, verify the registry and downstream install path:
+
+```sh
+cargo info openwire@0.1.0
+tmpdir="$(mktemp -d)"
+cd "$tmpdir"
+cargo init --bin
+cargo add openwire@0.1.0
+cargo check
+```

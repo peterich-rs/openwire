@@ -18,6 +18,9 @@ version = "0.1.0"
 authors = ["OpenWire contributors"]
 repository = "https://github.com/peterich-rs/openwire"
 rust-version = "1.80"
+readme = "README.md"
+categories = ["asynchronous", "network-programming", "web-programming::http-client"]
+keywords = ["http", "client", "async", "hyper", "okhttp"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -34,6 +37,14 @@ http-body = "1.0.1"
 http-body-util = "0.1.3"
 httpdate = "1.0.3"
 hyper = { version = "1.8.1", features = ["full"] }
+openwire = { path = "crates/openwire", version = "0.1.0" }
+openwire-cache = { path = "crates/openwire-cache", version = "0.1.0" }
+openwire-core = { path = "crates/openwire-core", version = "0.1.0" }
+openwire-fastwebsockets = { path = "crates/openwire-fastwebsockets", version = "0.1.0" }
+openwire-rustls = { path = "crates/openwire-rustls", version = "0.1.0", default-features = false }
+openwire-test = { path = "crates/openwire-test" }
+openwire-tokio = { path = "crates/openwire-tokio", version = "0.1.0" }
+openwire-tungstenite = { path = "crates/openwire-tungstenite", version = "0.1.0" }
 pin-project-lite = "0.2.16"
 rcgen = "0.14.5"
 rustls = "0.23.35"

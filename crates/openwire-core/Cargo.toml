@@ -1,11 +1,15 @@
 [package]
 name = "openwire-core"
+description = "Shared primitives, policies, bodies, and transport traits for OpenWire"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [features]
 json = ["dep:serde", "dep:serde_json"]

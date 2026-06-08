@@ -156,7 +156,7 @@ impl Interceptor for LoggerInterceptor {
                 Err(error) => {
                     emit_lines(
                         &config,
-                        &[format!("<-- HTTP FAILED {} ({})", request_uri, error)],
+                        &[format!("<-- HTTP FAILED {request_uri} ({error})")],
                     );
                     Err(error)
                 }

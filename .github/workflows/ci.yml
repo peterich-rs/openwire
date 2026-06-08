@@ -79,6 +79,22 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+  package:
+    name: Crates.io Package Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Package publishable crates
+        run: scripts/publish-crates.sh --dry-run
+
   gate:
     name: CI Gate
     if: ${{ always() }}
@@ -87,13 +103,16 @@ jobs:
       - fmt
       - clippy
       - test-and-build
+      - package
     steps:
       - name: Verify required CI jobs passed
         env:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           TEST_AND_BUILD_RESULT: ${{ needs.test-and-build.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
           test "$FMT_RESULT" = "success"
           test "$CLIPPY_RESULT" = "success"
           test "$TEST_AND_BUILD_RESULT" = "success"
+          test "$PACKAGE_RESULT" = "success"

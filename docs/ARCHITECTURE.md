@@ -31,15 +31,24 @@ flowchart LR
     TOKIO[crates/openwire-tokio<br/>Tokio runtime adapters]
     RUSTLS[crates/openwire-rustls<br/>TLS connector]
     CACHE[crates/openwire-cache<br/>application-layer cache]
+    FASTWS[crates/openwire-fastwebsockets<br/>WebSocket engine adapter]
+    TUNGSTENITE[crates/openwire-tungstenite<br/>WebSocket engine adapter]
     TEST[crates/openwire-test<br/>test support]
 
     OW --> CORE
     OW --> TOKIO
     OW --> RUSTLS
     CACHE --> CORE
+    CACHE --> OW
+    FASTWS --> CORE
+    FASTWS --> TOKIO
+    TUNGSTENITE --> CORE
+    TUNGSTENITE --> TOKIO
     TOKIO --> CORE
     RUSTLS --> CORE
+    RUSTLS --> TOKIO
     TEST --> CORE
+    TEST --> TOKIO
 ```
 
 | Crate | Responsibility |
@@ -49,7 +58,9 @@ flowchart LR
 | `crates/openwire-tokio` | Tokio executor, timer, I/O adapter, system DNS, TCP connector |
 | `crates/openwire-rustls` | default Rustls-backed TLS connector |
 | `crates/openwire-cache` | application-layer cache interceptor and store, with conservative RFC 9111 freshness and reuse handling |
-| `crates/openwire-test` | local test support |
+| `crates/openwire-fastwebsockets` | optional `fastwebsockets` WebSocket engine adapter |
+| `crates/openwire-tungstenite` | optional `tokio-tungstenite` WebSocket engine adapter |
+| `crates/openwire-test` | local test support; not published to crates.io |
 
 ## 3. Canonical Request Flow
 
