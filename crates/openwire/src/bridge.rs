@@ -1,5 +1,5 @@
 use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING, USER_AGENT};
-use http::{HeaderValue, Request, Version};
+use http::{HeaderValue, Request, Uri, Version};
 use openwire_core::{BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody, WireError};
 
 const DEFAULT_USER_AGENT: &str = concat!("openwire/", env!("CARGO_PKG_VERSION"));
@@ -63,17 +63,34 @@ fn normalize_host_header(request: &mut Request<RequestBody>) -> Result<(), WireE
         return Ok(());
     }
 
-    let authority = request
-        .uri()
+    let host = synthesized_host_header(request.uri())?;
+    request.headers_mut().insert(HOST, host);
+    Ok(())
+}
+
+fn synthesized_host_header(uri: &Uri) -> Result<HeaderValue, WireError> {
+    let authority = uri
         .authority()
         .ok_or_else(|| WireError::invalid_request("request URI is missing an authority"))?;
-    let host = HeaderValue::from_str(authority.as_str()).map_err(|error| {
+    let host = uri
+        .host()
+        .ok_or_else(|| WireError::invalid_request("request URI is missing a host"))?;
+
+    let authority = match uri.port_u16() {
+        Some(port) if !is_default_port(uri.scheme_str(), port) => authority.as_str(),
+        _ => host,
+    };
+
+    HeaderValue::from_str(authority).map_err(|error| {
         WireError::invalid_request(format!(
             "request URI authority is not a valid Host header: {error}"
         ))
-    })?;
-    request.headers_mut().insert(HOST, host);
-    Ok(())
+    })
+}
+
+fn is_default_port(scheme: Option<&str>, port: u16) -> bool {
+    matches!(scheme, Some(scheme) if (scheme.eq_ignore_ascii_case("http") && port == 80)
+        || (scheme.eq_ignore_ascii_case("https") && port == 443))
 }
 
 fn normalize_user_agent_header(request: &mut Request<RequestBody>) {
@@ -120,11 +137,107 @@ fn uses_chunked_transfer_encoding(version: Version) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+    use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
     use http::{Method, Request, Version};
 
-    use super::normalize_body_headers;
+    use super::{normalize_body_headers, normalize_request};
     use crate::RequestBody;
+
+    #[test]
+    fn synthesized_host_omits_default_http_port() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com:80/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_request(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn synthesized_host_omits_default_https_port() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com:443/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_request(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn synthesized_host_preserves_non_default_port() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com:8443/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_request(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("example.com:8443")
+        );
+    }
+
+    #[test]
+    fn synthesized_host_preserves_ipv6_brackets_while_omitting_default_port() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("http://[::1]:80/")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_request(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("[::1]")
+        );
+    }
+
+    #[test]
+    fn explicit_host_header_is_preserved() {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com:443/")
+            .header(HOST, "custom.example")
+            .body(RequestBody::empty())
+            .expect("request");
+
+        normalize_request(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("custom.example")
+        );
+    }
 
     #[test]
     fn absent_body_omits_content_length() {
