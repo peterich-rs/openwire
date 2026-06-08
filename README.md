@@ -22,8 +22,12 @@ blocks, and stable observability hooks.
 - event listeners and stable request / connection observability
 - retries, RFC-shaped redirects, cookies, and origin / proxy authentication
   follow-ups with structured HTTP authentication challenge parsing
+- HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
+  replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
   bridge normalization or network I/O
+- synthesized `Host` headers follow scheme-based URI normalization by omitting
+  default `:80` / `:443` ports while preserving caller-supplied `Host` values
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
   through the default `compression` feature
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
@@ -98,6 +102,7 @@ let response = client
     .new_call(request)
     .call_timeout(Duration::from_secs(2))
     .connect_timeout(Duration::from_millis(250))
+    .max_retries(1)
     .follow_redirects(false)
     .execute()
     .await?;

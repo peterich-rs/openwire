@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{Request, Response};
-use hyper::client::conn::{http1, http2};
+use hyper::client::conn::{http1, http2, TrySendError};
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, Connection, ConnectionInfo, Exchange, HyperExecutor,
     RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
@@ -39,6 +39,12 @@ use super::protocol::{
     map_hyper_error, prepare_bound_request,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoalescedConnectionRetryable;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NoCoalescedConnections;
+
 struct SelectedConnection {
     address: Address,
     selected_proxy: Option<SelectedProxy>,
@@ -46,6 +52,7 @@ struct SelectedConnection {
     binding: Option<AcquiredBinding>,
     request_permit: Option<crate::connection::RequestAdmissionPermit>,
     reused: bool,
+    coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
     availability: ConnectionAvailability,
@@ -58,6 +65,7 @@ struct SelectedConnectionInit {
     binding: AcquiredBinding,
     request_permit: crate::connection::RequestAdmissionPermit,
     reused: bool,
+    coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
     availability: ConnectionAvailability,
@@ -81,6 +89,7 @@ type SelectedConnectionSendParts = (
     AcquiredBinding,
     crate::connection::RequestAdmissionPermit,
     bool,
+    bool,
     Arc<ExchangeFinder>,
     Arc<ConnectionBindings>,
     ConnectionAvailability,
@@ -95,6 +104,7 @@ impl SelectedConnection {
             binding: Some(init.binding),
             request_permit: Some(init.request_permit),
             reused: init.reused,
+            coalesced: init.coalesced,
             exchange_finder: init.exchange_finder,
             bindings: init.bindings,
             availability: init.availability,
@@ -129,6 +139,7 @@ impl SelectedConnection {
             binding,
             request_permit,
             self.reused,
+            self.coalesced,
             self.exchange_finder.clone(),
             self.bindings.clone(),
             self.availability.clone(),
@@ -260,24 +271,6 @@ impl TransportService {
             if let Some(bytes) = request_body_len {
                 ctx.listener().request_body_end(&ctx, bytes);
             }
-
-            let connection_info = response
-                .response
-                .extensions()
-                .get::<ConnectionInfo>()
-                .cloned()
-                .ok_or_else(|| {
-                    WireError::internal(
-                        "response missing connection info",
-                        io::Error::other("owned response missing connection info"),
-                    )
-                })?;
-            ctx.listener()
-                .connection_acquired(&ctx, connection_info.id, response.reused);
-            let span = tracing::Span::current();
-            span.record("connection_id", connection_info.id.as_u64());
-            span.record("connection_reused", response.reused);
-
             ctx.listener().response_headers_start(&ctx);
             let (parts, body) = response.response.into_parts();
             let deadline_expired =
@@ -396,6 +389,7 @@ impl TransportService {
                             binding,
                             request_permit: request_permit.take().expect("request permit"),
                             reused: true,
+                            coalesced: false,
                             exchange_finder: self.exchange_finder.clone(),
                             bindings: self.bindings.clone(),
                             availability: self.connection_availability.clone(),
@@ -443,7 +437,7 @@ impl TransportService {
                 WireError::internal("route plan missing", io::Error::other("route plan missing"))
             })?;
             if let Some(selected) =
-                self.try_acquire_coalesced(candidate, route_plan_ref, &mut request_permit)
+                self.try_acquire_coalesced(candidate, route_plan_ref, request, &mut request_permit)
             {
                 return Ok(selected);
             }
@@ -576,6 +570,7 @@ impl TransportService {
             binding,
             request_permit: args.request_permit,
             reused: false,
+            coalesced: false,
             exchange_finder: self.exchange_finder.clone(),
             bindings: self.bindings.clone(),
             availability: self.connection_availability.clone(),
@@ -586,8 +581,17 @@ impl TransportService {
         &self,
         candidate: &ResolvedAddress,
         route_plan: &RoutePlan,
+        request: &Request<RequestBody>,
         request_permit: &mut Option<crate::connection::RequestAdmissionPermit>,
     ) -> Option<SelectedConnection> {
+        if request
+            .extensions()
+            .get::<NoCoalescedConnections>()
+            .is_some()
+        {
+            return None;
+        }
+
         let connection = self
             .exchange_finder
             .pool()
@@ -601,6 +605,7 @@ impl TransportService {
                     binding,
                     request_permit: request_permit.take().expect("request permit"),
                     reused: true,
+                    coalesced: true,
                     exchange_finder: self.exchange_finder.clone(),
                     bindings: self.bindings.clone(),
                     availability: self.connection_availability.clone(),
@@ -771,6 +776,7 @@ async fn send_bound_request(
         binding,
         request_permit,
         reused,
+        coalesced,
         exchange_finder,
         bindings,
         availability,
@@ -784,14 +790,31 @@ async fn send_bound_request(
 
     match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
+            record_connection_acquired(&ctx, &info, reused);
             sender.ready().await.map_err(|error| {
-                cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
+                cleanup_failed_request(
+                    &connection,
+                    &exchange_finder,
+                    &bindings,
+                    &availability,
+                    &ctx,
+                );
                 map_hyper_error(error)
             })?;
             let request_requests_close = connection_header_requests_close(request.headers());
-            let mut response = sender.send_request(request).await.map_err(|error| {
-                cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
-                map_hyper_error(error)
+            ctx.listener().request_headers_start(&ctx);
+            let response = sender.try_send_request(request);
+            ctx.listener().request_headers_end(&ctx);
+            let response = response.await;
+            let mut response = response.map_err(|error| {
+                cleanup_failed_request(
+                    &connection,
+                    &exchange_finder,
+                    &bindings,
+                    &availability,
+                    &ctx,
+                );
+                map_try_send_error(error)
             })?;
             let reusable = http1_exchange_allows_reuse(request_requests_close, &response);
             response.extensions_mut().insert(info);
@@ -808,23 +831,44 @@ async fn send_bound_request(
                         reusable,
                         ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
                     ),
-                    reused,
                 },
                 request_permit,
             ))
         }
         AcquiredBinding::Http2 { info, mut sender } => {
+            record_connection_acquired(&ctx, &info, reused);
             sender.ready().await.map_err(|error| {
-                cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
+                cleanup_failed_request(
+                    &connection,
+                    &exchange_finder,
+                    &bindings,
+                    &availability,
+                    &ctx,
+                );
                 map_hyper_error(error)
             })?;
-            let mut response = sender.send_request(request).await.map_err(|error| {
-                cleanup_failed_request(&connection, &exchange_finder, &bindings, &availability);
-                map_hyper_error(error)
+            ctx.listener().request_headers_start(&ctx);
+            let response = sender.try_send_request(request);
+            ctx.listener().request_headers_end(&ctx);
+            let response = response.await;
+            let mut response = response.map_err(|error| {
+                cleanup_failed_request(
+                    &connection,
+                    &exchange_finder,
+                    &bindings,
+                    &availability,
+                    &ctx,
+                );
+                map_try_send_error(error)
             })?;
             response.extensions_mut().insert(info);
             if let Some(selected_proxy) = selected_proxy {
                 response.extensions_mut().insert(selected_proxy);
+            }
+            if coalesced {
+                response
+                    .extensions_mut()
+                    .insert(CoalescedConnectionRetryable);
             }
             Ok((
                 BoundResponse {
@@ -833,12 +877,28 @@ async fn send_bound_request(
                         connection,
                         ResponseLeaseShared::new(exchange_finder, ctx, tasks, availability),
                     ),
-                    reused,
                 },
                 request_permit,
             ))
         }
     }
+}
+
+fn map_try_send_error<T>(error: TrySendError<T>) -> WireError {
+    let committed = error.message().is_none();
+    let error = map_hyper_error(error.into_error());
+    if committed {
+        error.with_request_committed()
+    } else {
+        error
+    }
+}
+
+fn record_connection_acquired(ctx: &CallContext, info: &ConnectionInfo, reused: bool) {
+    ctx.listener().connection_acquired(ctx, info.id, reused);
+    let span = tracing::Span::current();
+    span.record("connection_id", info.id.as_u64());
+    span.record("connection_reused", reused);
 }
 
 pub(super) fn prepare_request_for_send(
@@ -856,6 +916,7 @@ fn cleanup_failed_request(
     exchange_finder: &Arc<ExchangeFinder>,
     bindings: &Arc<ConnectionBindings>,
     availability: &ConnectionAvailability,
+    ctx: &CallContext,
 ) {
     match connection.protocol() {
         ConnectionProtocol::Http1 => {
@@ -868,4 +929,5 @@ fn cleanup_failed_request(
         }
     }
     availability.notify();
+    ctx.listener().connection_released(ctx, connection.id());
 }
