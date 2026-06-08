@@ -22,6 +22,8 @@ blocks, and stable observability hooks.
 - event listeners and stable request / connection observability
 - retries, redirects, cookies, and origin / proxy authentication follow-ups
   with structured HTTP authentication challenge parsing
+- HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
+  replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
   bridge normalization or network I/O
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
@@ -98,6 +100,7 @@ let response = client
     .new_call(request)
     .call_timeout(Duration::from_secs(2))
     .connect_timeout(Duration::from_millis(250))
+    .max_retries(1)
     .follow_redirects(false)
     .execute()
     .await?;
