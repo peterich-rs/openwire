@@ -3037,6 +3037,309 @@ async fn shared_client_coalesces_https_http2_connections_across_verified_authori
 }
 
 #[tokio::test]
+async fn coalesced_http2_421_retries_without_coalescing() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], move |request| {
+        let handler_attempts = handler_attempts.clone();
+        async move {
+            match request.uri().path() {
+                "/first" => ok_text("first h2"),
+                "/second" => {
+                    let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected")
+                    } else {
+                        ok_text("second h2")
+                    }
+                }
+                _ => text_response(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response_one.version(), Version::HTTP_2);
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_one.into_body().text().await.expect("body");
+    assert_eq!(body, "first h2");
+
+    let response_two = client
+        .execute(empty_request(format!(
+            "https://b.test:{}/second",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response_two.status(), StatusCode::OK);
+    assert_eq!(response_two.version(), Version::HTTP_2);
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_two.into_body().text().await.expect("body");
+
+    assert_eq!(body, "second h2");
+    assert_ne!(connection_one, connection_two);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let events = events.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "retry 1 misdirected_request"),
+        "events = {events:?}",
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("connect_end "))
+            .count(),
+        2,
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn non_coalesced_http2_421_is_returned() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = spawn_https_http2_with_hosts(&["a.test"], move |_request| {
+        let handler_attempts = handler_attempts.clone();
+        async move {
+            handler_attempts.fetch_add(1, Ordering::SeqCst);
+            text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected")
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([("a.test".to_owned(), server.addr())]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/misdirected",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "misdirected");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.contains("misdirected_request")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn coalesced_http2_421_does_not_retry_streaming_body() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], move |request| {
+        let handler_attempts = handler_attempts.clone();
+        async move {
+            match request.uri().path() {
+                "/first" => ok_text("first h2"),
+                "/streaming" => {
+                    let _ = collect_request_body(request).await;
+                    handler_attempts.fetch_add(1, Ordering::SeqCst);
+                    text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected")
+                }
+                _ => text_response(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let stream = stream::iter(vec![Ok::<Bytes, WireError>(Bytes::from_static(
+        b"streaming body",
+    ))]);
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("https://b.test:{}/streaming", server.addr().port()))
+        .body(RequestBody::from_stream(stream))
+        .expect("request");
+    let response_two = client.execute(request).await.expect("response");
+    assert_eq!(response_two.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(response_two.version(), Version::HTTP_2);
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_two.into_body().text().await.expect("body");
+
+    assert_eq!(body, "misdirected");
+    assert_eq!(connection_one, connection_two);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.contains("misdirected_request")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn coalesced_http2_421_respects_max_retries() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], move |request| {
+        let handler_attempts = handler_attempts.clone();
+        async move {
+            match request.uri().path() {
+                "/first" => ok_text("first h2"),
+                "/second" => {
+                    handler_attempts.fetch_add(1, Ordering::SeqCst);
+                    text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected")
+                }
+                _ => text_response(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .max_retries(0)
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let response_two = client
+        .execute(empty_request(format!(
+            "https://b.test:{}/second",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response_two.status(), StatusCode::MISDIRECTED_REQUEST);
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_two.into_body().text().await.expect("body");
+
+    assert_eq!(body, "misdirected");
+    assert_eq!(connection_one, connection_two);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.contains("misdirected_request")),
+        "events = {events:?}",
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("connect_end "))
+            .count(),
+        1,
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
 async fn http2_send_path_strips_connection_specific_request_headers() {
     #[derive(Debug, PartialEq, Eq)]
     struct HeaderSnapshot {

@@ -7,7 +7,9 @@ mod service;
 pub(crate) use connect::ConnectorStack;
 #[cfg(feature = "websocket")]
 pub(crate) use connect::{connect_route_plan, ProxyConnectDeps};
-pub(crate) use service::{TransportService, TransportServiceInit};
+pub(crate) use service::{
+    CoalescedConnectionRetryable, NoCoalescedConnections, TransportService, TransportServiceInit,
+};
 
 #[cfg(test)]
 mod tests;
