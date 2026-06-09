@@ -60,7 +60,7 @@ where
             let mut validation_entry = None;
             if let Some(cache_key) = cache_key.as_ref() {
                 for entry in store.get_candidates(cache_key).await.into_iter().rev() {
-                    if entry.matches_request(&request_headers) {
+                    if entry.matches_request(&request_policy, &request_headers) {
                         if request_policy.lookup && entry.is_servable_for(&request_policy) {
                             return Ok(entry.into_response());
                         }
@@ -96,7 +96,7 @@ where
                 return Ok(response);
             };
 
-            if let Some(entry) = validation_entry {
+            if let Some(entry) = validation_entry.as_ref() {
                 if response.status() == StatusCode::NOT_MODIFIED {
                     let (parts, body) = response.into_parts();
                     let _ = body.bytes().await?;
@@ -105,7 +105,7 @@ where
                     if store_response {
                         store.put_candidate(cache_key, freshened.clone()).await;
                     } else {
-                        store.remove(&cache_key).await;
+                        store.remove_candidate(&cache_key, entry).await;
                     }
                     return Ok(freshened.into_response());
                 }
@@ -118,7 +118,14 @@ where
             let (parts, body) = response.into_parts();
             let response_directives = CacheDirectives::from_headers(&parts.headers);
             if response_directives.no_store {
-                store.remove(&cache_key).await;
+                remove_unusable_candidate(
+                    store.as_ref(),
+                    &cache_key,
+                    validation_entry.as_ref(),
+                    &request_policy,
+                    &request_headers,
+                )
+                .await;
                 return Ok(Response::from_parts(parts, body));
             }
 
@@ -132,17 +139,35 @@ where
                 &response_directives,
                 &validators,
                 freshness_lifetime,
+                request_policy.has_authorization,
             ) {
                 if parts.status == StatusCode::OK {
-                    store.remove(&cache_key).await;
+                    remove_unusable_candidate(
+                        store.as_ref(),
+                        &cache_key,
+                        validation_entry.as_ref(),
+                        &request_policy,
+                        &request_headers,
+                    )
+                    .await;
                 }
                 return Ok(Response::from_parts(parts, body));
             }
 
-            let Some(vary) = CapturedVary::capture(&parts.headers, &request_headers) else {
-                store.remove(&cache_key).await;
+            let Some(mut vary) = CapturedVary::capture(&parts.headers, &request_headers) else {
+                remove_unusable_candidate(
+                    store.as_ref(),
+                    &cache_key,
+                    validation_entry.as_ref(),
+                    &request_policy,
+                    &request_headers,
+                )
+                .await;
                 return Ok(Response::from_parts(parts, body));
             };
+            if request_policy.has_authorization {
+                vary.include_request_header(AUTHORIZATION, &request_headers);
+            }
 
             let body = body.bytes().await?;
             let cached_headers = parts.headers.clone();
@@ -177,6 +202,7 @@ where
 #[derive(Clone, Debug, Default)]
 struct RequestCachePolicy {
     is_cacheable: bool,
+    has_authorization: bool,
     lookup: bool,
     store_response: bool,
     only_if_cached: bool,
@@ -187,10 +213,12 @@ struct RequestCachePolicy {
 
 #[derive(Clone, Debug, Default)]
 struct CacheDirectives {
+    public: bool,
     no_cache: bool,
     no_store: bool,
     only_if_cached: bool,
     max_age: Option<Duration>,
+    s_maxage: Option<Duration>,
     max_stale: Option<MaxStale>,
     min_fresh: Option<Duration>,
     must_revalidate: bool,
@@ -231,6 +259,7 @@ impl CacheDirectives {
 
             for directive in cache_control_directives(value) {
                 match directive.name.as_str() {
+                    "public" => out.public = true,
                     "no-cache" => out.no_cache = true,
                     "no-store" => out.no_store = true,
                     "only-if-cached" => out.only_if_cached = true,
@@ -240,6 +269,13 @@ impl CacheDirectives {
                             directive.value.as_deref().and_then(parse_delta_seconds)
                         {
                             out.max_age = Some(value);
+                        }
+                    }
+                    "s-maxage" => {
+                        if let Some(value) =
+                            directive.value.as_deref().and_then(parse_delta_seconds)
+                        {
+                            out.s_maxage = Some(value);
                         }
                     }
                     "max-stale" => match directive.value.as_deref() {
@@ -273,9 +309,9 @@ struct CacheDirective {
 
 fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
     let directives = request_cache_directives(request.headers());
-    let is_cacheable = request.method() == Method::GET
-        && request.body().replayable_len() == Some(0)
-        && !request.headers().contains_key(AUTHORIZATION);
+    let has_authorization = request.headers().contains_key(AUTHORIZATION);
+    let is_cacheable =
+        request.method() == Method::GET && request.body().replayable_len() == Some(0);
     let lookup = is_cacheable
         && !directives.no_cache
         && (!directives.max_age.is_some_and(|max_age| max_age.is_zero())
@@ -283,6 +319,7 @@ fn request_cache_policy(request: &Request<RequestBody>) -> RequestCachePolicy {
 
     RequestCachePolicy {
         is_cacheable,
+        has_authorization,
         lookup,
         store_response: is_cacheable && !directives.no_store,
         only_if_cached: is_cacheable && directives.only_if_cached,
@@ -337,6 +374,22 @@ impl CapturedVary {
             }
         }
         Some(Self { fields })
+    }
+
+    fn include_request_header(&mut self, name: HeaderName, request_headers: &HeaderMap) {
+        if let Some(field) = self.fields.iter_mut().find(|field| field.name == name) {
+            field.values = request_headers.get_all(&name).iter().cloned().collect();
+            return;
+        }
+
+        self.fields.push(VaryField {
+            values: request_headers.get_all(&name).iter().cloned().collect(),
+            name,
+        });
+    }
+
+    fn tracks_request_header(&self, name: HeaderName) -> bool {
+        self.fields.iter().any(|field| field.name == name)
     }
 
     fn matches(&self, request_headers: &HeaderMap) -> bool {
@@ -402,6 +455,11 @@ pub trait CacheStore: Send + Sync + 'static {
     async fn put_candidate(&self, key: String, value: CachedResponse) {
         self.put(key, value).await;
     }
+
+    async fn remove_candidate(&self, key: &str, value: &CachedResponse) {
+        let _ = value;
+        self.remove(key).await;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -446,6 +504,17 @@ impl CacheStore for MemoryCacheStore {
             *existing = value;
         } else {
             candidates.push(value);
+        }
+    }
+
+    async fn remove_candidate(&self, key: &str, value: &CachedResponse) {
+        let mut entries = self.entries.write().await;
+        let Some(candidates) = entries.get_mut(key) else {
+            return;
+        };
+        candidates.retain(|candidate| !candidate.same_variant_as(value));
+        if candidates.is_empty() {
+            entries.remove(key);
         }
     }
 }
@@ -572,7 +641,14 @@ impl CachedResponse {
         }
     }
 
-    fn matches_request(&self, request_headers: &HeaderMap) -> bool {
+    fn matches_request(
+        &self,
+        request_policy: &RequestCachePolicy,
+        request_headers: &HeaderMap,
+    ) -> bool {
+        if request_policy.has_authorization && !self.vary.tracks_request_header(AUTHORIZATION) {
+            return false;
+        }
         self.vary.matches(request_headers)
     }
 
@@ -606,7 +682,12 @@ impl CachedResponse {
         let validators = CacheValidators::from_headers(&headers);
         let freshness_lifetime =
             response_freshness_lifetime(&headers, &directives).unwrap_or_default();
-        let vary = CapturedVary::capture(&headers, request_headers);
+        let mut vary = CapturedVary::capture(&headers, request_headers);
+        if let Some(vary) = vary.as_mut() {
+            if self.vary.tracks_request_header(AUTHORIZATION) {
+                vary.include_request_header(AUTHORIZATION, request_headers);
+            }
+        }
         let store_response = vary.is_some()
             && response_is_storable(
                 &headers,
@@ -614,6 +695,7 @@ impl CachedResponse {
                 &directives,
                 &validators,
                 freshness_lifetime,
+                request_headers.contains_key(AUTHORIZATION),
             );
         let response = Self::new_with_vary(
             self.status,
@@ -650,12 +732,44 @@ fn response_is_storable(
     directives: &CacheDirectives,
     validators: &CacheValidators,
     freshness_lifetime: Duration,
+    request_has_authorization: bool,
 ) -> bool {
     status == StatusCode::OK
         && !headers.contains_key(SET_COOKIE)
         && !directives.no_store
+        && (!request_has_authorization || response_allows_authorized_storage(directives))
         && (!directives.no_cache || validators.has_any())
         && (!freshness_lifetime.is_zero() || validators.has_any())
+}
+
+fn response_allows_authorized_storage(directives: &CacheDirectives) -> bool {
+    directives.public || directives.s_maxage.is_some() || directives.must_revalidate
+}
+
+async fn remove_unusable_candidate<S>(
+    store: &S,
+    cache_key: &str,
+    validation_entry: Option<&CachedResponse>,
+    request_policy: &RequestCachePolicy,
+    request_headers: &HeaderMap,
+) where
+    S: CacheStore,
+{
+    if request_policy.has_authorization {
+        if let Some(entry) = validation_entry {
+            store.remove_candidate(cache_key, entry).await;
+            return;
+        }
+
+        for entry in store.get_candidates(cache_key).await {
+            if entry.matches_request(request_policy, request_headers) {
+                store.remove_candidate(cache_key, &entry).await;
+            }
+        }
+        return;
+    }
+
+    store.remove(cache_key).await;
 }
 
 fn request_method_invalidates_cache(method: &Method) -> bool {

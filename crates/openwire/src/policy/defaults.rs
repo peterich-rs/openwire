@@ -320,7 +320,8 @@ impl RedirectPolicy for DefaultRedirectPolicy {
 fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::MOVED_PERMANENTLY
+        StatusCode::MULTIPLE_CHOICES
+            | StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::SEE_OTHER
             | StatusCode::TEMPORARY_REDIRECT
@@ -428,6 +429,27 @@ mod tests {
                 describe_decision(other)
             ),
         }
+    }
+
+    #[test]
+    fn default_redirect_policy_follows_multiple_choices_with_location() {
+        let policy = DefaultRedirectPolicy::default();
+        let method = Method::GET;
+        let current = "http://example.test/start".parse().expect("current uri");
+        let location = "http://example.test/choice".parse().expect("location");
+        let ctx = RedirectContext::new(
+            &method,
+            &current,
+            http::StatusCode::MULTIPLE_CHOICES,
+            &location,
+            0,
+            true,
+        );
+
+        assert!(matches!(
+            policy.should_redirect(&ctx),
+            RedirectDecision::Follow
+        ));
     }
 
     fn describe_decision(decision: RedirectDecision) -> &'static str {

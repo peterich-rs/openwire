@@ -193,9 +193,15 @@ for private in-process caching: request `Cache-Control` directives such as
 `no-cache`, `no-store`, `max-age=0`, `max-stale`, `min-fresh`, and
 `only-if-cached`, plus HTTP/1.0-compatible request `Pragma: no-cache` when
 `Cache-Control` is absent; response `max-age`, `must-revalidate`, `no-cache`,
-`no-store`, `Expires`, `Date` apparent age, Last-Modified heuristic freshness,
-`Age`, invalid duplicate freshness fields, and `Vary` matching, including
-multiple stored variants per URI. It also
+`no-store`, `public`, `s-maxage`, `Expires`, `Date` apparent age,
+Last-Modified heuristic freshness, `Age`, invalid duplicate freshness fields,
+and `Vary` matching, including multiple stored variants per URI. Responses to
+authenticated requests are stored only when `public`, `s-maxage`, or
+`must-revalidate` explicitly permits it; stored authenticated responses also
+require the original `Authorization` value to match, even when the server does
+not include `Authorization` in `Vary`. Because this is a private cache,
+`s-maxage` is treated as an authenticated-storage permit rather than as a
+private freshness override. It also
 revalidates stale stored responses that carry `ETag` or `Last-Modified`
 validators, refreshing stored metadata on `304 Not Modified` before returning
 the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
@@ -250,6 +256,10 @@ follow-ups (pool reuse, interceptor chain integration).
   only retries replayable `408 Request Timeout` responses and `503 Service
   Unavailable` responses that explicitly carry `Retry-After: 0`; delayed,
   invalid, or duplicate `Retry-After` values remain caller-visible responses.
+  Default redirect handling follows `300`, `301`, `302`, `303`, `307`, and `308`
+  responses when a valid `Location` is present and policy permits it.
+  Preserve-method redirects (`307` / `308`) require a replayable request body;
+  otherwise the original redirect response is returned to the caller.
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
   and HTTP URI authorities that include userinfo before bridge normalization can
   derive `Host` or transport can route the request.
@@ -271,7 +281,10 @@ follow-ups (pool reuse, interceptor chain integration).
   attempt, retry count, redirect count, and logical auth count plus any completed
   CONNECT-local auth retries. The same logical auth budget gates this loop, so
   CONNECT tunnel proxy authentication cannot exceed the per-call
-  `max_auth_attempts` limit by resetting its own local counter.
+  `max_auth_attempts` limit by resetting its own local counter. CONNECT retry
+  headers are sanitized to the synthetic tunnel `Host` plus proxy-authentication
+  headers, so origin auth, cookies, body framing, and other request headers are
+  not forwarded into the proxy tunnel handshake.
 - `Client::execute` owns call cancellation, final call completion, and wraps the
   returned response body so `call_end` / `call_failed` reflect the whole call.
 - `Call::enqueue` is executor-backed dispatch for the same `Call::execute`

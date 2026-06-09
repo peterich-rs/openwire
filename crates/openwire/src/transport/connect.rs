@@ -11,7 +11,7 @@ use futures_util::future::{select, Either};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
-use http::header::HOST;
+use http::header::{HOST, PROXY_AUTHORIZATION};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use hyper::rt::Timer;
 use hyper::Uri;
@@ -520,7 +520,7 @@ pub(super) async fn establish_connect_tunnel(
                 )
                 .with_proxy_addr(params.proxy_addr)
             })?;
-        connect_headers.insert(http::header::PROXY_AUTHORIZATION, value);
+        connect_headers.insert(PROXY_AUTHORIZATION, value);
     }
 
     loop {
@@ -1286,11 +1286,8 @@ fn connect_request_headers(authority: &str, headers: &HeaderMap) -> Result<Heade
 
 fn sanitize_connect_headers(headers: &HeaderMap) -> HeaderMap {
     let mut sanitized = HeaderMap::new();
-    for (name, value) in headers {
-        if *name == HOST {
-            continue;
-        }
-        sanitized.append(name.clone(), value.clone());
+    for value in headers.get_all(PROXY_AUTHORIZATION) {
+        sanitized.append(PROXY_AUTHORIZATION, value.clone());
     }
     sanitized
 }

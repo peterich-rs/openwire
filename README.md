@@ -20,9 +20,10 @@ blocks, and stable observability hooks.
 - application and network interceptors
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
-- retries, redirects, cookies, and origin / proxy authentication follow-ups
-  with structured HTTP authentication challenge parsing, plus immediate
-  response-status retries for replayable `408` and `503 Retry-After: 0`
+- retries, RFC-shaped redirects, cookies, and origin / proxy authentication
+  follow-ups with structured HTTP authentication challenge parsing, plus
+  immediate response-status retries for replayable `408` and
+  `503 Retry-After: 0`
 - HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
   replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
@@ -235,7 +236,10 @@ uses those same logical counters; repeated CONNECT 407 tunnel retries add their
 tunnel-local proxy auth count to the logical auth count before calling the
 authenticator again. `ClientBuilder::max_auth_attempts` is a per-logical-call
 budget, so CONNECT proxy authentication also stops once the logical auth count
-plus completed CONNECT-local retries reaches that limit.
+plus completed CONNECT-local retries reaches that limit. CONNECT retries send
+only the synthetic tunnel `Host` plus proxy-authentication headers; origin
+`Authorization`, cookies, body framing, and other request headers returned by a
+proxy authenticator are not forwarded into the proxy tunnel handshake.
 
 ## Transparent Compression
 
@@ -260,14 +264,18 @@ controls needed to avoid unsafe reuse:
   `max-stale`, `min-fresh`, and `only-if-cached`
 - request `Pragma: no-cache` as an HTTP/1.0 compatibility signal when
   `Cache-Control` is absent
-- response `Cache-Control: max-age`, `must-revalidate`, `no-cache`, and
-  `no-store`
+- response `Cache-Control: public`, `max-age`, `s-maxage`,
+  `must-revalidate`, `no-cache`, and `no-store`
 - `Expires` freshness when `max-age` is absent
 - `Age` reducing remaining `max-age` freshness
 - `Date` apparent age and Last-Modified heuristic freshness when explicit
   freshness is absent
 - multiple stored variants for one URI through `Vary` matching against the
   original request headers, with `Vary: *` treated as not reusable
+- responses to authenticated requests are stored only when `public`,
+  `s-maxage`, or `must-revalidate` explicitly permits it; those entries also
+  require the original `Authorization` value to match even when the server did
+  not include `Authorization` in `Vary`
 - stale stored responses with `ETag` or `Last-Modified` validators are
   revalidated with conditional GET requests, and `304 Not Modified` responses
   refresh stored metadata before returning the cached body as `200 OK`
@@ -279,8 +287,9 @@ controls needed to avoid unsafe reuse:
 - cached hits generate a current `Age` header
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
-responses, skips responses with `Set-Cookie`, skips authenticated requests, and
-does not yet implement stale-if-error or background stale revalidation.
+responses, skips responses with `Set-Cookie`, treats `s-maxage` as an
+authenticated-storage permit rather than private-cache freshness, and does not
+yet implement stale-if-error or background stale revalidation.
 
 ## Default Transport Settings
 

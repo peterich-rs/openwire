@@ -345,6 +345,91 @@ async fn follows_redirects_for_get_requests() {
 }
 
 #[tokio::test]
+async fn follows_multiple_choices_redirect_when_location_is_present() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        match request.uri().path() {
+            "/choices" => Response::builder()
+                .status(StatusCode::MULTIPLE_CHOICES)
+                .header("location", "/chosen")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("redirect response"),
+            "/chosen" => ok_text("chosen"),
+            _ => text_response(StatusCode::NOT_FOUND, "not found"),
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/choices")))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "chosen");
+    assert!(
+        events
+            .events()
+            .iter()
+            .any(|event| event.starts_with("redirect 1 ")),
+        "events = {:?}",
+        events.events()
+    );
+}
+
+#[tokio::test]
+async fn preserve_method_redirect_with_streaming_body_is_returned() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = collect_request_body(request).await;
+            Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(Bytes::from_static(
+                    b"cannot replay",
+                )))
+                .expect("redirect response")
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/streaming-redirect"))
+        .body(RequestBody::from_stream(stream::iter(vec![Ok::<
+            Bytes,
+            WireError,
+        >(
+            Bytes::from_static(b"streaming body"),
+        )])))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "cannot replay");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events.iter().any(|event| event.starts_with("redirect ")),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
 async fn per_request_follow_redirects_override_can_disable_redirects() {
     let server = spawn_http1(|request: Request<Incoming>| async move {
         match request.uri().path() {

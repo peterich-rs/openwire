@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::task::noop_waker_ref;
-use http::header::{HeaderValue, CONNECTION, PROXY_AUTHORIZATION};
+use http::header::{
+    HeaderValue, AUTHORIZATION, CONNECTION, COOKIE, PROXY_AUTHORIZATION, TRANSFER_ENCODING,
+};
 use http::{HeaderMap, Method, Request};
 use hyper::rt::{Read, ReadBuf, Write};
 use hyper::Uri;
@@ -582,9 +584,20 @@ struct ObservedAuthAttempt {
 struct StaticProxyAuthenticator {
     calls: Arc<AtomicUsize>,
     observed_attempts: Arc<Mutex<Vec<ObservedAuthAttempt>>>,
+    extra_headers: Vec<(http::header::HeaderName, HeaderValue)>,
 }
 
 impl StaticProxyAuthenticator {
+    fn with_extra_headers(
+        extra_headers: impl IntoIterator<Item = (http::header::HeaderName, HeaderValue)>,
+    ) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observed_attempts: Arc::new(Mutex::new(Vec::new())),
+            extra_headers: extra_headers.into_iter().collect(),
+        }
+    }
+
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -613,6 +626,7 @@ impl Authenticator for StaticProxyAuthenticator {
                 redirect_count: ctx.redirect_count(),
                 auth_count: ctx.auth_count(),
             });
+        let extra_headers = self.extra_headers.clone();
         Box::pin(async move {
             let mut request = Request::new(RequestBody::empty());
             *request.method_mut() = Method::CONNECT;
@@ -621,6 +635,9 @@ impl Authenticator for StaticProxyAuthenticator {
                 "proxy-authorization",
                 HeaderValue::from_static("Basic dXNlcjpwYXNz"),
             );
+            for (name, value) in extra_headers {
+                request.headers_mut().append(name, value);
+            }
             Ok(Some(request))
         })
     }
@@ -1122,6 +1139,83 @@ async fn connect_tunnel_proxy_auth_context_extends_logical_attempt_counts() {
     first_response.await.expect("first response task");
     second_response.await.expect("second response task");
     third_response.await.expect("third response task");
+}
+
+#[tokio::test]
+async fn connect_tunnel_proxy_auth_retry_sends_only_proxy_headers() {
+    let timer = SharedTimer::new(openwire_tokio::TokioTimer::new());
+    let target_uri: Uri = "https://example.com:443/".parse().expect("target uri");
+    let (initial_stream, mut initial_peer) = duplex_box_connection(1024);
+    let (retry_stream, mut retry_peer) = duplex_box_connection(2048);
+    let retry_connector = QueuedTcpConnector::new([retry_stream]);
+    let authenticator_impl = Arc::new(StaticProxyAuthenticator::with_extra_headers([
+        (AUTHORIZATION, HeaderValue::from_static("Bearer origin")),
+        (COOKIE, HeaderValue::from_static("session=origin")),
+        (CONNECTION, HeaderValue::from_static("keep-alive")),
+        (TRANSFER_ENCODING, HeaderValue::from_static("chunked")),
+    ]));
+    let authenticator = authenticator_impl.clone() as SharedAuthenticator;
+
+    let first_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut initial_peer).await;
+        let request = String::from_utf8(request).expect("CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        initial_peer
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+            )
+            .await
+            .expect("write 407");
+    });
+    let second_response = tokio::spawn(async move {
+        let request = read_until_headers_end(&mut retry_peer).await;
+        let request = String::from_utf8(request).expect("retry CONNECT request utf8");
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(request.contains("Host: example.com:443\r\n"));
+        assert!(request.contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"));
+        assert!(
+            !request.contains("\r\nauthorization:"),
+            "request = {request:?}"
+        );
+        assert!(!request.contains("\r\ncookie:"), "request = {request:?}");
+        assert!(
+            !request.contains("\r\nconnection:"),
+            "request = {request:?}"
+        );
+        assert!(
+            !request.contains("\r\ntransfer-encoding:"),
+            "request = {request:?}"
+        );
+        retry_peer
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .expect("write CONNECT success");
+    });
+
+    let _tunneled = establish_connect_tunnel(ConnectTunnelParams {
+        ctx: make_call_context(),
+        proxy_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+        target_uri: &target_uri,
+        stream: initial_stream,
+        tcp_connector: Arc::new(retry_connector),
+        auth_attempts: AuthAttemptState {
+            total_attempt: 1,
+            retry_count: 0,
+            redirect_count: 0,
+            auth_count: 0,
+        },
+        initial_proxy_credentials: None,
+        proxy_authenticator: Some(authenticator),
+        max_proxy_auth_attempts: 2,
+        budget: ConnectBudget::new(Some(Duration::from_secs(1)), None),
+        timer: timer.clone(),
+    })
+    .await
+    .expect("CONNECT should succeed after proxy auth retry");
+
+    assert_eq!(authenticator_impl.calls(), 1);
+    first_response.await.expect("first response task");
+    second_response.await.expect("second response task");
 }
 
 #[tokio::test]
