@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use http::header::{
-    ACCEPT_LANGUAGE, AGE, CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES, HOST,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, PRAGMA, VARY,
+    ACCEPT_LANGUAGE, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES,
+    HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, PRAGMA, VARY,
 };
 use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
@@ -107,6 +107,409 @@ async fn no_store_responses_are_not_cached() {
     );
 
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn authorized_response_without_explicit_permission_is_not_cached() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = text_response(StatusCode::OK, format!("authorized body {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(request_with_header(
+            server.http_url("/authorized-private"),
+            AUTHORIZATION,
+            "Bearer one",
+        ))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "authorized body 1"
+    );
+
+    let second = client
+        .execute(request_with_header(
+            server.http_url("/authorized-private"),
+            AUTHORIZATION,
+            "Bearer one",
+        ))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "authorized body 2"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn authorized_public_response_is_cached_per_authorization_value() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let authorization = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("anonymous")
+                    .to_owned();
+                let mut response =
+                    text_response(StatusCode::OK, format!("{authorization} hit {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "public, max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/authorized-public");
+
+    let first = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "Bearer one hit 1"
+    );
+
+    let same_token = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("same token response");
+    assert_eq!(
+        same_token.into_body().text().await.expect("body"),
+        "Bearer one hit 1"
+    );
+
+    let different_token = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer two"))
+        .await
+        .expect("different token response");
+    assert_eq!(
+        different_token.into_body().text().await.expect("body"),
+        "Bearer two hit 2"
+    );
+
+    let unauthenticated = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(
+        unauthenticated.into_body().text().await.expect("body"),
+        "anonymous hit 3"
+    );
+
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn authorized_must_revalidate_response_is_stored_and_keeps_authorization_match_after_304() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let authorization = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("anonymous")
+                    .to_owned();
+
+                if hit == 2 {
+                    assert_eq!(authorization, "Bearer one");
+                    assert_eq!(
+                        request.headers().get(IF_NONE_MATCH).expect("if-none-match"),
+                        "\"authorized-v1\""
+                    );
+                    let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                    response.headers_mut().insert(
+                        CACHE_CONTROL,
+                        "public, max-age=60, must-revalidate"
+                            .parse()
+                            .expect("header"),
+                    );
+                    response
+                        .headers_mut()
+                        .insert(ETAG, "\"authorized-v1\"".parse().expect("etag"));
+                    return response;
+                }
+
+                let mut response =
+                    text_response(StatusCode::OK, format!("{authorization} body {hit}"));
+                response.headers_mut().insert(
+                    CACHE_CONTROL,
+                    "max-age=0, must-revalidate".parse().expect("header"),
+                );
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"authorized-v1\"".parse().expect("etag"));
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/authorized-must-revalidate");
+
+    let first = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "Bearer one body 1"
+    );
+
+    let revalidated = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("revalidated response");
+    assert_eq!(revalidated.status(), StatusCode::OK);
+    assert_eq!(
+        revalidated.into_body().text().await.expect("body"),
+        "Bearer one body 1"
+    );
+
+    let cached_after_304 = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("cached response");
+    assert_eq!(
+        cached_after_304.into_body().text().await.expect("body"),
+        "Bearer one body 1"
+    );
+
+    let different_token = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer two"))
+        .await
+        .expect("different token response");
+    assert_eq!(
+        different_token.into_body().text().await.expect("body"),
+        "Bearer two body 3"
+    );
+
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn authorized_request_does_not_reuse_generic_cached_response() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let authorization = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("anonymous")
+                    .to_owned();
+                let mut response =
+                    text_response(StatusCode::OK, format!("{authorization} generic {hit}"));
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "public, max-age=60".parse().expect("header"));
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/generic-then-authorized");
+
+    let first = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "anonymous generic 1"
+    );
+
+    let authorized = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("authorized response");
+    assert_eq!(
+        authorized.into_body().text().await.expect("body"),
+        "Bearer one generic 2"
+    );
+
+    let anonymous_again = client
+        .execute(empty_request(&uri))
+        .await
+        .expect("anonymous cached response");
+    assert_eq!(
+        anonymous_again.into_body().text().await.expect("body"),
+        "anonymous generic 1"
+    );
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn authorized_no_store_response_is_not_cached() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = text_response(StatusCode::OK, format!("no-store auth {hit}"));
+                response.headers_mut().insert(
+                    CACHE_CONTROL,
+                    "public, max-age=60, no-store".parse().expect("header"),
+                );
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/authorized-no-store");
+
+    let first = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "no-store auth 1"
+    );
+
+    let second = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("second response");
+    assert_eq!(
+        second.into_body().text().await.expect("body"),
+        "no-store auth 2"
+    );
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn authorized_no_store_refresh_removes_matching_authorization_variant() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hits = hits.clone();
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let authorization = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("anonymous")
+                    .to_owned();
+                let mut response =
+                    text_response(StatusCode::OK, format!("{authorization} refresh {hit}"));
+                if request.headers().contains_key(CACHE_CONTROL) {
+                    response.headers_mut().insert(
+                        CACHE_CONTROL,
+                        "public, max-age=60, no-store".parse().expect("header"),
+                    );
+                } else {
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "public, max-age=60".parse().expect("header"));
+                }
+                response
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .expect("client");
+    let uri = server.http_url("/authorized-no-store-refresh");
+
+    let first = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("first response");
+    assert_eq!(
+        first.into_body().text().await.expect("body"),
+        "Bearer one refresh 1"
+    );
+
+    let bypass = client
+        .execute(request_with_headers(
+            &uri,
+            AUTHORIZATION,
+            "Bearer one",
+            CACHE_CONTROL,
+            "no-cache",
+        ))
+        .await
+        .expect("bypass response");
+    assert_eq!(
+        bypass.into_body().text().await.expect("body"),
+        "Bearer one refresh 2"
+    );
+
+    let after_no_store = client
+        .execute(request_with_header(&uri, AUTHORIZATION, "Bearer one"))
+        .await
+        .expect("after no-store response");
+    assert_eq!(
+        after_no_store.into_body().text().await.expect("body"),
+        "Bearer one refresh 3"
+    );
+
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

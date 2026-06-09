@@ -193,9 +193,15 @@ for private in-process caching: request `Cache-Control` directives such as
 `no-cache`, `no-store`, `max-age=0`, `max-stale`, `min-fresh`, and
 `only-if-cached`, plus HTTP/1.0-compatible request `Pragma: no-cache` when
 `Cache-Control` is absent; response `max-age`, `must-revalidate`, `no-cache`,
-`no-store`, `Expires`, `Date` apparent age, Last-Modified heuristic freshness,
-`Age`, invalid duplicate freshness fields, and `Vary` matching, including
-multiple stored variants per URI. It also
+`no-store`, `public`, `s-maxage`, `Expires`, `Date` apparent age,
+Last-Modified heuristic freshness, `Age`, invalid duplicate freshness fields,
+and `Vary` matching, including multiple stored variants per URI. Responses to
+authenticated requests are stored only when `public`, `s-maxage`, or
+`must-revalidate` explicitly permits it; stored authenticated responses also
+require the original `Authorization` value to match, even when the server does
+not include `Authorization` in `Vary`. Because this is a private cache,
+`s-maxage` is treated as an authenticated-storage permit rather than as a
+private freshness override. It also
 revalidates stale stored responses that carry `ETag` or `Last-Modified`
 validators, refreshing stored metadata on `304 Not Modified` before returning
 the cached body as `200 OK`. Explicit `max-stale` requests can reuse stale
@@ -245,6 +251,10 @@ follow-ups (pool reuse, interceptor chain integration).
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
+  Default redirect handling follows `300`, `301`, `302`, `303`, `307`, and
+  `308` responses when a valid `Location` is present and policy permits it.
+  Preserve-method redirects (`307` / `308`) require a replayable request body;
+  otherwise the original redirect response is returned to the caller.
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
   and HTTP URI authorities that include userinfo before bridge normalization can
   derive `Host` or transport can route the request.
