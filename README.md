@@ -20,8 +20,8 @@ blocks, and stable observability hooks.
 - application and network interceptors
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
-- retries, redirects, cookies, and origin / proxy authentication follow-ups
-  with structured HTTP authentication challenge parsing
+- retries, RFC-shaped redirects, cookies, and origin / proxy authentication
+  follow-ups with structured HTTP authentication challenge parsing
 - HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
   replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before
