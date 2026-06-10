@@ -6,6 +6,10 @@ use crate::WireError;
 
 pub trait RetryPolicy: Send + Sync + 'static {
     fn should_retry(&self, ctx: &RetryContext<'_>) -> Option<&'static str>;
+
+    fn should_retry_response(&self, _ctx: &ResponseRetryContext<'_>) -> Option<&'static str> {
+        None
+    }
 }
 
 impl<T> RetryPolicy for Arc<T>
@@ -14,6 +18,10 @@ where
 {
     fn should_retry(&self, ctx: &RetryContext<'_>) -> Option<&'static str> {
         (**self).should_retry(ctx)
+    }
+
+    fn should_retry_response(&self, ctx: &ResponseRetryContext<'_>) -> Option<&'static str> {
+        (**self).should_retry_response(ctx)
     }
 }
 
@@ -54,6 +62,59 @@ impl<'a> RetryContext<'a> {
     pub fn request_method(&self) -> &'a Method {
         self.request_method
     }
+}
+
+pub struct ResponseRetryContext<'a> {
+    response_status: StatusCode,
+    retry_count: u32,
+    is_body_replayable: bool,
+    request_method: &'a Method,
+    retry_after: Option<RetryAfter>,
+}
+
+impl<'a> ResponseRetryContext<'a> {
+    pub fn new(
+        response_status: StatusCode,
+        retry_count: u32,
+        is_body_replayable: bool,
+        request_method: &'a Method,
+        retry_after: Option<RetryAfter>,
+    ) -> Self {
+        Self {
+            response_status,
+            retry_count,
+            is_body_replayable,
+            request_method,
+            retry_after,
+        }
+    }
+
+    pub fn response_status(&self) -> StatusCode {
+        self.response_status
+    }
+
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    pub fn is_body_replayable(&self) -> bool {
+        self.is_body_replayable
+    }
+
+    pub fn request_method(&self) -> &'a Method {
+        self.request_method
+    }
+
+    pub fn retry_after(&self) -> Option<RetryAfter> {
+        self.retry_after
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryAfter {
+    Immediate,
+    Delayed,
+    Invalid,
 }
 
 pub trait RedirectPolicy: Send + Sync + 'static {

@@ -2537,6 +2537,166 @@ async fn retry_follow_up_preserves_request_extensions() {
 }
 
 #[tokio::test]
+async fn request_timeout_response_retries_replayable_request() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |_request| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            let attempt = server_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                text_response(StatusCode::REQUEST_TIMEOUT, "timeout")
+            } else {
+                ok_text("retry ok")
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/request-timeout")))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+
+    assert_eq!(body, "retry ok");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        events
+            .events()
+            .iter()
+            .any(|event| event == "retry 1 http_408"),
+        "events = {:?}",
+        events.events()
+    );
+}
+
+#[tokio::test]
+async fn service_unavailable_retries_only_with_immediate_retry_after() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            match request.uri().path() {
+                "/immediate" => {
+                    let attempt = server_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("retry-after", "0")
+                            .body(http_body_util::Full::new(Bytes::from_static(b"busy")))
+                            .expect("response")
+                    } else {
+                        ok_text("retry ok")
+                    }
+                }
+                "/delayed" => Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("retry-after", "1")
+                    .body(http_body_util::Full::new(Bytes::from_static(b"busy")))
+                    .expect("response"),
+                _ => text_response(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(server.http_url("/immediate")))
+        .await
+        .expect("response");
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "retry ok");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        events
+            .events()
+            .iter()
+            .any(|event| event == "retry 1 http_503"),
+        "events = {:?}",
+        events.events()
+    );
+
+    let response = client
+        .execute(empty_request(server.http_url("/delayed")))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "busy");
+}
+
+#[tokio::test]
+async fn response_status_retries_respect_replayability_and_max_retries() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            let _ = collect_request_body(request).await;
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            text_response(StatusCode::REQUEST_TIMEOUT, "timeout")
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/streaming-timeout"))
+        .body(RequestBody::from_stream(stream::iter(vec![Ok::<
+            Bytes,
+            WireError,
+        >(
+            Bytes::from_static(b"streaming body"),
+        )])))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let _ = response.into_body().text().await.expect("body");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events.iter().any(|event| event == "retry 1 http_408"),
+        "events = {events:?}",
+    );
+
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .max_retries(0)
+        .build()
+        .expect("client");
+    let response = client
+        .execute(empty_request(server.http_url("/max-retries-zero")))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let _ = response.into_body().text().await.expect("body");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let events = events.events();
+    assert!(
+        !events.iter().any(|event| event == "retry 1 http_408"),
+        "events = {events:?}",
+    );
+}
+
+#[tokio::test]
 async fn declining_proxy_authenticator_returns_407_response() {
     let proxy =
         spawn_proxy_requiring_authorization("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0").await;

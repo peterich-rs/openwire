@@ -175,7 +175,7 @@ These are the intended customization points:
 | `EventListener` / `EventListenerFactory` | call-level and transport-level observability |
 | `CookieJar` | request cookie application and response cookie persistence |
 | `Authenticator` | origin and proxy authentication follow-ups, with `AuthContext::challenges()` exposing RFC 9110 / RFC 7235 `WWW-Authenticate` and `Proxy-Authenticate` challenges |
-| `RetryPolicy` | retry decisions |
+| `RetryPolicy` | connection-failure and response-status retry decisions |
 | `RedirectPolicy` | redirect decisions |
 | `ProxySelector` | per-attempt ordered proxy candidate resolution |
 | `DnsResolver` | host resolution |
@@ -251,8 +251,13 @@ follow-ups (pool reuse, interceptor chain integration).
 ## 6. Operating Rules
 
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
-  Default redirect handling follows `300`, `301`, `302`, `303`, `307`, and
-  `308` responses when a valid `Location` is present and policy permits it.
+  Response-status retries are policy decisions after cookie persistence and
+  authentication handling and before redirect handling. The default retry policy
+  only retries replayable `408 Request Timeout` responses and `503 Service
+  Unavailable` responses that explicitly carry `Retry-After: 0`; delayed,
+  invalid, or duplicate `Retry-After` values remain caller-visible responses.
+  Default redirect handling follows `300`, `301`, `302`, `303`, `307`, and `308`
+  responses when a valid `Location` is present and policy permits it.
   Preserve-method redirects (`307` / `308`) require a replayable request body;
   otherwise the original redirect response is returned to the caller.
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,

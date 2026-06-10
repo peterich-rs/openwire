@@ -391,17 +391,21 @@ Deliverables:
 
 ### Phase 4: Expand retry inputs
 
-Status: Partially completed on 2026-03-27
+Status: Partially completed on 2026-06-08
 
 Goals:
 
 - let retry policy inspect stable metadata instead of message strings
 - add request method immediately
 - add request-commitment signals only when transport code can assert them
+- expose response-status retry context for follow-up decisions that are not
+  represented as transport errors
 
 Deliverables:
 
 - richer `RetryContext`
+- `ResponseRetryContext` for response-status follow-ups such as `408` and
+  immediate `503 Retry-After`
 - retry-policy tests covering idempotency and request commitment
 
 ### Phase 5: Improve extension attribution

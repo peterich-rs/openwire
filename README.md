@@ -21,7 +21,9 @@ blocks, and stable observability hooks.
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
 - retries, RFC-shaped redirects, cookies, and origin / proxy authentication
-  follow-ups with structured HTTP authentication challenge parsing
+  follow-ups with structured HTTP authentication challenge parsing, plus
+  immediate response-status retries for replayable `408` and
+  `503 Retry-After: 0`
 - HTTP/2 coalesced-connection `421 Misdirected Request` recovery for
   replayable requests
 - request validation rejects HTTP URI authorities that include userinfo before

@@ -29,7 +29,10 @@ pub use event::{
 pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,
 };
-pub use policy::{RedirectContext, RedirectDecision, RedirectPolicy, RetryContext, RetryPolicy};
+pub use policy::{
+    RedirectContext, RedirectDecision, RedirectPolicy, ResponseRetryContext, RetryAfter,
+    RetryContext, RetryPolicy,
+};
 pub use runtime::{BoxTaskHandle, HyperExecutor, SharedTimer, TaskHandle, WireExecutor};
 pub use transport::{
     BoxConnection, BoxDnsService, BoxTcpService, BoxTlsService, CoalescingInfo, Connected,

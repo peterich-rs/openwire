@@ -37,6 +37,7 @@ futures-util = { workspace = true, features = ["io"] }
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
+httpdate.workspace = true
 hyper.workspace = true
 openwire-core.workspace = true
 openwire-tokio.workspace = true
