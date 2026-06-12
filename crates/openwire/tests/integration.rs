@@ -4949,6 +4949,43 @@ async fn bridge_interceptor_omits_content_length_for_absent_requests_before_netw
 }
 
 #[tokio::test]
+async fn bridge_interceptor_sends_synthesized_host_on_raw_http11_wire() {
+    let observed_request = Arc::new(Mutex::new(None));
+    let server = spawn_raw_http1_host_guard(observed_request.clone()).await;
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/raw-host",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "host ok");
+
+    let request = observed_request
+        .lock()
+        .expect("observed request")
+        .clone()
+        .expect("observed request");
+    assert!(
+        request.starts_with("GET /raw-host HTTP/1.1\r\n"),
+        "request should use HTTP/1.1 origin-form after transport binding: {request:?}",
+    );
+    assert!(
+        request.lines().any(|line| {
+            line.eq_ignore_ascii_case(&format!("host: openwire.test:{}", server.addr().port()))
+        }),
+        "request should include the bridge-synthesized Host header: {request:?}",
+    );
+}
+
+#[tokio::test]
 async fn bridge_interceptor_normalizes_empty_requests_before_network_interceptors() {
     let observed_server_request = Arc::new(Mutex::new(None));
     let observed_server_request_clone = observed_server_request.clone();
@@ -6653,6 +6690,66 @@ async fn spawn_raw_http1_headers_then_stall_body(delay: Duration) -> RawHttpServ
                         .await;
                     let _ = stream.flush().await;
                     tokio::time::sleep(delay).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_raw_http1_host_guard(observed_request: Arc<Mutex<Option<String>>>) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut shutdown_rx => {}
+            accepted = listener.accept() => {
+                if let Ok((mut stream, _)) = accepted {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 256];
+                    let deadline = tokio::time::sleep(Duration::from_millis(500));
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            _ = &mut deadline => break,
+                            read = stream.read(&mut buffer) => {
+                                let Ok(bytes_read) = read else {
+                                    break;
+                                };
+                                if bytes_read == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..bytes_read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    let has_host = request
+                        .lines()
+                        .any(|line| line.to_ascii_lowercase().starts_with("host: "));
+                    *observed_request.lock().expect("observed request") = Some(request);
+
+                    let response = if has_host {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhost ok"
+                            .as_slice()
+                    } else {
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmissing host"
+                            .as_slice()
+                    };
+                    let _ = stream.write_all(response).await;
                     let _ = stream.shutdown().await;
                 }
             }
