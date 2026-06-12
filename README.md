@@ -65,15 +65,15 @@ keeps the client API and higher-level policy / planning surfaces.
 
 ## Installation
 
-The first planned crates.io release is `0.1.0`:
+The next planned crates.io release is `0.1.1`:
 
 ```toml
 [dependencies]
-openwire = "0.1.0"
+openwire = "0.1.1"
 ```
 
 Optional companion crates are published with the same workspace version, for
-example `openwire-cache = "0.1.0"` or `openwire-tungstenite = "0.1.0"`.
+example `openwire-cache = "0.1.1"` or `openwire-tungstenite = "0.1.1"`.
 Release and versioning steps are documented in `docs/release-process.md`.
 
 ## Quick Start
