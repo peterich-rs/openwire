@@ -1,8 +1,8 @@
 # Release Process
 
 OpenWire publishes the user-facing crates through crates.io so downstream users
-can depend on standard registry versions instead of Git source paths. The first
-planned release is `0.1.0`.
+can depend on standard registry versions instead of Git source paths. The next
+planned release is `0.1.1`.
 
 ## Published Crates
 
@@ -67,19 +67,24 @@ After the release PR is merged:
 1. Create and push a release tag that matches the workspace version:
 
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
 
-2. Run the `Publish Crates` GitHub Actions workflow on that tag with
-   `version=0.1.0` and `dry_run=false`.
+2. Pushing the `v0.1.1` tag automatically runs the `Publish Crates` GitHub
+   Actions workflow as a real publish.
 
-The workflow refuses to publish unless it is running on `refs/tags/v<version>`.
-It publishes crates in dependency order and waits for each version to become
-visible through Cargo before publishing the next dependent crate.
+Create the release tag only after the release PR has merged. If the intended tag
+already exists on an older commit, delete and recreate it on the release commit
+or choose a new version instead.
 
-The same workflow can be run with `dry_run=true` on a branch or tag to execute
-the package preflight without requiring a crates.io token.
+For tag pushes, the workflow derives the publish version from
+`refs/tags/v<version>` and refuses to publish if it does not match the workspace
+version. It publishes crates in dependency order and waits for each version to
+become visible through Cargo before publishing the next dependent crate.
+
+The same workflow can still be run manually with `dry_run=true` on a branch or
+tag to execute the package preflight without requiring a crates.io token.
 
 ## Resuming a Partial Publish
 
@@ -91,7 +96,7 @@ the time reported by crates.io and rerun `Publish Crates` from `main` with:
 - `dry_run=false`
 - `start_at` set to the first crate that did not publish
 
-For example, if the first five `0.1.0` crates published and the rate limit
+For example, if the first five `0.1.1` crates published and the rate limit
 stopped at `openwire-fastwebsockets`, rerun with
 `start_at=openwire-fastwebsockets`. The workflow only allows non-tag publishing
 when `start_at` is set and the ref is `main`.
@@ -101,10 +106,10 @@ when `start_at` is set and the ref is `main`.
 After the workflow finishes, verify the registry and downstream install path:
 
 ```sh
-cargo info openwire@0.1.0
+cargo info openwire@0.1.1
 tmpdir="$(mktemp -d)"
 cd "$tmpdir"
 cargo init --bin
-cargo add openwire@0.1.0
+cargo add openwire@0.1.1
 cargo check
 ```

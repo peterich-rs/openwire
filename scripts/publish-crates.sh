@@ -96,10 +96,21 @@ else
   selected_publish_order=("${publish_order[@]}")
 fi
 
-cargo_args=()
-if [[ "$allow_dirty" -eq 1 ]]; then
-  cargo_args+=(--allow-dirty)
-fi
+cargo_package() {
+  if [[ "$allow_dirty" -eq 1 ]]; then
+    cargo package "$@" --allow-dirty
+  else
+    cargo package "$@"
+  fi
+}
+
+cargo_publish() {
+  if [[ "$allow_dirty" -eq 1 ]]; then
+    cargo publish "$@" --allow-dirty
+  else
+    cargo publish "$@"
+  fi
+}
 
 crate_version() {
   cargo pkgid -p "$1" | sed 's/.*#//'
@@ -165,14 +176,14 @@ fi
 for crate in "${selected_publish_order[@]}"; do
   echo "==> ${mode}: ${crate}"
   if [[ "$mode" == "dry-run" ]]; then
-    cargo package -p "$crate" --list "${cargo_args[@]}" >/dev/null
+    cargo_package -p "$crate" --list >/dev/null
     if [[ "$crate" == "openwire-core" ]]; then
-      cargo package -p "$crate" --no-verify "${cargo_args[@]}"
+      cargo_package -p "$crate" --no-verify
     else
       echo "checked package file list; tarball packaging waits for staged registry dependencies"
     fi
   else
-    cargo publish -p "$crate" "${cargo_args[@]}"
+    cargo_publish -p "$crate"
     if [[ "$wait_for_registry" -eq 1 ]]; then
       wait_until_visible "$crate" "$workspace_version"
     fi
