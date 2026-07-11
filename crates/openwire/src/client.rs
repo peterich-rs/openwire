@@ -17,8 +17,7 @@ use openwire_core::{
     RequestBody, ResponseBody, RetryPolicy, SharedEventListenerFactory, SharedInterceptor,
     SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
-use openwire_tokio::{SystemDnsResolver, TokioExecutor, TokioTcpConnector, TokioTimer};
-use pin_project_lite::pin_project;
+use openwire_tokio::{CachingDnsResolver, TokioExecutor, TokioTcpConnector, TokioTimer};
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
 use tower::Service;
@@ -572,7 +571,7 @@ impl Default for ClientBuilder {
                 retry: RetryPolicyConfig::default(),
                 redirect: RedirectPolicyConfig::default(),
             },
-            dns_resolver: Arc::new(SystemDnsResolver),
+            dns_resolver: Arc::new(CachingDnsResolver::system()),
             tcp_connector: Arc::new(TokioTcpConnector),
             tls_connector: None,
             route_planner: Arc::new(DefaultRoutePlanner::default()),
@@ -987,32 +986,36 @@ impl QueuedCall {
     }
 }
 
+/// Held on the response so admission capacity stays reserved for the body
+/// lifetime without an extra `BoxBody` wrapper layer.
+// RequestAdmissionPermit is not Clone; store behind Arc so it can live in
+// response extensions until call lifecycle takes ownership.
+#[derive(Clone)]
+pub(crate) struct HeldRequestAdmission(pub(crate) std::sync::Arc<RequestAdmissionPermit>);
+
 pub(crate) fn attach_request_admission(
-    response: Response<ResponseBody>,
+    mut response: Response<ResponseBody>,
     permit: RequestAdmissionPermit,
 ) -> Response<ResponseBody> {
-    let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        ResponseBody::new(
-            RequestAdmissionBody {
-                inner: body,
-                _permit: Some(permit),
-            }
-            .boxed(),
-        ),
-    )
+    response
+        .extensions_mut()
+        .insert(HeldRequestAdmission(std::sync::Arc::new(permit)));
+    response
 }
 
 fn attach_call_lifecycle(
-    response: Response<ResponseBody>,
+    mut response: Response<ResponseBody>,
     ctx: CallContext,
     state: Arc<CallState>,
 ) -> Response<ResponseBody> {
+    let admission = response
+        .extensions_mut()
+        .remove::<HeldRequestAdmission>()
+        .map(|held| held.0);
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        ResponseBody::new(CallLifecycleBody::new(body, ctx, state).boxed()),
+        ResponseBody::new(CallLifecycleBody::new(body, ctx, state, admission).boxed()),
     )
 }
 
@@ -1338,15 +1341,23 @@ struct CallLifecycleBody {
     inner: Option<ResponseBody>,
     ctx: CallContext,
     state: Arc<CallState>,
+    /// Keeps request admission capacity reserved until the body completes.
+    _admission: Option<std::sync::Arc<RequestAdmissionPermit>>,
     finished: bool,
 }
 
 impl CallLifecycleBody {
-    fn new(inner: ResponseBody, ctx: CallContext, state: Arc<CallState>) -> Self {
+    fn new(
+        inner: ResponseBody,
+        ctx: CallContext,
+        state: Arc<CallState>,
+        admission: Option<std::sync::Arc<RequestAdmissionPermit>>,
+    ) -> Self {
         Self {
             inner: Some(inner),
             ctx,
             state,
+            _admission: admission,
             finished: false,
         }
     }
@@ -1437,34 +1448,6 @@ impl Body for CallLifecycleBody {
         self.inner
             .as_ref()
             .map_or_else(SizeHint::default, http_body::Body::size_hint)
-    }
-}
-
-pin_project! {
-    struct RequestAdmissionBody {
-        #[pin]
-        inner: ResponseBody,
-        _permit: Option<RequestAdmissionPermit>,
-    }
-}
-
-impl Body for RequestAdmissionBody {
-    type Data = Bytes;
-    type Error = WireError;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }
 

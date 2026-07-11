@@ -345,3 +345,23 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 - Transparent decompression failures mark the call for connection discard so
   HTTP/2 connections are not returned to the pool as healthy after a body error.
 
+## Performance notes
+
+- The connection pool is sharded by address hash (`32` shards) so concurrent
+  acquire/release for different hosts does not serialize on one global mutex.
+  HTTP/2 coalescing still uses a shared index keyed by direct route target.
+- Dual-stack route plans share a single `Arc<Address>` across candidate routes
+  instead of cloning the full address key per IP.
+- Follow-up `RequestSnapshot` stores headers and extensions behind `Arc` so
+  auth challenge construction and retry rebuilds avoid re-cloning large maps
+  when only metadata is inspected.
+- `ResponseBody::text()` reclaims the collected `Bytes` buffer via `into()` when
+  unique, avoiding an extra `to_vec()` copy on the common path.
+
+- Default clients wrap the system resolver in `CachingDnsResolver` (30s positive /
+  5s negative TTL) to avoid repeated system lookups under connection churn.
+- Follow-up snapshots stay light when redirects, retries, and authenticators are
+  all disabled, so the common single-shot path skips header/extension cloning.
+- Request admission permits are held via response extensions into the call
+  lifecycle body, avoiding an extra `BoxBody` layer on the returned response.
+
