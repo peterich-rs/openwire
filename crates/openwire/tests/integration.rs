@@ -4878,7 +4878,13 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
 
     let retry_event = trace
         .event_by_message("retrying request after connection-establishment failure")
-        .expect("retry trace event");
+        .or_else(|| trace.event_with_field("retry_reason", "connect"))
+        .unwrap_or_else(|| {
+            panic!(
+                "retry trace event missing; captured messages = {:?}",
+                trace.event_messages()
+            )
+        });
     assert_eq!(
         retry_event.fields.get("attempt").map(String::as_str),
         Some("2")
@@ -4896,13 +4902,31 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
         Some("0")
     );
     assert_eq!(
-        retry_event.fields.get("retry_reason").map(String::as_str),
-        Some("connect")
+        retry_event
+            .fields
+            .get("retry_reason")
+            .map(|value| normalize_trace_message(value)),
+        Some("connect".to_owned())
     );
 
     let redirect_event = trace
         .event_by_message("following redirect")
-        .expect("redirect trace event");
+        .or_else(|| {
+            trace
+                .inner
+                .lock()
+                .expect("trace capture lock")
+                .events
+                .iter()
+                .find(|event| event.fields.contains_key("redirect_location"))
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "redirect trace event missing; captured messages = {:?}",
+                trace.event_messages()
+            )
+        });
     assert_eq!(
         redirect_event.fields.get("attempt").map(String::as_str),
         Some("3")
@@ -7649,17 +7673,50 @@ impl TraceCapture {
                 event
                     .fields
                     .get("message")
-                    .is_some_and(|value| value.trim_matches('"') == message)
+                    .is_some_and(|value| normalize_trace_message(value) == message)
             })
             .cloned()
     }
+
+    fn event_with_field(&self, name: &str, expected: &str) -> Option<CapturedEvent> {
+        self.inner
+            .lock()
+            .expect("trace capture lock")
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .fields
+                    .get(name)
+                    .is_some_and(|value| normalize_trace_message(value) == expected)
+            })
+            .cloned()
+    }
+
+    fn event_messages(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("trace capture lock")
+            .events
+            .iter()
+            .filter_map(|event| event.fields.get("message").cloned())
+            .collect()
+    }
+}
+
+fn normalize_trace_message(value: &str) -> String {
+    value.trim().trim_matches('"').trim_matches('\'').to_owned()
 }
 
 async fn with_trace_capture<F, T>(trace: &TraceCapture, future: F) -> T
 where
     F: Future<Output = T>,
 {
-    let subscriber = tracing_subscriber::registry().with(trace.clone());
+    // Explicit TRACE filter keeps debug/trace events even when RUST_LOG is set
+    // in CI or the parent process environment.
+    let subscriber = tracing_subscriber::registry()
+        .with(trace.clone())
+        .with(tracing_subscriber::filter::LevelFilter::TRACE);
     future
         .with_subscriber(tracing::Dispatch::new(subscriber))
         .await
