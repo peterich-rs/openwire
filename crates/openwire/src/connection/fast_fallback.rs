@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_channel::mpsc;
-use futures_util::future::{AbortHandle, Abortable};
+use futures_util::future::{select, AbortHandle, Abortable, Either};
 use futures_util::stream::StreamExt;
 use hyper::rt::Timer;
 use hyper::Uri;
@@ -376,6 +376,8 @@ impl FastFallbackDialer {
         route_plan: RoutePlan,
         deps: DirectDialDeps,
     ) -> Result<(BoxConnection, FastFallbackOutcome), WireError> {
+        let connect_timeout = deps.connect_timeout;
+        let timer = deps.runtime.timer.clone();
         self.dial_route_plan(
             ctx,
             uri,
@@ -398,7 +400,18 @@ impl FastFallbackDialer {
             },
             move |ctx, uri, _route, stream| {
                 let tls_connector = deps.tls_connector.clone();
-                async move { finalize_direct_connection(ctx, uri, stream, tls_connector).await }
+                let timer = timer.clone();
+                async move {
+                    finalize_direct_connection(
+                        ctx,
+                        uri,
+                        stream,
+                        tls_connector,
+                        timer,
+                        connect_timeout,
+                    )
+                    .await
+                }
             },
         )
         .await
@@ -410,6 +423,8 @@ async fn finalize_direct_connection(
     uri: Uri,
     stream: BoxConnection,
     tls_connector: Option<Arc<dyn TlsConnector>>,
+    timer: SharedTimer,
+    connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
     if !uri
         .scheme_str()
@@ -425,7 +440,42 @@ async fn finalize_direct_connection(
         ));
     };
 
-    tls_connector.connect(ctx, uri, stream).await
+    with_connect_timeout(
+        timer,
+        connect_timeout,
+        tls_connector.connect(ctx, uri, stream),
+        "TLS handshake",
+    )
+    .await
+}
+
+/// Applies `connect_timeout` to a connect-stage future (TLS or protocol bind).
+pub(crate) async fn with_connect_timeout<T, F>(
+    timer: SharedTimer,
+    connect_timeout: Option<Duration>,
+    future: F,
+    stage: &'static str,
+) -> Result<T, WireError>
+where
+    F: Future<Output = Result<T, WireError>>,
+{
+    let Some(timeout) = connect_timeout else {
+        return future.await;
+    };
+    if timeout.is_zero() {
+        return Err(WireError::connect_timeout(format!(
+            "connect timed out before {stage}"
+        )));
+    }
+
+    let future = Box::pin(future);
+    let sleep = timer.sleep(timeout);
+    match select(future, sleep).await {
+        Either::Left((result, _sleep)) => result,
+        Either::Right((_ready, _future)) => Err(WireError::connect_timeout(format!(
+            "connect timed out after {timeout:?} during {stage}"
+        ))),
+    }
 }
 
 fn failure_stage(error: &WireError) -> ConnectFailureStage {

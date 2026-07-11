@@ -376,6 +376,8 @@ async fn connect_via_http_proxy(
                             target_uri,
                             tunneled,
                             deps.tls_connector.clone(),
+                            deps.timer.clone(),
+                            deps.connect_timeout,
                         )
                         .await
                     }
@@ -461,6 +463,8 @@ async fn connect_via_socks_proxy(
                             target_uri,
                             proxied,
                             deps.tls_connector.clone(),
+                            deps.timer.clone(),
+                            deps.connect_timeout,
                         )
                         .await
                     }
@@ -480,6 +484,8 @@ async fn connect_target_tls_if_needed(
     target_uri: Uri,
     stream: BoxConnection,
     tls_connector: Option<Arc<dyn TlsConnector>>,
+    timer: SharedTimer,
+    connect_timeout: Option<Duration>,
 ) -> Result<BoxConnection, WireError> {
     if !target_uri
         .scheme_str()
@@ -495,7 +501,13 @@ async fn connect_target_tls_if_needed(
         )
         .with_authority_from_uri(&target_uri)
     })?;
-    tls_connector.connect(ctx, target_uri, stream).await
+    crate::connection::with_connect_timeout(
+        timer,
+        connect_timeout,
+        tls_connector.connect(ctx, target_uri, stream),
+        "TLS handshake",
+    )
+    .await
 }
 
 pub(super) async fn establish_connect_tunnel(

@@ -1,9 +1,12 @@
 use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use http::{Request, Response};
 use hyper::client::conn::{http1, http2, TrySendError};
+use hyper::rt::Timer;
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, Connection, ConnectionInfo, Exchange, HyperExecutor,
     RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
@@ -25,8 +28,8 @@ use crate::proxy::{SelectedProxy, SharedProxySelector};
 use crate::trace::PolicyTraceContext;
 
 use super::bindings::{
-    release_acquired_connection, AcquiredBinding, BindingAcquireResult, ConnectionBindings,
-    ConnectionTaskRegistry,
+    release_acquired_connection, teardown_pooled_connection, AcquiredBinding, BindingAcquireResult,
+    ConnectionBindings, ConnectionTaskRegistry,
 };
 use super::body::{
     spawn_body_deadline_signal, BoundResponse, ObservedIncomingBody, ResponseLease,
@@ -55,6 +58,7 @@ struct SelectedConnection {
     coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
+    tasks: ConnectionTaskRegistry,
     availability: ConnectionAvailability,
 }
 
@@ -68,6 +72,7 @@ struct SelectedConnectionInit {
     coalesced: bool,
     exchange_finder: Arc<ExchangeFinder>,
     bindings: Arc<ConnectionBindings>,
+    tasks: ConnectionTaskRegistry,
     availability: ConnectionAvailability,
 }
 
@@ -92,6 +97,7 @@ type SelectedConnectionSendParts = (
     bool,
     Arc<ExchangeFinder>,
     Arc<ConnectionBindings>,
+    ConnectionTaskRegistry,
     ConnectionAvailability,
 );
 
@@ -107,6 +113,7 @@ impl SelectedConnection {
             coalesced: init.coalesced,
             exchange_finder: init.exchange_finder,
             bindings: init.bindings,
+            tasks: init.tasks,
             availability: init.availability,
         }
     }
@@ -142,6 +149,7 @@ impl SelectedConnection {
             self.coalesced,
             self.exchange_finder.clone(),
             self.bindings.clone(),
+            self.tasks.clone(),
             self.availability.clone(),
         ))
     }
@@ -159,6 +167,7 @@ impl Drop for SelectedConnection {
         release_acquired_connection(
             &self.exchange_finder,
             &self.bindings,
+            &self.tasks,
             &self.availability,
             connection,
             binding,
@@ -211,6 +220,17 @@ impl TransportService {
             config.max_connections_per_host,
             connection_availability.clone(),
         );
+        let bindings = Arc::new(ConnectionBindings::default());
+        let connection_tasks = ConnectionTaskRegistry::default();
+        {
+            let bindings = bindings.clone();
+            let tasks = connection_tasks.clone();
+            exchange_finder
+                .pool()
+                .set_eviction_hook(Arc::new(move |connection_id| {
+                    tasks.teardown_connection(&bindings, connection_id);
+                }));
+        }
         Self {
             connector,
             config,
@@ -222,8 +242,8 @@ impl TransportService {
             on_pooled_connection_published,
             connection_limiter,
             connection_availability,
-            bindings: Arc::new(ConnectionBindings::default()),
-            connection_tasks: ConnectionTaskRegistry::default(),
+            bindings,
+            connection_tasks,
         }
     }
 
@@ -392,6 +412,7 @@ impl TransportService {
                             coalesced: false,
                             exchange_finder: self.exchange_finder.clone(),
                             bindings: self.bindings.clone(),
+                            tasks: self.connection_tasks.clone(),
                             availability: self.connection_availability.clone(),
                         }));
                     }
@@ -400,7 +421,12 @@ impl TransportService {
                         waitable_pooled_connection = true;
                     }
                     BindingAcquireResult::Stale => {
-                        let _ = self.exchange_finder.pool().remove(connection.id());
+                        teardown_pooled_connection(
+                            &self.exchange_finder,
+                            &self.bindings,
+                            &self.connection_tasks,
+                            connection.id(),
+                        );
                         self.connection_availability.notify();
                     }
                 }
@@ -507,7 +533,12 @@ impl TransportService {
 
         let binding = match protocol {
             ConnectionProtocol::Http1 => {
-                let (sender, task) = bind_http1(stream).await?;
+                let (sender, task) = with_connect_stage_timeout(
+                    self.timer.clone(),
+                    connect_timeout,
+                    bind_http1(stream),
+                )
+                .await?;
                 self.bindings.insert_http1(info.id, info, sender);
                 let binding = match self.bindings.acquire(connection.id()) {
                     BindingAcquireResult::Acquired(binding) => binding,
@@ -523,8 +554,12 @@ impl TransportService {
                 };
                 self.exchange_finder.pool().insert(connection.clone());
                 if let Err(error) = self.spawn_http1_task(connection.clone(), task, span.clone()) {
-                    self.bindings.remove(connection.id());
-                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    teardown_pooled_connection(
+                        &self.exchange_finder,
+                        &self.bindings,
+                        &self.connection_tasks,
+                        connection.id(),
+                    );
                     self.connection_availability.notify();
                     return Err(error);
                 }
@@ -532,11 +567,15 @@ impl TransportService {
                 binding
             }
             ConnectionProtocol::Http2 => {
-                let (sender, task) = bind_http2(
-                    stream,
-                    &self.config,
-                    HyperExecutor(self.executor.clone()),
+                let (sender, task) = with_connect_stage_timeout(
                     self.timer.clone(),
+                    connect_timeout,
+                    bind_http2(
+                        stream,
+                        &self.config,
+                        HyperExecutor(self.executor.clone()),
+                        self.timer.clone(),
+                    ),
                 )
                 .await?;
                 self.bindings.insert_http2(info.id, info, sender);
@@ -554,8 +593,12 @@ impl TransportService {
                 };
                 self.exchange_finder.pool().insert(connection.clone());
                 if let Err(error) = self.spawn_http2_task(connection.clone(), task, span.clone()) {
-                    self.bindings.remove(connection.id());
-                    let _ = self.exchange_finder.pool().remove(connection.id());
+                    teardown_pooled_connection(
+                        &self.exchange_finder,
+                        &self.bindings,
+                        &self.connection_tasks,
+                        connection.id(),
+                    );
                     self.connection_availability.notify();
                     return Err(error);
                 }
@@ -574,6 +617,7 @@ impl TransportService {
             coalesced: false,
             exchange_finder: self.exchange_finder.clone(),
             bindings: self.bindings.clone(),
+            tasks: self.connection_tasks.clone(),
             availability: self.connection_availability.clone(),
         }))
     }
@@ -609,6 +653,7 @@ impl TransportService {
                     coalesced: true,
                     exchange_finder: self.exchange_finder.clone(),
                     bindings: self.bindings.clone(),
+                    tasks: self.connection_tasks.clone(),
                     availability: self.connection_availability.clone(),
                 }));
             }
@@ -616,7 +661,12 @@ impl TransportService {
                 let _ = self.exchange_finder.release(&connection);
             }
             BindingAcquireResult::Stale => {
-                let _ = self.exchange_finder.pool().remove(connection.id());
+                teardown_pooled_connection(
+                    &self.exchange_finder,
+                    &self.bindings,
+                    &self.connection_tasks,
+                    connection.id(),
+                );
                 self.connection_availability.notify();
             }
         }
@@ -640,12 +690,13 @@ impl TransportService {
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
         let availability = self.connection_availability.clone();
-        let (task_id, registry) = self.connection_tasks.reserve();
+        let registry = self.connection_tasks.downgrade();
         let future = Box::pin(
             async move {
                 let result = task.await;
                 bindings.remove(connection_id);
-                let _ = pool.remove(connection_id);
+                let _ = pool.remove_without_hook(connection_id);
+                ConnectionTaskRegistry::complete_connection_weak(&registry, connection_id);
                 availability.notify();
                 if let Err(error) = result {
                     tracing::debug!(
@@ -654,17 +705,17 @@ impl TransportService {
                         "owned HTTP/1 connection task failed",
                     );
                 }
-                ConnectionTaskRegistry::complete_weak(&registry, task_id);
             }
             .instrument(span),
         );
         match self.executor.spawn(future) {
             Ok(handle) => {
-                self.connection_tasks.attach(task_id, handle);
+                self.connection_tasks
+                    .attach_connection(connection_id, handle);
                 Ok(())
             }
             Err(error) => {
-                self.connection_tasks.cancel(task_id);
+                self.connection_tasks.abort_connection(connection_id);
                 Err(error)
             }
         }
@@ -680,12 +731,13 @@ impl TransportService {
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
         let availability = self.connection_availability.clone();
-        let (task_id, registry) = self.connection_tasks.reserve();
+        let registry = self.connection_tasks.downgrade();
         let future = Box::pin(
             async move {
                 let result = task.await;
                 bindings.remove(connection_id);
-                let _ = pool.remove(connection_id);
+                let _ = pool.remove_without_hook(connection_id);
+                ConnectionTaskRegistry::complete_connection_weak(&registry, connection_id);
                 availability.notify();
                 if let Err(error) = result {
                     tracing::debug!(
@@ -694,17 +746,17 @@ impl TransportService {
                         "owned HTTP/2 connection task failed",
                     );
                 }
-                ConnectionTaskRegistry::complete_weak(&registry, task_id);
             }
             .instrument(span),
         );
         match self.executor.spawn(future) {
             Ok(handle) => {
-                self.connection_tasks.attach(task_id, handle);
+                self.connection_tasks
+                    .attach_connection(connection_id, handle);
                 Ok(())
             }
             Err(error) => {
-                self.connection_tasks.cancel(task_id);
+                self.connection_tasks.abort_connection(connection_id);
                 Err(error)
             }
         }
@@ -780,6 +832,7 @@ async fn send_bound_request(
         coalesced,
         exchange_finder,
         bindings,
+        tasks_reg,
         availability,
     ) = selected.into_send_parts()?;
     let request = prepare_request_for_send(
@@ -797,6 +850,7 @@ async fn send_bound_request(
                     &connection,
                     &exchange_finder,
                     &bindings,
+                    &tasks_reg,
                     &availability,
                     &ctx,
                 );
@@ -812,6 +866,7 @@ async fn send_bound_request(
                     &connection,
                     &exchange_finder,
                     &bindings,
+                    &tasks_reg,
                     &availability,
                     &ctx,
                 );
@@ -843,6 +898,7 @@ async fn send_bound_request(
                     &connection,
                     &exchange_finder,
                     &bindings,
+                    &tasks_reg,
                     &availability,
                     &ctx,
                 );
@@ -857,6 +913,7 @@ async fn send_bound_request(
                     &connection,
                     &exchange_finder,
                     &bindings,
+                    &tasks_reg,
                     &availability,
                     &ctx,
                 );
@@ -948,13 +1005,13 @@ fn cleanup_failed_request(
     connection: &RealConnection,
     exchange_finder: &Arc<ExchangeFinder>,
     bindings: &Arc<ConnectionBindings>,
+    tasks: &ConnectionTaskRegistry,
     availability: &ConnectionAvailability,
     ctx: &CallContext,
 ) {
     match connection.protocol() {
         ConnectionProtocol::Http1 => {
-            bindings.remove(connection.id());
-            let _ = exchange_finder.pool().remove(connection.id());
+            teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
         }
         ConnectionProtocol::Http2 => {
             connection.mark_unhealthy();
@@ -963,4 +1020,31 @@ fn cleanup_failed_request(
     }
     availability.notify();
     ctx.listener().connection_released(ctx, connection.id());
+}
+
+async fn with_connect_stage_timeout<T, F>(
+    timer: SharedTimer,
+    connect_timeout: Option<Duration>,
+    future: F,
+) -> Result<T, WireError>
+where
+    F: std::future::Future<Output = Result<T, WireError>>,
+{
+    let Some(timeout) = connect_timeout else {
+        return future.await;
+    };
+    if timeout.is_zero() {
+        return Err(WireError::connect_timeout(
+            "connect timed out before protocol binding",
+        ));
+    }
+
+    let future = Box::pin(future);
+    let sleep = timer.sleep(timeout);
+    match select(future, sleep).await {
+        Either::Left((result, _sleep)) => result,
+        Either::Right((_ready, _future)) => Err(WireError::connect_timeout(format!(
+            "connect timed out after {timeout:?} during protocol binding"
+        ))),
+    }
 }

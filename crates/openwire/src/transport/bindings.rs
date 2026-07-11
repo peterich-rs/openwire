@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use hyper::client::conn::{http1, http2};
@@ -104,8 +103,6 @@ impl ConnectionBindings {
                 if binding.sender.is_closed() {
                     remove_stale = true;
                     BindingAcquireResult::Stale
-                } else if !binding.sender.is_ready() {
-                    BindingAcquireResult::Busy
                 } else {
                     BindingAcquireResult::Acquired(AcquiredBinding::Http2 {
                         info: binding.info.clone(),
@@ -166,43 +163,55 @@ pub(super) struct ConnectionTaskRegistry {
 
 #[derive(Default)]
 pub(super) struct ConnectionTaskRegistryInner {
-    next_id: AtomicU64,
-    handles: Mutex<HashMap<u64, Option<BoxTaskHandle>>>,
+    handles_by_connection: Mutex<HashMap<ConnectionId, Option<BoxTaskHandle>>>,
 }
 
 impl ConnectionTaskRegistry {
-    pub(super) fn reserve(&self) -> (u64, Weak<ConnectionTaskRegistryInner>) {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        lock_mutex(&self.inner.handles).insert(id, None);
-        (id, Arc::downgrade(&self.inner))
-    }
-
-    pub(super) fn attach(&self, task_id: u64, handle: BoxTaskHandle) {
-        let mut handles = lock_mutex(&self.inner.handles);
-        if let Some(slot) = handles.get_mut(&task_id) {
-            *slot = Some(handle);
-            return;
+    pub(super) fn attach_connection(&self, connection_id: ConnectionId, handle: BoxTaskHandle) {
+        let mut handles = lock_mutex(&self.inner.handles_by_connection);
+        if let Some(previous) = handles.insert(connection_id, Some(handle)) {
+            if let Some(previous) = previous {
+                previous.abort();
+            }
         }
-        drop(handles);
-        handle.abort();
     }
 
-    pub(super) fn cancel(&self, task_id: u64) {
-        lock_mutex(&self.inner.handles).remove(&task_id);
+    pub(super) fn abort_connection(&self, connection_id: ConnectionId) {
+        if let Some(Some(handle)) =
+            lock_mutex(&self.inner.handles_by_connection).remove(&connection_id)
+        {
+            handle.abort();
+        }
     }
 
-    pub(super) fn complete_weak(inner: &Weak<ConnectionTaskRegistryInner>, task_id: u64) {
+    pub(super) fn complete_connection_weak(
+        inner: &Weak<ConnectionTaskRegistryInner>,
+        connection_id: ConnectionId,
+    ) {
         let Some(inner) = inner.upgrade() else {
             return;
         };
-        lock_mutex(&inner.handles).remove(&task_id);
+        lock_mutex(&inner.handles_by_connection).remove(&connection_id);
+    }
+
+    pub(super) fn downgrade(&self) -> Weak<ConnectionTaskRegistryInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    pub(super) fn teardown_connection(
+        &self,
+        bindings: &ConnectionBindings,
+        connection_id: ConnectionId,
+    ) {
+        bindings.remove(connection_id);
+        self.abort_connection(connection_id);
     }
 
     #[cfg(test)]
     pub(super) fn poison_handles_for_test(&self) {
         let _guard = self
             .inner
-            .handles
+            .handles_by_connection
             .lock()
             .expect("poison connection task registry lock for test");
         panic!("poison connection task registry");
@@ -211,7 +220,7 @@ impl ConnectionTaskRegistry {
 
 impl Drop for ConnectionTaskRegistryInner {
     fn drop(&mut self) {
-        let handles = lock_mutex(&self.handles);
+        let handles = lock_mutex(&self.handles_by_connection);
         for handle in handles.values().filter_map(Option::as_ref) {
             handle.abort();
         }
@@ -221,6 +230,7 @@ impl Drop for ConnectionTaskRegistryInner {
 pub(super) fn release_acquired_connection(
     exchange_finder: &Arc<ExchangeFinder>,
     bindings: &Arc<ConnectionBindings>,
+    tasks: &ConnectionTaskRegistry,
     availability: &ConnectionAvailability,
     connection: RealConnection,
     binding: AcquiredBinding,
@@ -233,8 +243,7 @@ pub(super) fn release_acquired_connection(
                 availability.notify();
                 return;
             }
-            bindings.remove(connection.id());
-            let _ = exchange_finder.pool().remove(connection.id());
+            teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
             availability.notify();
         }
         AcquiredBinding::Http2 { .. } => {
@@ -242,8 +251,18 @@ pub(super) fn release_acquired_connection(
                 availability.notify();
                 return;
             }
-            let _ = exchange_finder.pool().remove(connection.id());
+            teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
             availability.notify();
         }
     }
+}
+
+pub(super) fn teardown_pooled_connection(
+    exchange_finder: &Arc<ExchangeFinder>,
+    bindings: &ConnectionBindings,
+    tasks: &ConnectionTaskRegistry,
+    connection_id: ConnectionId,
+) {
+    tasks.teardown_connection(bindings, connection_id);
+    let _ = exchange_finder.pool().remove_without_hook(connection_id);
 }

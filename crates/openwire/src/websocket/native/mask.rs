@@ -4,10 +4,15 @@ pub(crate) fn mask_in_place(payload: &mut [u8], key: [u8; 4]) {
     }
 }
 
-pub(crate) fn random_mask_key() -> [u8; 4] {
+pub(crate) fn random_mask_key() -> Result<[u8; 4], openwire_core::websocket::WebSocketEngineError> {
     let mut key = [0u8; 4];
-    getrandom::getrandom(&mut key).expect("getrandom failed");
-    key
+    getrandom::getrandom(&mut key).map_err(|error| {
+        openwire_core::websocket::WebSocketEngineError::Io(openwire_core::WireError::internal(
+            "failed to generate WebSocket mask key",
+            std::io::Error::other(error.to_string()),
+        ))
+    })?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -36,8 +41,8 @@ mod tests {
 
     #[test]
     fn random_keys_differ_across_calls() {
-        let a = random_mask_key();
-        let b = random_mask_key();
+        let a = random_mask_key().expect("mask key");
+        let b = random_mask_key().expect("mask key");
         // 4 bytes of entropy — collisions theoretically possible but vanishingly rare.
         assert_ne!(a, b);
     }

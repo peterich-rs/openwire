@@ -18,7 +18,9 @@ use openwire_core::{
 
 use crate::connection::{ConnectionAvailability, ExchangeFinder, RealConnection};
 
-use super::bindings::{ConnectionBindings, ConnectionTaskRegistry};
+use super::bindings::{
+    teardown_pooled_connection, ConnectionBindings, ConnectionTaskRegistry,
+};
 
 pub(super) struct BoundResponse {
     pub(super) response: Response<Incoming>,
@@ -188,6 +190,21 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
+        if self.ctx.body_force_discard() {
+            // Decode/body-layer errors set this flag so Drop discards the
+            // connection instead of treating the body as a clean abandon.
+            self.ctx
+                .listener()
+                .response_body_failed(
+                    &self.ctx,
+                    &WireError::body(
+                        "response body failed after intermediate processing error",
+                        std::io::Error::other("body force discard"),
+                    ),
+                );
+            self.discard_connection();
+            return;
+        }
         self.ctx
             .listener()
             .response_body_end(&self.ctx, self.bytes_read);
@@ -254,7 +271,7 @@ fn release_response_lease(state: ResponseLeaseState) {
                     exchange_finder,
                     ctx,
                     availability,
-                    ..
+                    _tasks,
                 },
             ..
         } => {
@@ -266,8 +283,12 @@ fn release_response_lease(state: ResponseLeaseState) {
                 ctx.listener().connection_released(&ctx, connection.id());
                 return;
             }
-            bindings.remove(connection.id());
-            let _ = exchange_finder.pool().remove(connection.id());
+            teardown_pooled_connection(
+                &exchange_finder,
+                &bindings,
+                &_tasks,
+                connection.id(),
+            );
             availability.notify();
             ctx.listener().connection_released(&ctx, connection.id());
         }
@@ -307,12 +328,16 @@ fn evict_response_lease_state(state: ResponseLeaseState, mark_unhealthy: bool) {
                     exchange_finder,
                     ctx,
                     availability,
-                    ..
+                    _tasks,
                 },
             ..
         } => {
-            bindings.remove(connection.id());
-            let _ = exchange_finder.pool().remove(connection.id());
+            teardown_pooled_connection(
+                &exchange_finder,
+                &bindings,
+                &_tasks,
+                connection.id(),
+            );
             availability.notify();
             ctx.listener().connection_released(&ctx, connection.id());
         }

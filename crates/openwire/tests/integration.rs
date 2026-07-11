@@ -4866,8 +4866,11 @@ async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
             "connect_end ",
             "connection_acquired ",
             "response_headers_end 302 Found",
-            "redirect 1 http://openwire.test:",
+            // Intermediate redirect body is drained so the connection can be
+            // reused before the follow-up hop starts.
+            "response_body_end ",
             "connection_released ",
+            "redirect 1 http://openwire.test:",
             "connection_acquired ",
             "response_headers_end 200 OK",
             "response_body_end 20",

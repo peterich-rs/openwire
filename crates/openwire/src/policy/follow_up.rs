@@ -2,7 +2,8 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, RETRY_AFTER, SET_COOKIE,
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST,
+    LOCATION, RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
@@ -143,6 +144,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 response_status = %response.status(),
                                 "following authentication challenge",
                             );
+                            let _ = drain_intermediate_response(response).await;
                             request = next_request;
                             attempt = next_attempt;
                             continue;
@@ -173,7 +175,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 "retrying request after HTTP/2 misdirected request",
                             );
 
-                            drop(response);
+                            let _ = drain_intermediate_response(response).await;
                             request = snapshot.to_retry_request(policy_trace)?;
                             request.extensions_mut().insert(NoCoalescedConnections);
                             attempt = next_attempt;
@@ -200,7 +202,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 "retrying request after retryable response status",
                             );
 
-                            drop(response);
+                            let _ = drain_intermediate_response(response).await;
                             request = snapshot.to_retry_request(policy_trace)?;
                             attempt = next_attempt;
                             continue;
@@ -257,8 +259,9 @@ impl Service<Exchange> for FollowUpPolicyService {
                             "following redirect",
                         );
 
+                        let status = response.status();
                         let Some(next_request) = snapshot.into_redirect_request(
-                            response.status(),
+                            status,
                             next_uri.clone(),
                             policy_trace,
                             selected_proxy,
@@ -266,6 +269,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                         else {
                             return Ok(response);
                         };
+                        let _ = drain_intermediate_response(response).await;
                         ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
                         request = next_request;
                         redirects += 1;
@@ -463,6 +467,29 @@ fn should_retry_misdirected_request(
             .is_some()
 }
 
+
+const INTERMEDIATE_BODY_DRAIN_LIMIT: u64 = 256 * 1024;
+
+async fn drain_intermediate_response(
+    response: Response<ResponseBody>,
+) -> Result<(), WireError> {
+    let body = response.into_body();
+    let mut body = std::pin::pin!(body);
+    let mut read = 0u64;
+    use http_body_util::BodyExt;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            read = read.saturating_add(data.len() as u64);
+            if read > INTERMEDIATE_BODY_DRAIN_LIMIT {
+                // Oversized intermediate body: drop the rest and let lease discard.
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn store_response_cookies(
     response: &Response<ResponseBody>,
     request_uri: &Uri,
@@ -587,6 +614,9 @@ impl RequestSnapshot {
         if should_switch_to_get {
             headers.remove(CONTENT_LENGTH);
             headers.remove(CONTENT_TYPE);
+            headers.remove(CONTENT_ENCODING);
+            headers.remove(TRANSFER_ENCODING);
+            headers.remove(EXPECT);
         }
 
         let mut request = Request::builder()
@@ -920,6 +950,39 @@ mod tests {
             .expect("redirect request");
 
         assert!(next.is_none());
+    }
+
+
+    #[test]
+    fn redirect_to_get_strips_body_describing_headers() {
+        use http::header::{
+            CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, TRANSFER_ENCODING,
+        };
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("http://source.test/start")
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_ENCODING, "gzip")
+            .header(TRANSFER_ENCODING, "chunked")
+            .header(EXPECT, "100-continue")
+            .body(RequestBody::from_static(b"{}"))
+            .expect("request");
+        let snapshot = RequestSnapshot::capture(&request);
+        let next = snapshot
+            .into_redirect_request(
+                StatusCode::FOUND,
+                "http://source.test/next".parse().expect("redirect uri"),
+                PolicyTraceContext::default(),
+                None,
+            )
+            .expect("redirect request")
+            .expect("followable");
+        assert_eq!(next.method(), http::Method::GET);
+        assert!(next.headers().get(CONTENT_TYPE).is_none());
+        assert!(next.headers().get(CONTENT_ENCODING).is_none());
+        assert!(next.headers().get(TRANSFER_ENCODING).is_none());
+        assert!(next.headers().get(EXPECT).is_none());
+        assert!(next.headers().get(CONTENT_LENGTH).is_none());
     }
 
     struct ReadinessTrackingService {
