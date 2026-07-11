@@ -243,7 +243,9 @@ impl ResponseBody {
 
     pub async fn text(self) -> Result<String, WireError> {
         let bytes = self.bytes().await?;
-        String::from_utf8(bytes.to_vec())
+        // Prefer reclaiming the buffer when this is the unique owner of the
+        // Bytes allocation (common after a full collect).
+        String::from_utf8(bytes.into())
             .map_err(|error| WireError::body("response body is not valid UTF-8", error))
     }
 

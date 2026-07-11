@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -384,8 +385,8 @@ async fn authenticate_response(
             snapshot.method.clone(),
             snapshot.uri.clone(),
             snapshot.version,
-            snapshot.headers.clone(),
-            snapshot.extensions.clone(),
+            (*snapshot.headers).clone(),
+            (*snapshot.extensions).clone(),
             snapshot.body.as_ref().and_then(RequestBody::try_clone),
         ),
         AuthResponseState::new(response.status(), response.headers().clone()),
@@ -511,8 +512,10 @@ struct RequestSnapshot {
     method: Method,
     uri: Uri,
     version: Version,
-    headers: HeaderMap,
-    extensions: http::Extensions,
+    /// Shared so auth / retry rebuilds do not re-clone the full map on each hop.
+    headers: Arc<HeaderMap>,
+    /// Shared request extensions captured at attempt start.
+    extensions: Arc<http::Extensions>,
     body: Option<RequestBody>,
 }
 
@@ -528,8 +531,8 @@ impl RequestSnapshot {
             method: request.method().clone(),
             uri: request.uri().clone(),
             version: request.version(),
-            headers: request.headers().clone(),
-            extensions: request.extensions().clone(),
+            headers: Arc::new(request.headers().clone()),
+            extensions: Arc::new(request.extensions().clone()),
             body: request.body().try_clone(),
         }
     }
@@ -557,8 +560,8 @@ impl RequestSnapshot {
             .uri(self.uri.clone())
             .version(self.version)
             .body(body)?;
-        *request.headers_mut() = self.headers.clone();
-        *request.extensions_mut() = self.extensions.clone();
+        *request.headers_mut() = (*self.headers).clone();
+        *request.extensions_mut() = (*self.extensions).clone();
         let sticky_proxy = request.extensions().get::<SelectedProxy>().cloned();
         reset_network_attempt_extensions(request.extensions_mut(), sticky_proxy);
         request.extensions_mut().insert(policy_trace);
@@ -603,7 +606,7 @@ impl RequestSnapshot {
             self.method
         };
 
-        let mut headers = self.headers;
+        let mut headers = Arc::try_unwrap(self.headers).unwrap_or_else(|arc| (*arc).clone());
         headers.remove(HOST);
         if !same_origin {
             strip_sensitive_cross_origin_headers(&mut headers);
@@ -622,7 +625,8 @@ impl RequestSnapshot {
             .version(self.version)
             .body(body)?;
         *request.headers_mut() = headers;
-        *request.extensions_mut() = self.extensions;
+        *request.extensions_mut() =
+            Arc::try_unwrap(self.extensions).unwrap_or_else(|arc| (*arc).clone());
         reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
         request.extensions_mut().insert(policy_trace);
         Ok(Some(request))

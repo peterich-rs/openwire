@@ -328,7 +328,7 @@ pub(crate) enum RouteKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Route {
-    address: Address,
+    address: Arc<Address>,
     family: RouteFamily,
     kind: RouteKind,
     target_dns: DnsResolution,
@@ -342,16 +342,31 @@ impl Route {
             kind: RouteKind::Direct { target },
             target_dns: DnsResolution::Local(target),
             proxy_dns: None,
+            address: Arc::new(address),
+        }
+    }
+
+    /// Builds a direct route reusing a shared address allocation (dual-stack plans).
+    pub(crate) fn direct_shared(address: Arc<Address>, target: SocketAddr) -> Self {
+        Self {
+            family: RouteFamily::from_socket_addr(target),
+            kind: RouteKind::Direct { target },
+            target_dns: DnsResolution::Local(target),
+            proxy_dns: None,
             address,
         }
     }
 
     pub fn http_forward(address: Address, proxy: SocketAddr) -> Self {
+        Self::http_forward_shared(Arc::new(address), proxy)
+    }
+
+    pub(crate) fn http_forward_shared(address: Arc<Address>, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
             .cloned();
-        Self::proxy_route(
+        Self::proxy_route_shared(
             address,
             proxy,
             RouteKind::HttpForwardProxy { proxy, credentials },
@@ -359,11 +374,15 @@ impl Route {
     }
 
     pub fn connect_proxy(address: Address, proxy: SocketAddr) -> Self {
+        Self::connect_proxy_shared(Arc::new(address), proxy)
+    }
+
+    pub(crate) fn connect_proxy_shared(address: Arc<Address>, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
             .cloned();
-        Self::proxy_route(
+        Self::proxy_route_shared(
             address,
             proxy,
             RouteKind::ConnectProxy { proxy, credentials },
@@ -371,11 +390,15 @@ impl Route {
     }
 
     pub fn socks_proxy(address: Address, proxy: SocketAddr) -> Self {
+        Self::socks_proxy_shared(Arc::new(address), proxy)
+    }
+
+    pub(crate) fn socks_proxy_shared(address: Arc<Address>, proxy: SocketAddr) -> Self {
         let credentials = address
             .proxy()
             .and_then(|proxy| proxy.endpoint().credentials())
             .cloned();
-        Self::proxy_route(address, proxy, RouteKind::SocksProxy { proxy, credentials })
+        Self::proxy_route_shared(address, proxy, RouteKind::SocksProxy { proxy, credentials })
     }
 
     pub(crate) fn from_observed(address: Address, remote_addr: Option<SocketAddr>) -> Self {
@@ -396,7 +419,7 @@ impl Route {
         }
     }
 
-    fn proxy_route(address: Address, proxy: SocketAddr, kind: RouteKind) -> Self {
+    fn proxy_route_shared(address: Arc<Address>, proxy: SocketAddr, kind: RouteKind) -> Self {
         let authority = address.authority();
         Self {
             family: RouteFamily::from_socket_addr(proxy),
@@ -661,10 +684,11 @@ impl DefaultRoutePlanner {
         resolved_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> RoutePlan {
         let ordered = order_for_fast_fallback(resolved_addrs);
+        let address = Arc::new(address);
         RoutePlan::new(
             ordered
                 .into_iter()
-                .map(|addr| Route::direct(address.clone(), addr))
+                .map(|addr| Route::direct_shared(address.clone(), addr))
                 .collect(),
             self.fast_fallback_stagger,
         )
@@ -676,10 +700,11 @@ impl DefaultRoutePlanner {
         resolved_proxy_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> RoutePlan {
         let ordered = order_for_fast_fallback(resolved_proxy_addrs);
+        let address = Arc::new(address);
         RoutePlan::new(
             ordered
                 .into_iter()
-                .map(|addr| Route::http_forward(address.clone(), addr))
+                .map(|addr| Route::http_forward_shared(address.clone(), addr))
                 .collect(),
             self.fast_fallback_stagger,
         )
@@ -691,10 +716,11 @@ impl DefaultRoutePlanner {
         resolved_proxy_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> RoutePlan {
         let ordered = order_for_fast_fallback(resolved_proxy_addrs);
+        let address = Arc::new(address);
         RoutePlan::new(
             ordered
                 .into_iter()
-                .map(|addr| Route::connect_proxy(address.clone(), addr))
+                .map(|addr| Route::connect_proxy_shared(address.clone(), addr))
                 .collect(),
             self.fast_fallback_stagger,
         )
@@ -706,10 +732,11 @@ impl DefaultRoutePlanner {
         resolved_proxy_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> RoutePlan {
         let ordered = order_for_fast_fallback(resolved_proxy_addrs);
+        let address = Arc::new(address);
         RoutePlan::new(
             ordered
                 .into_iter()
-                .map(|addr| Route::socks_proxy(address.clone(), addr))
+                .map(|addr| Route::socks_proxy_shared(address.clone(), addr))
                 .collect(),
             self.fast_fallback_stagger,
         )
