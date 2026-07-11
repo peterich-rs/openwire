@@ -2,8 +2,8 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use http::header::{
-    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST,
-    LOCATION, RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING,
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST, LOCATION,
+    RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
@@ -467,12 +467,9 @@ fn should_retry_misdirected_request(
             .is_some()
 }
 
-
 const INTERMEDIATE_BODY_DRAIN_LIMIT: u64 = 256 * 1024;
 
-async fn drain_intermediate_response(
-    response: Response<ResponseBody>,
-) -> Result<(), WireError> {
+async fn drain_intermediate_response(response: Response<ResponseBody>) -> Result<(), WireError> {
     let body = response.into_body();
     let mut body = std::pin::pin!(body);
     let mut read = 0u64;
@@ -952,13 +949,12 @@ mod tests {
         assert!(next.is_none());
     }
 
-
     #[test]
     fn redirect_to_get_strips_body_describing_headers() {
         use http::header::{
             CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, TRANSFER_ENCODING,
         };
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri("http://source.test/start")
             .header(CONTENT_TYPE, "application/json")

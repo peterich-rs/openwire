@@ -169,10 +169,8 @@ pub(super) struct ConnectionTaskRegistryInner {
 impl ConnectionTaskRegistry {
     pub(super) fn attach_connection(&self, connection_id: ConnectionId, handle: BoxTaskHandle) {
         let mut handles = lock_mutex(&self.inner.handles_by_connection);
-        if let Some(previous) = handles.insert(connection_id, Some(handle)) {
-            if let Some(previous) = previous {
-                previous.abort();
-            }
+        if let Some(Some(previous)) = handles.insert(connection_id, Some(handle)) {
+            previous.abort();
         }
     }
 

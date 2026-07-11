@@ -73,9 +73,11 @@ impl WebSocketEngine for TungsteniteEngine {
 
             // BoxConnection (hyper::rt::Read+Write) → tokio AsyncRead+Write.
             let tokio_io = TokioIo::new(io);
-            let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-            ws_config.max_message_size = Some(config.max_message_size);
-            ws_config.max_frame_size = Some(config.max_frame_size);
+            let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                max_message_size: Some(config.max_message_size),
+                max_frame_size: Some(config.max_frame_size),
+                ..Default::default()
+            };
             let stream = WebSocketStream::from_raw_socket(
                 tokio_io,
                 tokio_tungstenite::tungstenite::protocol::Role::Client,

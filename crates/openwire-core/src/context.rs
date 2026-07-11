@@ -117,9 +117,7 @@ impl CallContext {
     }
 
     pub fn mark_body_force_discard(&self) {
-        self.inner
-            .body_force_discard
-            .store(true, Ordering::Release);
+        self.inner.body_force_discard.store(true, Ordering::Release);
     }
 
     pub fn body_force_discard(&self) -> bool {

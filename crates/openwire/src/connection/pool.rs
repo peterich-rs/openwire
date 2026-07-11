@@ -309,18 +309,19 @@ impl ConnectionPool {
         let mut state = lock_mutex(&self.state);
         let evicted = prune_address(&self.settings, &mut state, address);
         let stats = match state.by_address.get(address) {
-            Some(connections) => connections.iter().fold(
-                PoolStats::default(),
-                |mut stats, connection| {
-                    stats.total += 1;
-                    match connection.snapshot().allocation {
-                        ConnectionAllocationState::Idle => stats.idle += 1,
-                        ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
-                        ConnectionAllocationState::Closed => {}
-                    }
-                    stats
-                },
-            ),
+            Some(connections) => {
+                connections
+                    .iter()
+                    .fold(PoolStats::default(), |mut stats, connection| {
+                        stats.total += 1;
+                        match connection.snapshot().allocation {
+                            ConnectionAllocationState::Idle => stats.idle += 1,
+                            ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
+                            ConnectionAllocationState::Closed => {}
+                        }
+                        stats
+                    })
+            }
             None => PoolStats::default(),
         };
         drop(state);
