@@ -2,7 +2,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use async_compression::futures::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
+use async_compression::futures::bufread::{
+    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
+};
 use bytes::Bytes;
 use futures_util::io::{AsyncBufRead, AsyncRead, BufReader};
 use futures_util::TryStreamExt;
@@ -15,6 +17,12 @@ use pin_project_lite::pin_project;
 
 const ACCEPTED_ENCODINGS: HeaderValue = HeaderValue::from_static("br, gzip, deflate, zstd");
 const DECODE_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Default cap on transparent response decompression output.
+///
+/// Prevents classic compression-bomb denial-of-service against clients that
+/// automatically decode `Content-Encoding`.
+pub const DEFAULT_MAX_DECOMPRESSED_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 type BoxAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send + Sync>>;
 type BoxAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync>>;
@@ -33,6 +41,7 @@ pub(crate) fn normalize_request(request: &mut http::Request<RequestBody>) -> boo
 pub(crate) fn decode_response(
     response: Response<ResponseBody>,
     request_method: &Method,
+    max_decompressed_body_bytes: usize,
 ) -> Response<ResponseBody> {
     if !response_can_have_body(request_method, response.status()) {
         return response;
@@ -53,7 +62,7 @@ pub(crate) fn decode_response(
         .map(|encoding| encoding.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let body = DecodedResponseBody::new(body, encodings, label);
+    let body = DecodedResponseBody::new(body, encodings, label, max_decompressed_body_bytes);
     Response::from_parts(parts, ResponseBody::new(body.boxed()))
 }
 
@@ -139,11 +148,18 @@ pin_project! {
         #[pin]
         reader: BoxAsyncBufRead,
         label: String,
+        max_decompressed_body_bytes: usize,
+        decoded_bytes: usize,
     }
 }
 
 impl DecodedResponseBody {
-    fn new(body: ResponseBody, encodings: Vec<ResponseEncoding>, label: String) -> Self {
+    fn new(
+        body: ResponseBody,
+        encodings: Vec<ResponseEncoding>,
+        label: String,
+        max_decompressed_body_bytes: usize,
+    ) -> Self {
         let stream = body.into_data_stream().map_err(wire_error_to_io);
         let reader = stream.into_async_read();
         let mut reader: BoxAsyncBufRead = Box::pin(reader);
@@ -152,7 +168,12 @@ impl DecodedResponseBody {
             reader = decode_layer(reader, encoding);
         }
 
-        Self { reader, label }
+        Self {
+            reader,
+            label,
+            max_decompressed_body_bytes,
+            decoded_bytes: 0,
+        }
     }
 }
 
@@ -168,9 +189,30 @@ impl Body for DecodedResponseBody {
         let mut buffer = [0; DECODE_BUFFER_SIZE];
         match this.reader.poll_read(cx, &mut buffer) {
             Poll::Ready(Ok(0)) => Poll::Ready(None),
-            Poll::Ready(Ok(read)) => Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
-                &buffer[..read],
-            ))))),
+            Poll::Ready(Ok(read)) => {
+                let Some(total) = this.decoded_bytes.checked_add(read) else {
+                    return Poll::Ready(Some(Err(WireError::body(
+                        format!(
+                            "decompressed {} response exceeded size limit {}",
+                            this.label, this.max_decompressed_body_bytes
+                        ),
+                        io::Error::new(io::ErrorKind::InvalidData, "decompressed body too large"),
+                    ))));
+                };
+                if total > *this.max_decompressed_body_bytes {
+                    return Poll::Ready(Some(Err(WireError::body(
+                        format!(
+                            "decompressed {} response exceeded size limit {}",
+                            this.label, this.max_decompressed_body_bytes
+                        ),
+                        io::Error::new(io::ErrorKind::InvalidData, "decompressed body too large"),
+                    ))));
+                }
+                *this.decoded_bytes = total;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
+                    &buffer[..read],
+                )))))
+            }
             Poll::Ready(Err(error)) => {
                 Poll::Ready(Some(Err(io_error_to_wire(error, this.label.as_str()))))
             }
@@ -194,14 +236,179 @@ fn decode_layer(reader: BoxAsyncBufRead, encoding: ResponseEncoding) -> BoxAsync
             Box::pin(BufReader::new(decoded))
         }
         ResponseEncoding::Deflate => {
-            let decoded: BoxAsyncRead = Box::pin(ZlibDecoder::new(reader));
-            Box::pin(BufReader::new(decoded))
+            // HTTP "deflate" is ambiguous (zlib-wrapped vs raw). Detect via the
+            // first two bytes (RFC 1950 CMF/FLG check) before wrapping.
+            Box::pin(BufReader::new(DeflateAutoDecoder::new(reader)))
         }
         ResponseEncoding::Zstd => {
             let decoded: BoxAsyncRead = Box::pin(ZstdDecoder::new(reader));
             Box::pin(BufReader::new(decoded))
         }
     }
+}
+
+/// Chooses zlib-wrapped vs raw DEFLATE after buffering a two-byte header peek.
+struct DeflateAutoDecoder {
+    state: DeflateAutoState,
+}
+
+enum DeflateAutoState {
+    /// Accumulating the first two payload bytes.
+    Peeking {
+        reader: BoxAsyncBufRead,
+        peeked: [u8; 2],
+        peeked_len: usize,
+    },
+    /// Decoder selected; remaining stream is already wired with the prefix.
+    Decoding {
+        reader: BoxAsyncBufRead,
+    },
+}
+
+impl DeflateAutoDecoder {
+    fn new(reader: BoxAsyncBufRead) -> Self {
+        Self {
+            state: DeflateAutoState::Peeking {
+                reader,
+                peeked: [0; 2],
+                peeked_len: 0,
+            },
+        }
+    }
+
+    fn finish_peek(
+        reader: BoxAsyncBufRead,
+        peeked: [u8; 2],
+        peeked_len: usize,
+    ) -> BoxAsyncBufRead {
+        let use_zlib = looks_like_zlib_header(&peeked[..peeked_len]);
+        let prefixed: BoxAsyncBufRead = Box::pin(PrefixedReader {
+            prefix: peeked,
+            prefix_len: peeked_len,
+            prefix_pos: 0,
+            inner: reader,
+        });
+        let decoded: BoxAsyncRead = if use_zlib {
+            Box::pin(ZlibDecoder::new(prefixed))
+        } else {
+            Box::pin(DeflateDecoder::new(prefixed))
+        };
+        Box::pin(BufReader::new(decoded))
+    }
+}
+
+impl AsyncRead for DeflateAutoDecoder {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match &mut self.state {
+                DeflateAutoState::Peeking {
+                    reader,
+                    peeked,
+                    peeked_len,
+                } => {
+                    while *peeked_len < 2 {
+                        let mut tmp = [0u8; 1];
+                        match Pin::new(&mut *reader).poll_read(cx, &mut tmp) {
+                            Poll::Ready(Ok(0)) => break,
+                            Poll::Ready(Ok(1)) => {
+                                peeked[*peeked_len] = tmp[0];
+                                *peeked_len += 1;
+                            }
+                            Poll::Ready(Ok(_)) => unreachable!("tmp is 1 byte"),
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    let DeflateAutoState::Peeking {
+                        reader,
+                        peeked,
+                        peeked_len,
+                    } = std::mem::replace(
+                        &mut self.state,
+                        DeflateAutoState::Decoding {
+                            // Temporary placeholder replaced immediately below.
+                            reader: Box::pin(BufReader::new(futures_util::io::empty())),
+                        },
+                    )
+                    else {
+                        unreachable!("just matched Peeking");
+                    };
+                    self.state = DeflateAutoState::Decoding {
+                        reader: Self::finish_peek(reader, peeked, peeked_len),
+                    };
+                }
+                DeflateAutoState::Decoding { reader } => {
+                    return Pin::new(reader).poll_read(cx, buf);
+                }
+            }
+        }
+    }
+}
+
+/// Replays a short peeked prefix before reading the remainder of the stream.
+struct PrefixedReader {
+    prefix: [u8; 2],
+    prefix_len: usize,
+    prefix_pos: usize,
+    inner: BoxAsyncBufRead,
+}
+
+impl AsyncRead for PrefixedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.prefix_pos < self.prefix_len {
+            let available = self.prefix_len - self.prefix_pos;
+            let copy = available.min(buf.len());
+            buf[..copy]
+                .copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + copy]);
+            self.prefix_pos += copy;
+            return Poll::Ready(Ok(copy));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncBufRead for PrefixedReader {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.prefix_pos < this.prefix_len {
+            return Poll::Ready(Ok(&this.prefix[this.prefix_pos..this.prefix_len]));
+        }
+        Pin::new(&mut this.inner).poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        if self.prefix_pos < self.prefix_len {
+            let available = self.prefix_len - self.prefix_pos;
+            let take = amt.min(available);
+            self.prefix_pos += take;
+            let remaining = amt - take;
+            if remaining > 0 {
+                Pin::new(&mut self.inner).consume(remaining);
+            }
+            return;
+        }
+        Pin::new(&mut self.inner).consume(amt);
+    }
+}
+
+fn looks_like_zlib_header(header: &[u8]) -> bool {
+    if header.len() < 2 {
+        // Not enough data; zlib is the historical HTTP default.
+        return true;
+    }
+    let cmf = header[0];
+    let flg = header[1];
+    // CM must be 8 (DEFLATE) and CMF/FLG must be multiple of 31 (RFC 1950).
+    (cmf & 0x0f) == 8 && (u16::from(cmf) * 256 + u16::from(flg)) % 31 == 0
 }
 
 fn wire_error_to_io(error: WireError) -> io::Error {
@@ -224,7 +431,10 @@ mod tests {
     use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
     use http::{Method, Request, Response};
 
-    use super::{decode_response, normalize_request, ACCEPTED_ENCODINGS};
+    use super::{
+        decode_response, looks_like_zlib_header, normalize_request, ACCEPTED_ENCODINGS,
+        DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
+    };
     use crate::{RequestBody, ResponseBody};
 
     #[test]
@@ -276,7 +486,8 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response = decode_response(response, &Method::GET);
+        let response =
+            decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
 
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
         assert!(response.headers().get(CONTENT_LENGTH).is_none());
@@ -290,9 +501,17 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response = decode_response(response, &Method::GET);
+        let response =
+            decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
 
         assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "made-up");
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "20");
+    }
+
+    #[test]
+    fn zlib_header_detection_accepts_rfc1950_header() {
+        // CMF=0x78, FLG=0x9c is the common default zlib header.
+        assert!(looks_like_zlib_header(&[0x78, 0x9c]));
+        assert!(!looks_like_zlib_header(&[0x01, 0x02]));
     }
 }

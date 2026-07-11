@@ -495,12 +495,13 @@ impl TransportService {
         let coalescing = coalescing_info_from_connected(&connected);
         let protocol = determine_protocol(args.candidate.address(), &connected);
         let route = Route::from_observed(args.candidate.address().clone(), info.remote_addr);
-        let connection = RealConnection::with_id_permit_and_coalescing(
+        let connection = RealConnection::with_id_permit_coalescing_and_stream_cap(
             info.id,
             route,
             protocol,
             Some(args.connection_permit),
             coalescing,
+            self.config.max_http2_streams,
         );
         let _ = connection.try_acquire();
 
@@ -908,7 +909,40 @@ pub(super) fn prepare_request_for_send(
     route_kind: &crate::connection::RouteKind,
 ) -> Result<Request<RequestBody>, WireError> {
     clear_proxy_authorization_if_proxy_changed(&mut request, selected_proxy);
+    apply_forward_proxy_credentials(&mut request, route_kind)?;
     prepare_bound_request(request, protocol, route_kind)
+}
+
+fn apply_forward_proxy_credentials(
+    request: &mut Request<RequestBody>,
+    route_kind: &crate::connection::RouteKind,
+) -> Result<(), WireError> {
+    use http::header::PROXY_AUTHORIZATION;
+    use openwire_core::WireErrorKind;
+
+    let crate::connection::RouteKind::HttpForwardProxy {
+        credentials: Some(credentials),
+        ..
+    } = route_kind
+    else {
+        return Ok(());
+    };
+
+    if request.headers().contains_key(PROXY_AUTHORIZATION) {
+        return Ok(());
+    }
+
+    let value = http::HeaderValue::from_str(&credentials.basic_auth_header_value()).map_err(
+        |error| {
+            WireError::with_source(
+                WireErrorKind::InvalidRequest,
+                "proxy basic auth header is not valid ASCII",
+                error,
+            )
+        },
+    )?;
+    request.headers_mut().insert(PROXY_AUTHORIZATION, value);
+    Ok(())
 }
 
 fn cleanup_failed_request(

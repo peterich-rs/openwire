@@ -113,7 +113,10 @@ enabled, bridge injects `Accept-Encoding: br, gzip, deflate, zstd` only for
 requests that did not already specify `Accept-Encoding` and are not range
 requests. Matching compressed responses are decoded as a stream on the return
 path, with `Content-Encoding` and compressed `Content-Length` removed before the
-response reaches application interceptors or callers. Network interceptors still
+response reaches application interceptors or callers. Transparent decoding
+stops with a body error once the decompressed output exceeds the configured
+`max_decompressed_body_bytes` (default 128 MiB). For `deflate`, OpenWire peeks
+the first two bytes and selects zlib-wrapped (RFC 1950) vs raw DEFLATE. Network interceptors still
 observe the normalized request and wire response for each network attempt.
 
 The transport protocol-binding step applies protocol-specific final shaping.
@@ -253,13 +256,24 @@ follow-ups (pool reuse, interceptor chain integration).
 - `FollowUpPolicyService` owns retry, redirect, auth, and cookie follow-ups.
   Response-status retries are policy decisions after cookie persistence and
   authentication handling and before redirect handling. The default retry policy
-  only retries replayable `408 Request Timeout` responses and `503 Service
-  Unavailable` responses that explicitly carry `Retry-After: 0`; delayed,
-  invalid, or duplicate `Retry-After` values remain caller-visible responses.
-  Default redirect handling follows `300`, `301`, `302`, `303`, `307`, and `308`
-  responses when a valid `Location` is present and policy permits it.
-  Preserve-method redirects (`307` / `308`) require a replayable request body;
-  otherwise the original redirect response is returned to the caller.
+  only retries **idempotent** replayable `408 Request Timeout` responses and
+  `503 Service Unavailable` responses that explicitly carry `Retry-After: 0`
+  (set `retry_non_idempotent(true)` to extend response-status retries to
+  non-idempotent methods); delayed, invalid, or duplicate `Retry-After` values
+  remain caller-visible responses. Default redirect handling follows `301`,
+  `302`, `303`, `307`, and `308` when a valid `Location` is present and policy
+  permits it; `300 Multiple Choices` is returned to the caller without automatic
+  following. Cross-origin redirects strip `Authorization`, `Cookie`, and common
+  API-token headers (`X-Api-Key`, `X-Auth-Token`, and related) while preserving
+  `Proxy-Authorization` for sticky proxy routing. Preserve-method redirects
+  (`307` / `308`) require a replayable request body; otherwise the original
+  redirect response is returned to the caller.
+- The default `Jar` cookie store loads an embedded public suffix list so
+  `Domain=.com`-style cookies are rejected (RFC 6265 §5.3) and honors `Secure`.
+- Connection pool defaults include idle timeout, max idle per host, absolute max
+  lifetime, global/per-host connection caps, and a local HTTP/2 concurrent-stream
+  budget. Dual-stack route planning prefers starting with IPv6 when both families
+  are present (staggered dial, not full Happy Eyeballs v2).
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
   and HTTP URI authorities that include userinfo before bridge normalization can
   derive `Host` or transport can route the request.
@@ -292,7 +306,7 @@ follow-ups (pool reuse, interceptor chain integration).
 - `ResponseLease` and `ObservedIncomingBody` own final release bookkeeping.
 - HTTP/1.1 reuse is single-exchange and response-body-lifecycle-driven.
 - HTTP/2 multiplexing is governed by connection health, allocation tracking,
-  and bound-sender readiness.
+  a local concurrent-stream budget (default 100), and bound-sender readiness.
 - `hyper` owns protocol engines; OpenWire owns client semantics.
 
 ## 7. Verification Strategy

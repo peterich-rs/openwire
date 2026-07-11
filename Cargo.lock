@@ -1165,6 +1165,7 @@ dependencies = [
  "openwire-test",
  "openwire-tokio",
  "pin-project-lite",
+ "publicsuffix",
  "serde_json",
  "sha1",
  "tokio",

@@ -15,6 +15,7 @@ use crate::sync_util::lock_mutex;
 pub(crate) struct PoolSettings {
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) max_idle_per_address: usize,
+    pub(crate) max_lifetime: Option<Duration>,
 }
 
 impl Default for PoolSettings {
@@ -22,6 +23,22 @@ impl Default for PoolSettings {
         Self {
             idle_timeout: Some(Duration::from_secs(300)),
             max_idle_per_address: 5,
+            max_lifetime: Some(Duration::from_secs(600)),
+        }
+    }
+}
+
+impl PoolSettings {
+    pub(crate) fn needs_reaper(&self) -> bool {
+        self.idle_timeout.is_some() || self.max_lifetime.is_some()
+    }
+
+    pub(crate) fn reaper_interval_hint(&self) -> Duration {
+        match (self.idle_timeout, self.max_lifetime) {
+            (Some(idle), Some(lifetime)) => idle.min(lifetime),
+            (Some(idle), None) => idle,
+            (None, Some(lifetime)) => lifetime,
+            (None, None) => Duration::from_secs(60),
         }
     }
 }
@@ -319,6 +336,15 @@ fn prune_connections(
         }
 
         if settings
+            .max_lifetime
+            .is_some_and(|lifetime| connection_lifetime_expired(connection, lifetime))
+        {
+            connection.close();
+            removed.push(connection.clone());
+            return false;
+        }
+
+        if settings
             .idle_timeout
             .is_some_and(|timeout| idle_connection_expired(connection, timeout))
         {
@@ -356,6 +382,13 @@ fn idle_connection_expired(connection: &RealConnection, timeout: Duration) -> bo
         && snapshot
             .idle_since
             .is_some_and(|idle_since| idle_since.elapsed() >= timeout)
+}
+
+fn connection_lifetime_expired(connection: &RealConnection, max_lifetime: Duration) -> bool {
+    // Only reclaim idle connections for max-lifetime; in-use streams finish first.
+    let snapshot = connection.snapshot();
+    matches!(snapshot.allocation, ConnectionAllocationState::Idle)
+        && connection.created_at().elapsed() >= max_lifetime
 }
 
 fn can_coalesce(connection: &RealConnection, request: &Address, route_plan: &RoutePlan) -> bool {
@@ -633,6 +666,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(30)),
             max_idle_per_address: 2,
+            max_lifetime: Some(Duration::from_secs(600)),
         });
 
         assert_eq!(
@@ -640,6 +674,7 @@ mod tests {
             &PoolSettings {
                 idle_timeout: Some(Duration::from_secs(30)),
                 max_idle_per_address: 2,
+                max_lifetime: Some(Duration::from_secs(600)),
             }
         );
     }
@@ -859,6 +894,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         let connection = make_connection(address.clone(), 12);
         let connection_id = connection.id();
@@ -876,6 +912,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         let connection = make_connection(address.clone(), 13);
         let connection_id = connection.id();
@@ -902,6 +939,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: None,
             max_idle_per_address: 2,
+            max_lifetime: None,
         });
         let now = Instant::now();
 
@@ -953,6 +991,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         let connection =
             make_connection_with_protocol(address.clone(), 31, ConnectionProtocol::Http2);
@@ -971,6 +1010,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: None,
             max_idle_per_address: 0,
+            max_lifetime: None,
         });
         let connection =
             make_connection_with_protocol(address.clone(), 31, ConnectionProtocol::Http2);
@@ -1016,6 +1056,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         pool.insert(connection.clone());
         connection.set_idle_since_for_test(Some(Instant::now() - Duration::from_secs(6)));
@@ -1039,6 +1080,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         pool.insert(stale.clone());
         pool.insert(live.clone());
@@ -1111,18 +1153,26 @@ mod tests {
     }
 
     #[test]
-    fn pool_reuses_http2_connections_without_a_local_stream_cap() {
+    fn pool_reuses_http2_connections_until_local_stream_cap() {
         let address = address_with_proxy(None);
         let pool = ConnectionPool::new(PoolSettings::default());
-        let connection =
-            make_connection_with_protocol(address.clone(), 32, ConnectionProtocol::Http2);
+        let connection = RealConnection::with_id_permit_coalescing_and_stream_cap(
+            openwire_core::next_connection_id(),
+            Route::direct(
+                address.clone(),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 32), 443)),
+            ),
+            ConnectionProtocol::Http2,
+            None,
+            CoalescingInfo::default(),
+            4,
+        );
         pool.insert(connection.clone());
 
-        for _ in 0..128 {
+        for _ in 0..4 {
             assert!(connection.try_acquire());
         }
-
-        assert!(pool.acquire(&address).is_some());
+        assert!(pool.acquire(&address).is_none());
         assert!(connection.release());
         assert!(pool.acquire(&address).is_some());
     }
@@ -1185,6 +1235,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolSettings {
             idle_timeout: Some(Duration::from_secs(5)),
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         });
         let connection = make_connection(address.clone(), 62);
         pool.insert(connection.clone());

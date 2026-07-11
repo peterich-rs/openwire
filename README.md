@@ -31,10 +31,16 @@ blocks, and stable observability hooks.
 - synthesized `Host` headers follow scheme-based URI normalization by omitting
   default `:80` / `:443` ports while preserving caller-supplied `Host` values
 - transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
-  through the default `compression` feature
+  through the default `compression` feature, with a default 128 MiB
+  decompressed-size cap against compression bombs
+- default cookie jar rejects public-suffix `Domain` cookies (RFC 6265 §5.3)
+  and honors the `Secure` attribute
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
-  including `socks5://user:pass@host:port` credentials and proxy-endpoint
-  fast fallback
+  including `http://user:pass@host:port` / `socks5://user:pass@host:port`
+  credentials on the initial attempt and proxy-endpoint fast fallback
+- bounded connection defaults (`max_connections_total=256`,
+  `max_connections_per_host=8`, HTTP/2 local stream budget `100`, pool
+  max lifetime `600s`)
 - dynamic per-request proxy selection via `ProxySelector`, including ordered
   proxy candidate fallback and `DIRECT`, with `ProxyRules` as the built-in
   rule-based implementation

@@ -748,11 +748,10 @@ impl RoutePlanner for DefaultRoutePlanner {
 
 fn order_for_fast_fallback(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let addrs = addrs.into_iter().collect::<Vec<_>>();
-    let Some(first) = addrs.first().copied() else {
+    if addrs.is_empty() {
         return Vec::new();
-    };
+    }
 
-    let first_family = RouteFamily::from_socket_addr(first);
     let mut by_family = HashMap::<RouteFamily, VecDeque<SocketAddr>>::new();
 
     for addr in addrs {
@@ -762,8 +761,14 @@ fn order_for_fast_fallback(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<S
             .push_back(addr);
     }
 
+    // Prefer starting with IPv6 when available (RFC 8305 guidance). This is
+    // staggered dual-stack dialing, not a full Happy Eyeballs v2 implementation.
+    let mut next_family = if by_family.contains_key(&RouteFamily::Ipv6) {
+        RouteFamily::Ipv6
+    } else {
+        RouteFamily::Ipv4
+    };
     let mut ordered = Vec::new();
-    let mut next_family = first_family;
 
     loop {
         let primary = by_family

@@ -30,5 +30,5 @@ pub(crate) use planning::{
 pub(crate) use pool::{ConnectionPool, PoolSettings, PoolStats};
 pub(crate) use real_connection::{
     ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection,
-    RealConnectionSnapshot,
+    RealConnectionSnapshot, DEFAULT_HTTP2_MAX_LOCAL_STREAMS,
 };

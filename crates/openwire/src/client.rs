@@ -87,17 +87,32 @@ pub struct QueuedCall {
     _task: BoxTaskHandle,
 }
 
+/// Default global connection cap.
+pub const DEFAULT_MAX_CONNECTIONS_TOTAL: usize = 256;
+/// Default per-address connection cap.
+pub const DEFAULT_MAX_CONNECTIONS_PER_HOST: usize = 8;
+/// Default maximum connection lifetime in the pool (absolute age).
+pub const DEFAULT_POOL_MAX_LIFETIME: Duration = Duration::from_secs(600);
+/// Default local concurrent-stream budget for HTTP/2 connections.
+pub const DEFAULT_HTTP2_MAX_LOCAL_STREAMS: usize =
+    crate::connection::DEFAULT_HTTP2_MAX_LOCAL_STREAMS;
+
 #[derive(Clone)]
 pub(crate) struct TransportConfig {
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) pool_idle_timeout: Option<Duration>,
     pub(crate) pool_max_idle_per_host: usize,
+    pub(crate) pool_max_lifetime: Option<Duration>,
     pub(crate) http2_keep_alive_interval: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: bool,
+    pub(crate) max_http2_streams: usize,
     pub(crate) max_connections_total: usize,
     pub(crate) max_connections_per_host: usize,
     pub(crate) max_requests_total: usize,
     pub(crate) max_requests_per_host: usize,
+    #[cfg(feature = "compression")]
+    pub(crate) max_decompressed_body_bytes: usize,
+    pub(crate) strict_host_header: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -334,6 +349,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the absolute maximum age of a pooled connection.
+    ///
+    /// Connections older than this are closed during pool pruning even if they
+    /// are still within the idle timeout. Pass `None` to disable.
+    pub fn pool_max_lifetime(mut self, lifetime: Option<Duration>) -> Self {
+        self.transport.pool_max_lifetime = lifetime;
+        self
+    }
+
     pub fn http2_keep_alive_interval(mut self, interval: Duration) -> Self {
         self.transport.http2_keep_alive_interval = Some(interval);
         self
@@ -341,6 +365,13 @@ impl ClientBuilder {
 
     pub fn http2_keep_alive_while_idle(mut self, enabled: bool) -> Self {
         self.transport.http2_keep_alive_while_idle = enabled;
+        self
+    }
+
+    /// Caps how many concurrent streams OpenWire will open on a single HTTP/2
+    /// connection before opening another connection.
+    pub fn max_http2_streams(mut self, max_streams: usize) -> Self {
+        self.transport.max_http2_streams = max_streams.max(1);
         self
     }
 
@@ -364,11 +395,37 @@ impl ClientBuilder {
         self
     }
 
+    /// Caps transparent response decompression output size.
+    ///
+    /// Only applies when the `compression` feature is enabled.
+    #[cfg(feature = "compression")]
+    pub fn max_decompressed_body_bytes(mut self, max_bytes: usize) -> Self {
+        self.transport.max_decompressed_body_bytes = max_bytes;
+        self
+    }
+
+    /// When enabled, rejects requests whose `Host` header does not match the
+    /// URI authority (after default-port normalization).
+    pub fn strict_host_header(mut self, enabled: bool) -> Self {
+        self.transport.strict_host_header = enabled;
+        self
+    }
+
     pub fn retry_canceled_requests(mut self, enabled: bool) -> Self {
         self.policy
             .retry
             .default_mut()
             .set_retry_canceled_requests(enabled);
+        self
+    }
+
+    /// Allows response-status retries (408 / immediate 503) for non-idempotent
+    /// methods when the body is replayable. Defaults to `false`.
+    pub fn retry_non_idempotent(mut self, enabled: bool) -> Self {
+        self.policy
+            .retry
+            .default_mut()
+            .set_retry_non_idempotent(enabled);
         self
     }
 
@@ -410,9 +467,10 @@ impl ClientBuilder {
         let pool = Arc::new(ConnectionPool::new(PoolSettings {
             idle_timeout: self.transport.pool_idle_timeout,
             max_idle_per_address: self.transport.pool_max_idle_per_host,
+            max_lifetime: self.transport.pool_max_lifetime,
         }));
         let pool_reaper = Arc::new(PoolReaperController::default());
-        let on_pooled_connection_published = if pool.settings().idle_timeout.is_some() {
+        let on_pooled_connection_published = if pool.settings().needs_reaper() {
             let reaper = pool_reaper.clone();
             let executor = self.executor.clone();
             let timer = self.timer.clone();
@@ -456,6 +514,9 @@ impl ClientBuilder {
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
+            #[cfg(feature = "compression")]
+            self.transport.max_decompressed_body_bytes,
+            self.transport.strict_host_header,
         );
 
         Ok(Client {
@@ -488,12 +549,17 @@ impl Default for ClientBuilder {
                 connect_timeout: None,
                 pool_idle_timeout: Some(Duration::from_secs(300)),
                 pool_max_idle_per_host: 5,
+                pool_max_lifetime: Some(DEFAULT_POOL_MAX_LIFETIME),
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
-                max_connections_total: usize::MAX,
-                max_connections_per_host: usize::MAX,
+                max_http2_streams: DEFAULT_HTTP2_MAX_LOCAL_STREAMS,
+                max_connections_total: DEFAULT_MAX_CONNECTIONS_TOTAL,
+                max_connections_per_host: DEFAULT_MAX_CONNECTIONS_PER_HOST,
                 max_requests_total: 64,
                 max_requests_per_host: 5,
+                #[cfg(feature = "compression")]
+                max_decompressed_body_bytes: crate::compression::DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
+                strict_host_header: false,
             },
             policy: PolicyConfig {
                 cookie_jar: None,
@@ -954,6 +1020,8 @@ fn build_service_chain(
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     policy: PolicyConfig,
+    #[cfg(feature = "compression")] max_decompressed_body_bytes: usize,
+    strict_host_header: bool,
 ) -> BoxWireService {
     let mut network: BoxWireService = BoxCloneSyncService::new(transport);
     for interceptor in network_interceptors.iter().rev() {
@@ -961,7 +1029,12 @@ fn build_service_chain(
             BoxCloneSyncService::new(InterceptorLayer::new(interceptor.clone()).layer(network));
     }
     network = BoxCloneSyncService::new(
-        InterceptorLayer::new(Arc::new(BridgeInterceptor) as SharedInterceptor).layer(network),
+        InterceptorLayer::new(Arc::new(BridgeInterceptor::new(
+            #[cfg(feature = "compression")]
+            max_decompressed_body_bytes,
+            strict_host_header,
+        )) as SharedInterceptor)
+        .layer(network),
     );
 
     let mut service: BoxWireService =
@@ -1237,11 +1310,11 @@ fn spawn_pool_reaper(
     timer: SharedTimer,
     pool: &Arc<ConnectionPool>,
 ) -> Result<Option<BoxTaskHandle>, WireError> {
-    let Some(idle_timeout) = pool.settings().idle_timeout else {
+    if !pool.settings().needs_reaper() {
         return Ok(None);
-    };
+    }
 
-    let cadence = pool_reaper_cadence(idle_timeout);
+    let cadence = pool_reaper_cadence(pool.settings().reaper_interval_hint());
     let weak_pool = Arc::downgrade(pool);
     executor
         .spawn(Box::pin(async move {
@@ -1407,8 +1480,10 @@ mod tests {
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
 
     use super::{
-        cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions,
-        ClientBuilder, ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
+        cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ClientBuilder,
+        ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
+        DEFAULT_HTTP2_MAX_LOCAL_STREAMS, DEFAULT_MAX_CONNECTIONS_PER_HOST,
+        DEFAULT_MAX_CONNECTIONS_TOTAL, DEFAULT_POOL_MAX_LIFETIME,
     };
     use crate::connection::CachedAddresses;
     use crate::proxy::{Proxy, ProxyRules, ProxySelection, ProxySelector, SelectedProxy};
@@ -1514,6 +1589,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(PoolSettings {
             idle_timeout: None,
             max_idle_per_address: usize::MAX,
+            max_lifetime: None,
         }));
 
         let handle =
@@ -1677,7 +1753,23 @@ mod tests {
             builder.transport.pool_idle_timeout,
             Some(Duration::from_secs(300))
         );
+        assert_eq!(
+            builder.transport.pool_max_lifetime,
+            Some(DEFAULT_POOL_MAX_LIFETIME)
+        );
         assert_eq!(builder.transport.pool_max_idle_per_host, 5);
+        assert_eq!(
+            builder.transport.max_connections_total,
+            DEFAULT_MAX_CONNECTIONS_TOTAL
+        );
+        assert_eq!(
+            builder.transport.max_connections_per_host,
+            DEFAULT_MAX_CONNECTIONS_PER_HOST
+        );
+        assert_eq!(
+            builder.transport.max_http2_streams,
+            DEFAULT_HTTP2_MAX_LOCAL_STREAMS
+        );
         assert_eq!(builder.transport.max_requests_total, 64);
         assert_eq!(builder.transport.max_requests_per_host, 5);
     }
