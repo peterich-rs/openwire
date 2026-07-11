@@ -141,7 +141,7 @@ impl Body for RequestBody {
     fn is_end_stream(&self) -> bool {
         match &self.inner {
             RequestBodyInner::Empty => true,
-            RequestBodyInner::Replayable { emitted, .. } => *emitted,
+            RequestBodyInner::Replayable { bytes, emitted } => *emitted || bytes.is_empty(),
             RequestBodyInner::Streaming { inner } => inner.is_end_stream(),
         }
     }

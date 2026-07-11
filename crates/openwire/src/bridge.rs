@@ -42,6 +42,8 @@ impl Interceptor for BridgeInterceptor {
         let transparent_compression = normalization.as_ref().copied().unwrap_or(false);
         Box::pin(async move {
             normalization?;
+            #[cfg(feature = "compression")]
+            let ctx = exchange.context().clone();
             let response = next.run(exchange).await?;
             #[cfg(feature = "compression")]
             {
@@ -50,6 +52,7 @@ impl Interceptor for BridgeInterceptor {
                         response,
                         &request_method,
                         max_decompressed_body_bytes,
+                        ctx,
                     ));
                 }
             }

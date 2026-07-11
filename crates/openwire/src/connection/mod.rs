@@ -12,7 +12,8 @@ pub(crate) use exchange_finder::{
     ResolvedAddress,
 };
 pub(crate) use fast_fallback::{
-    DirectDialDeps, FastFallbackDialer, FastFallbackOutcome, FastFallbackRuntime,
+    with_connect_timeout, DirectDialDeps, FastFallbackDialer, FastFallbackOutcome,
+    FastFallbackRuntime,
 };
 pub(crate) use limits::{
     ConnectionAvailability, ConnectionLimiter, ConnectionPermit, RequestAdmissionLimiter,

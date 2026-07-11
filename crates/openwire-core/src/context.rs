@@ -53,6 +53,8 @@ struct CallContextInner {
     created_at: Instant,
     deadline: Option<Instant>,
     connection_established: AtomicBool,
+    /// When set, response-body Drop discards the connection (decode/body errors).
+    body_force_discard: AtomicBool,
     tls_alpn_preference: TlsAlpnPreference,
 }
 
@@ -86,6 +88,7 @@ impl CallContext {
                 created_at,
                 deadline,
                 connection_established: AtomicBool::new(false),
+                body_force_discard: AtomicBool::new(false),
                 tls_alpn_preference,
             }),
         }
@@ -111,6 +114,14 @@ impl CallContext {
 
     pub fn listener(&self) -> &SharedEventListener {
         &self.inner.listener
+    }
+
+    pub fn mark_body_force_discard(&self) {
+        self.inner.body_force_discard.store(true, Ordering::Release);
+    }
+
+    pub fn body_force_discard(&self) -> bool {
+        self.inner.body_force_discard.load(Ordering::Acquire)
     }
 
     pub fn created_at(&self) -> Instant {

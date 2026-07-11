@@ -12,7 +12,7 @@ use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use openwire_core::{RequestBody, ResponseBody, WireError};
+use openwire_core::{CallContext, RequestBody, ResponseBody, WireError};
 use pin_project_lite::pin_project;
 
 const ACCEPTED_ENCODINGS: HeaderValue = HeaderValue::from_static("br, gzip, deflate, zstd");
@@ -42,6 +42,7 @@ pub(crate) fn decode_response(
     response: Response<ResponseBody>,
     request_method: &Method,
     max_decompressed_body_bytes: usize,
+    ctx: CallContext,
 ) -> Response<ResponseBody> {
     if !response_can_have_body(request_method, response.status()) {
         return response;
@@ -62,7 +63,7 @@ pub(crate) fn decode_response(
         .map(|encoding| encoding.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let body = DecodedResponseBody::new(body, encodings, label, max_decompressed_body_bytes);
+    let body = DecodedResponseBody::new(body, encodings, label, max_decompressed_body_bytes, ctx);
     Response::from_parts(parts, ResponseBody::new(body.boxed()))
 }
 
@@ -150,6 +151,7 @@ pin_project! {
         label: String,
         max_decompressed_body_bytes: usize,
         decoded_bytes: usize,
+        ctx: CallContext,
     }
 }
 
@@ -159,6 +161,7 @@ impl DecodedResponseBody {
         encodings: Vec<ResponseEncoding>,
         label: String,
         max_decompressed_body_bytes: usize,
+        ctx: CallContext,
     ) -> Self {
         let stream = body.into_data_stream().map_err(wire_error_to_io);
         let reader = stream.into_async_read();
@@ -173,6 +176,7 @@ impl DecodedResponseBody {
             label,
             max_decompressed_body_bytes,
             decoded_bytes: 0,
+            ctx,
         }
     }
 }
@@ -191,6 +195,7 @@ impl Body for DecodedResponseBody {
             Poll::Ready(Ok(0)) => Poll::Ready(None),
             Poll::Ready(Ok(read)) => {
                 let Some(total) = this.decoded_bytes.checked_add(read) else {
+                    this.ctx.mark_body_force_discard();
                     return Poll::Ready(Some(Err(WireError::body(
                         format!(
                             "decompressed {} response exceeded size limit {}",
@@ -200,6 +205,7 @@ impl Body for DecodedResponseBody {
                     ))));
                 };
                 if total > *this.max_decompressed_body_bytes {
+                    this.ctx.mark_body_force_discard();
                     return Poll::Ready(Some(Err(WireError::body(
                         format!(
                             "decompressed {} response exceeded size limit {}",
@@ -214,6 +220,7 @@ impl Body for DecodedResponseBody {
                 )))))
             }
             Poll::Ready(Err(error)) => {
+                this.ctx.mark_body_force_discard();
                 Poll::Ready(Some(Err(io_error_to_wire(error, this.label.as_str()))))
             }
             Poll::Pending => Poll::Pending,
@@ -479,7 +486,16 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response = decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
+        let response = decode_response(
+            response,
+            &Method::GET,
+            DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
+            openwire_core::CallContext::new(
+                std::sync::Arc::new(openwire_core::NoopEventListener)
+                    as openwire_core::SharedEventListener,
+                None,
+            ),
+        );
 
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
         assert!(response.headers().get(CONTENT_LENGTH).is_none());
@@ -493,7 +509,16 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response = decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
+        let response = decode_response(
+            response,
+            &Method::GET,
+            DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
+            openwire_core::CallContext::new(
+                std::sync::Arc::new(openwire_core::NoopEventListener)
+                    as openwire_core::SharedEventListener,
+                None,
+            ),
+        );
 
         assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "made-up");
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "20");

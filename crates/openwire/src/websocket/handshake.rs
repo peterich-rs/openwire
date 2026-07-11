@@ -37,10 +37,15 @@ pub(crate) fn derive_accept(client_key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
 
-pub(crate) fn generate_client_key() -> String {
+pub(crate) fn generate_client_key() -> Result<String, WireError> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed");
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        WireError::internal(
+            "failed to generate WebSocket client key",
+            std::io::Error::other(error.to_string()),
+        )
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 pub(crate) fn inject_handshake(request: &mut Request<RequestBody>) -> Result<(), WireError> {
@@ -63,7 +68,7 @@ pub(crate) fn inject_handshake(request: &mut Request<RequestBody>) -> Result<(),
         .headers_mut()
         .insert("sec-websocket-version", HeaderValue::from_static("13"));
 
-    let key = generate_client_key();
+    let key = generate_client_key()?;
     let accept = derive_accept(&key);
     request.headers_mut().insert(
         "sec-websocket-key",
@@ -546,15 +551,15 @@ mod tests {
 
     #[test]
     fn client_key_is_24_base64_chars() {
-        let k = generate_client_key();
+        let k = generate_client_key().expect("key");
         assert_eq!(k.len(), 24);
         assert!(k.ends_with('='), "16-byte base64 always ends with =");
     }
 
     #[test]
     fn client_key_is_random() {
-        let a = generate_client_key();
-        let b = generate_client_key();
+        let a = generate_client_key().expect("key");
+        let b = generate_client_key().expect("key");
         assert_ne!(a, b);
     }
 

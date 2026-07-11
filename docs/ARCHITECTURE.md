@@ -329,3 +329,19 @@ Optional live-network smoke suite:
 ```bash
 cargo test -p openwire --test live_network -- --ignored --test-threads=1
 ```
+
+## Connection teardown and connect budgets
+
+- Pool eviction (idle timeout, max idle, max lifetime, explicit remove) aborts the
+  owned hyper connection task and clears protocol bindings so sockets are closed,
+  not only removed from reuse indexes.
+- `connect_timeout` covers TCP establishment, TLS handshake, and protocol binding
+  for direct and proxy-tunneled paths.
+- HTTP/2 temporary sender unreadiness is handled by awaiting `ready()` on the
+  acquired sender under the call deadline, not by parking on pool availability.
+- Intermediate follow-up responses (auth / redirect / status retry) drain the
+  body up to a small cap before the next network attempt so HTTP/1 connections
+  can be reused when possible.
+- Transparent decompression failures mark the call for connection discard so
+  HTTP/2 connections are not returned to the pool as healthy after a body error.
+

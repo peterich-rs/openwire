@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openwire_core::ConnectionId;
@@ -10,6 +10,10 @@ use super::{
     RouteKind, RoutePlan, UriScheme,
 };
 use crate::sync_util::lock_mutex;
+
+/// Invoked after a connection is removed from pool metadata so transport can
+/// abort the owned hyper task and drop bindings. Must not re-enter the pool.
+pub(crate) type PoolEvictionHook = Arc<dyn Fn(ConnectionId) + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PoolSettings {
@@ -53,6 +57,7 @@ pub(crate) struct PoolStats {
 pub(crate) struct ConnectionPool {
     settings: PoolSettings,
     state: Mutex<PoolState>,
+    eviction_hook: Mutex<Option<PoolEvictionHook>>,
 }
 
 #[derive(Debug, Default)]
@@ -67,7 +72,16 @@ impl ConnectionPool {
         Self {
             settings,
             state: Mutex::new(PoolState::default()),
+            eviction_hook: Mutex::new(None),
         }
+    }
+
+    /// Installs a hook that runs after a connection leaves the pool.
+    ///
+    /// Transport uses this to abort hyper connection tasks and clear bindings
+    /// so idle eviction actually closes sockets.
+    pub(crate) fn set_eviction_hook(&self, hook: PoolEvictionHook) {
+        *lock_mutex(&self.eviction_hook) = Some(hook);
     }
 
     pub(crate) fn settings(&self) -> &PoolSettings {
@@ -76,26 +90,28 @@ impl ConnectionPool {
 
     pub(crate) fn insert(&self, connection: RealConnection) {
         let address = connection.address().clone();
-        {
-            let mut state = lock_mutex(&self.state);
-            state
-                .by_address
-                .entry(address.clone())
-                .or_default()
-                .push(connection.clone());
-            register_connection(&mut state, &connection);
-            prune_address(&self.settings, &mut state, &address);
-        }
+        let mut state = lock_mutex(&self.state);
+        state
+            .by_address
+            .entry(address.clone())
+            .or_default()
+            .push(connection.clone());
+        register_connection(&mut state, &connection);
+        let evicted = prune_address(&self.settings, &mut state, &address);
+        drop(state);
+        self.notify_evictions(evicted);
     }
 
     pub(crate) fn acquire(&self, address: &Address) -> Option<RealConnection> {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return None;
-        }
-
-        let connections = state.by_address.get_mut(address)?;
-        connections.iter().find(|conn| conn.try_acquire()).cloned()
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let result = state
+            .by_address
+            .get_mut(address)
+            .and_then(|connections| connections.iter().find(|conn| conn.try_acquire()).cloned());
+        drop(state);
+        self.notify_evictions(evicted);
+        result
     }
 
     pub(crate) fn acquire_with_in_use_hint(
@@ -103,31 +119,33 @@ impl ConnectionPool {
         address: &Address,
     ) -> (Option<RealConnection>, bool) {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return (None, false);
-        }
-
-        let Some(connections) = state.by_address.get_mut(address) else {
-            return (None, false);
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let result = match state.by_address.get_mut(address) {
+            Some(connections) => {
+                let connection = connections.iter().find(|conn| conn.try_acquire()).cloned();
+                let has_in_use = has_in_use_connection_unpruned(
+                    connections,
+                    connection.as_ref().map(RealConnection::id),
+                );
+                (connection, has_in_use)
+            }
+            None => (None, false),
         };
-        let connection = connections.iter().find(|conn| conn.try_acquire()).cloned();
-        let has_in_use = has_in_use_connection_unpruned(
-            connections,
-            connection.as_ref().map(RealConnection::id),
-        );
-        (connection, has_in_use)
+        drop(state);
+        self.notify_evictions(evicted);
+        result
     }
 
     pub(crate) fn has_in_use_connection(&self, address: &Address) -> bool {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return false;
-        }
-
-        state
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let result = state
             .by_address
             .get(address)
-            .is_some_and(|connections| has_in_use_connection_unpruned(connections, None))
+            .is_some_and(|connections| has_in_use_connection_unpruned(connections, None));
+        drop(state);
+        self.notify_evictions(evicted);
+        result
     }
 
     pub(crate) fn acquire_coalesced(
@@ -153,8 +171,13 @@ impl ConnectionPool {
             }
         }
 
+        let mut evicted = Vec::new();
         for candidate_address in addresses_to_prune {
-            prune_address(&self.settings, &mut state, &candidate_address);
+            evicted.extend(prune_address(
+                &self.settings,
+                &mut state,
+                &candidate_address,
+            ));
         }
 
         let mut candidates = Vec::new();
@@ -174,6 +197,7 @@ impl ConnectionPool {
         }
 
         drop(state);
+        self.notify_evictions(evicted);
 
         candidates
             .into_iter()
@@ -187,8 +211,9 @@ impl ConnectionPool {
 
         let address = connection.address().clone();
         let mut state = lock_mutex(&self.state);
-        prune_address(&self.settings, &mut state, &address);
-
+        let evicted = prune_address(&self.settings, &mut state, &address);
+        drop(state);
+        self.notify_evictions(evicted);
         true
     }
 
@@ -198,19 +223,20 @@ impl ConnectionPool {
         connection_id: ConnectionId,
     ) -> Option<RealConnection> {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return None;
-        }
-        if state.by_id.get(&connection_id) != Some(address) {
-            return None;
-        }
-
-        state.by_address.get(address).and_then(|connections| {
-            connections
-                .iter()
-                .find(|connection| connection.id() == connection_id)
-                .cloned()
-        })
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let result = if state.by_id.get(&connection_id) != Some(address) {
+            None
+        } else {
+            state.by_address.get(address).and_then(|connections| {
+                connections
+                    .iter()
+                    .find(|connection| connection.id() == connection_id)
+                    .cloned()
+            })
+        };
+        drop(state);
+        self.notify_evictions(evicted);
+        result
     }
 
     pub(crate) fn acquire_by_id(
@@ -219,21 +245,38 @@ impl ConnectionPool {
         connection_id: ConnectionId,
     ) -> Option<RealConnection> {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return None;
-        }
-        if state.by_id.get(&connection_id) != Some(address) {
-            return None;
-        }
-
-        let connections = state.by_address.get_mut(address)?;
-        connections.iter().find_map(|connection| {
-            (connection.id() == connection_id && connection.try_acquire())
-                .then(|| connection.clone())
-        })
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let result = if state.by_id.get(&connection_id) != Some(address) {
+            None
+        } else {
+            state.by_address.get_mut(address).and_then(|connections| {
+                connections.iter().find_map(|connection| {
+                    (connection.id() == connection_id && connection.try_acquire())
+                        .then(|| connection.clone())
+                })
+            })
+        };
+        drop(state);
+        self.notify_evictions(evicted);
+        result
     }
 
     pub(crate) fn remove(&self, connection_id: ConnectionId) -> Option<RealConnection> {
+        let removed = self.remove_without_hook(connection_id);
+        if removed.is_some() {
+            self.notify_evictions(vec![connection_id]);
+        }
+        removed
+    }
+
+    /// Removes pool metadata without running the eviction hook.
+    ///
+    /// Used by transport teardown after it has already aborted the connection
+    /// task, so the hook does not re-enter abort/remove.
+    pub(crate) fn remove_without_hook(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<RealConnection> {
         let mut state = lock_mutex(&self.state);
         let address = state.by_id.remove(&connection_id)?;
         let mut removed = None;
@@ -264,31 +307,49 @@ impl ConnectionPool {
 
     pub(crate) fn stats(&self, address: &Address) -> PoolStats {
         let mut state = lock_mutex(&self.state);
-        if !prune_address(&self.settings, &mut state, address) {
-            return PoolStats::default();
-        }
-        let Some(connections) = state.by_address.get(address) else {
-            return PoolStats::default();
+        let evicted = prune_address(&self.settings, &mut state, address);
+        let stats = match state.by_address.get(address) {
+            Some(connections) => {
+                connections
+                    .iter()
+                    .fold(PoolStats::default(), |mut stats, connection| {
+                        stats.total += 1;
+                        match connection.snapshot().allocation {
+                            ConnectionAllocationState::Idle => stats.idle += 1,
+                            ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
+                            ConnectionAllocationState::Closed => {}
+                        }
+                        stats
+                    })
+            }
+            None => PoolStats::default(),
         };
-
-        connections
-            .iter()
-            .fold(PoolStats::default(), |mut stats, connection| {
-                stats.total += 1;
-                match connection.snapshot().allocation {
-                    ConnectionAllocationState::Idle => stats.idle += 1,
-                    ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
-                    ConnectionAllocationState::Closed => {}
-                }
-                stats
-            })
+        drop(state);
+        self.notify_evictions(evicted);
+        stats
     }
 
     pub(crate) fn prune_all(&self) {
         let mut state = lock_mutex(&self.state);
         let addresses = state.by_address.keys().cloned().collect::<Vec<_>>();
+        let mut evicted = Vec::new();
         for address in addresses {
-            prune_address(&self.settings, &mut state, &address);
+            evicted.extend(prune_address(&self.settings, &mut state, &address));
+        }
+        drop(state);
+        self.notify_evictions(evicted);
+    }
+
+    fn notify_evictions(&self, connection_ids: Vec<ConnectionId>) {
+        if connection_ids.is_empty() {
+            return;
+        }
+        let hook = lock_mutex(&self.eviction_hook).clone();
+        let Some(hook) = hook else {
+            return;
+        };
+        for connection_id in connection_ids {
+            hook(connection_id);
         }
     }
 }
@@ -301,26 +362,32 @@ impl std::fmt::Debug for ConnectionPool {
     }
 }
 
-fn prune_address(settings: &PoolSettings, state: &mut PoolState, address: &Address) -> bool {
+/// Returns connection ids closed and removed from the pool.
+fn prune_address(
+    settings: &PoolSettings,
+    state: &mut PoolState,
+    address: &Address,
+) -> Vec<ConnectionId> {
     let (removed, empty) = {
         let Some(connections) = state.by_address.get_mut(address) else {
-            return false;
+            return Vec::new();
         };
 
         let removed = prune_connections(settings, connections);
         (removed, connections.is_empty())
     };
 
+    let mut ids = Vec::with_capacity(removed.len());
     for connection in &removed {
         unregister_connection(state, connection);
+        ids.push(connection.id());
     }
 
     if empty {
         state.by_address.remove(address);
-        return false;
     }
 
-    true
+    ids
 }
 
 fn prune_connections(
@@ -330,6 +397,15 @@ fn prune_connections(
     let mut removed = Vec::new();
     connections.retain(|connection| {
         if !connection.is_healthy() {
+            // Keep unhealthy connections that still have live allocations so
+            // HTTP/2 multiplex bookkeeping can drain cleanly. They are not
+            // re-acquired because try_acquire requires Healthy.
+            if matches!(
+                connection.snapshot().allocation,
+                ConnectionAllocationState::InUse { .. }
+            ) {
+                return true;
+            }
             connection.close();
             removed.push(connection.clone());
             return false;

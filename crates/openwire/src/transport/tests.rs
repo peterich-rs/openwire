@@ -1359,6 +1359,6 @@ fn connection_task_registry_recovers_after_mutex_poisoning() {
 
     let _ = panic::catch_unwind(AssertUnwindSafe(|| registry.poison_handles_for_test()));
 
-    let (task_id, _weak) = registry.reserve();
-    registry.cancel(task_id);
+    let connection_id = openwire_core::next_connection_id();
+    registry.abort_connection(connection_id);
 }

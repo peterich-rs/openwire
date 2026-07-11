@@ -133,7 +133,7 @@ impl Sink<EngineFrame> for NativeSink {
         validate_outbound_engine_frame(&item)?;
 
         let me = self.get_mut();
-        let key = random_mask_key();
+        let key = random_mask_key()?;
         let header = match &item {
             EngineFrame::Text(_) => FrameHeader {
                 fin: true,
