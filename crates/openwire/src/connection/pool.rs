@@ -196,11 +196,7 @@ impl ConnectionPool {
         let mut removed = Vec::new();
         for candidate_address in &addresses_to_prune {
             let mut state = lock_mutex(self.shard(candidate_address));
-            removed.extend(prune_address(
-                &self.settings,
-                &mut state,
-                candidate_address,
-            ));
+            removed.extend(prune_address(&self.settings, &mut state, candidate_address));
         }
         self.finish_removals(removed);
 
@@ -334,18 +330,19 @@ impl ConnectionPool {
         let mut state = lock_mutex(self.shard(address));
         let removed = prune_address(&self.settings, &mut state, address);
         let stats = match state.by_address.get(address) {
-            Some(connections) => connections.iter().fold(
-                PoolStats::default(),
-                |mut stats, connection| {
-                    stats.total += 1;
-                    match connection.snapshot().allocation {
-                        ConnectionAllocationState::Idle => stats.idle += 1,
-                        ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
-                        ConnectionAllocationState::Closed => {}
-                    }
-                    stats
-                },
-            ),
+            Some(connections) => {
+                connections
+                    .iter()
+                    .fold(PoolStats::default(), |mut stats, connection| {
+                        stats.total += 1;
+                        match connection.snapshot().allocation {
+                            ConnectionAllocationState::Idle => stats.idle += 1,
+                            ConnectionAllocationState::InUse { .. } => stats.in_use += 1,
+                            ConnectionAllocationState::Closed => {}
+                        }
+                        stats
+                    })
+            }
             None => PoolStats::default(),
         };
         drop(state);
@@ -798,10 +795,7 @@ mod tests {
         let connection = make_connection(address.clone(), 10);
         let connection_id = connection.id();
         pool.insert(connection.clone());
-        assert_eq!(
-            lock_mutex(&pool.by_id).get(&connection_id),
-            Some(&address)
-        );
+        assert_eq!(lock_mutex(&pool.by_id).get(&connection_id), Some(&address));
 
         assert_eq!(
             pool.stats(&address),
@@ -1208,10 +1202,7 @@ mod tests {
             }
         );
         assert!(!lock_mutex(&pool.by_id).contains_key(&stale_id));
-        assert_eq!(
-            lock_mutex(&pool.by_id).get(&live_id),
-            Some(&live_address)
-        );
+        assert_eq!(lock_mutex(&pool.by_id).get(&live_id), Some(&live_address));
     }
 
     #[test]
@@ -1368,5 +1359,4 @@ mod tests {
         assert!(pool.acquire(&a).is_none());
         assert!(pool.acquire(&b).is_none());
     }
-
 }

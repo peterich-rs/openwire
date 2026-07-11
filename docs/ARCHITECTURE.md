@@ -358,3 +358,10 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 - `ResponseBody::text()` reclaims the collected `Bytes` buffer via `into()` when
   unique, avoiding an extra `to_vec()` copy on the common path.
 
+- Default clients wrap the system resolver in `CachingDnsResolver` (30s positive /
+  5s negative TTL) to avoid repeated system lookups under connection churn.
+- Follow-up snapshots stay light when redirects, retries, and authenticators are
+  all disabled, so the common single-shot path skips header/extension cloning.
+- Request admission permits are held via response extensions into the call
+  lifecycle body, avoiding an extra `BoxBody` layer on the returned response.
+

@@ -94,7 +94,8 @@ impl Service<Exchange> for FollowUpPolicyService {
                 policy_trace.auth_count = auths;
                 request.extensions_mut().insert(policy_trace);
 
-                let snapshot = RequestSnapshot::capture(&request);
+                let snapshot =
+                    RequestSnapshot::capture(&request, SnapshotCaptureMode::for_policy(&config));
                 apply_request_cookies(&mut request, config.cookie_jar.as_deref())?;
                 let exchange = Exchange::new(request, ctx.clone(), attempt);
                 let result = if first_network_attempt {
@@ -385,8 +386,8 @@ async fn authenticate_response(
             snapshot.method.clone(),
             snapshot.uri.clone(),
             snapshot.version,
-            (*snapshot.headers).clone(),
-            (*snapshot.extensions).clone(),
+            snapshot.headers()?.clone(),
+            snapshot.extensions()?.clone(),
             snapshot.body.as_ref().and_then(RequestBody::try_clone),
         ),
         AuthResponseState::new(response.status(), response.headers().clone()),
@@ -508,14 +509,42 @@ fn store_response_cookies(
     Ok(())
 }
 
+/// Whether this attempt may need a rebuilt request after the network hop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotCaptureMode {
+    /// Headers/extensions are not needed (no redirect/auth/retry possible).
+    Light,
+    /// Full rebuild material may be required after the response.
+    Rebuildable,
+}
+
+impl SnapshotCaptureMode {
+    fn for_policy(config: &PolicyConfig) -> Self {
+        let may_redirect = config
+            .redirect
+            .default_policy()
+            .map(|policy| policy.follow_redirects())
+            .unwrap_or(true);
+        let may_retry =
+            config.retry.default_config().max_retries() > 0 || config.retry.has_custom_policy();
+        let may_auth =
+            config.auth.authenticator.is_some() || config.auth.proxy_authenticator.is_some();
+        if may_redirect || may_retry || may_auth {
+            Self::Rebuildable
+        } else {
+            Self::Light
+        }
+    }
+}
+
 struct RequestSnapshot {
     method: Method,
     uri: Uri,
     version: Version,
-    /// Shared so auth / retry rebuilds do not re-clone the full map on each hop.
-    headers: Arc<HeaderMap>,
-    /// Shared request extensions captured at attempt start.
-    extensions: Arc<http::Extensions>,
+    /// Present only when capture mode is rebuildable.
+    headers: Option<Arc<HeaderMap>>,
+    /// Present only when capture mode is rebuildable.
+    extensions: Option<Arc<http::Extensions>>,
     body: Option<RequestBody>,
 }
 
@@ -526,19 +555,44 @@ fn request_url(uri: &Uri) -> Result<Url, WireError> {
 }
 
 impl RequestSnapshot {
-    fn capture(request: &Request<RequestBody>) -> Self {
+    fn capture(request: &Request<RequestBody>, mode: SnapshotCaptureMode) -> Self {
+        let (headers, extensions) = match mode {
+            SnapshotCaptureMode::Light => (None, None),
+            SnapshotCaptureMode::Rebuildable => (
+                Some(Arc::new(request.headers().clone())),
+                Some(Arc::new(request.extensions().clone())),
+            ),
+        };
         Self {
             method: request.method().clone(),
             uri: request.uri().clone(),
             version: request.version(),
-            headers: Arc::new(request.headers().clone()),
-            extensions: Arc::new(request.extensions().clone()),
+            headers,
+            extensions,
             body: request.body().try_clone(),
         }
     }
 
     fn is_replayable(&self) -> bool {
         self.body.is_some()
+    }
+
+    fn headers(&self) -> Result<&HeaderMap, WireError> {
+        self.headers.as_deref().ok_or_else(|| {
+            WireError::internal(
+                "request snapshot is missing headers for follow-up rebuild",
+                std::io::Error::other("light snapshot used for rebuild"),
+            )
+        })
+    }
+
+    fn extensions(&self) -> Result<&http::Extensions, WireError> {
+        self.extensions.as_deref().ok_or_else(|| {
+            WireError::internal(
+                "request snapshot is missing extensions for follow-up rebuild",
+                std::io::Error::other("light snapshot used for rebuild"),
+            )
+        })
     }
 
     fn to_retry_request(
@@ -560,8 +614,8 @@ impl RequestSnapshot {
             .uri(self.uri.clone())
             .version(self.version)
             .body(body)?;
-        *request.headers_mut() = (*self.headers).clone();
-        *request.extensions_mut() = (*self.extensions).clone();
+        *request.headers_mut() = self.headers()?.clone();
+        *request.extensions_mut() = self.extensions()?.clone();
         let sticky_proxy = request.extensions().get::<SelectedProxy>().cloned();
         reset_network_attempt_extensions(request.extensions_mut(), sticky_proxy);
         request.extensions_mut().insert(policy_trace);
@@ -606,7 +660,13 @@ impl RequestSnapshot {
             self.method
         };
 
-        let mut headers = Arc::try_unwrap(self.headers).unwrap_or_else(|arc| (*arc).clone());
+        let headers = self.headers.ok_or_else(|| {
+            WireError::internal(
+                "request snapshot is missing headers for redirect rebuild",
+                std::io::Error::other("light snapshot used for rebuild"),
+            )
+        })?;
+        let mut headers = Arc::try_unwrap(headers).unwrap_or_else(|arc| (*arc).clone());
         headers.remove(HOST);
         if !same_origin {
             strip_sensitive_cross_origin_headers(&mut headers);
@@ -619,6 +679,13 @@ impl RequestSnapshot {
             headers.remove(EXPECT);
         }
 
+        let extensions = self.extensions.ok_or_else(|| {
+            WireError::internal(
+                "request snapshot is missing extensions for redirect rebuild",
+                std::io::Error::other("light snapshot used for rebuild"),
+            )
+        })?;
+
         let mut request = Request::builder()
             .method(method)
             .uri(next_uri)
@@ -626,7 +693,7 @@ impl RequestSnapshot {
             .body(body)?;
         *request.headers_mut() = headers;
         *request.extensions_mut() =
-            Arc::try_unwrap(self.extensions).unwrap_or_else(|arc| (*arc).clone());
+            Arc::try_unwrap(extensions).unwrap_or_else(|arc| (*arc).clone());
         reset_network_attempt_extensions(request.extensions_mut(), selected_proxy);
         request.extensions_mut().insert(policy_trace);
         Ok(Some(request))
@@ -797,7 +864,7 @@ mod tests {
                 HeaderValue::from_str(value).expect("header value"),
             );
         }
-        RequestSnapshot::capture(&request)
+        RequestSnapshot::capture(&request, super::SnapshotCaptureMode::Rebuildable)
     }
 
     #[test]
@@ -939,7 +1006,7 @@ mod tests {
                 Result<bytes::Bytes, WireError>,
             >()))
             .expect("request");
-        let snapshot = RequestSnapshot::capture(&request);
+        let snapshot = RequestSnapshot::capture(&request, super::SnapshotCaptureMode::Rebuildable);
 
         let next = snapshot
             .into_redirect_request(
@@ -967,7 +1034,7 @@ mod tests {
             .header(EXPECT, "100-continue")
             .body(RequestBody::from_static(b"{}"))
             .expect("request");
-        let snapshot = RequestSnapshot::capture(&request);
+        let snapshot = RequestSnapshot::capture(&request, super::SnapshotCaptureMode::Rebuildable);
         let next = snapshot
             .into_redirect_request(
                 StatusCode::FOUND,

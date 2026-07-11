@@ -294,6 +294,145 @@ impl DnsResolver for SystemDnsResolver {
     }
 }
 
+/// In-process DNS cache layered over another [`DnsResolver`].
+///
+/// Positive results are retained for `positive_ttl`. Empty / failed lookups are
+/// retained for `negative_ttl` so transient NXDOMAIN storms do not hammer the
+/// system resolver. Cache keys are `(host, port)`.
+#[derive(Clone, Debug)]
+pub struct CachingDnsResolver<R = SystemDnsResolver> {
+    inner: R,
+    positive_ttl: Duration,
+    negative_ttl: Duration,
+    cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<DnsCacheKey, DnsCacheEntry>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DnsCacheKey {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct DnsCacheEntry {
+    expires_at: Instant,
+    outcome: DnsCacheOutcome,
+}
+
+#[derive(Clone, Debug)]
+enum DnsCacheOutcome {
+    Ok(Vec<SocketAddr>),
+    Err(String),
+}
+
+impl CachingDnsResolver<SystemDnsResolver> {
+    /// Builds a cache over the system resolver with 30s positive / 5s negative TTL.
+    pub fn system() -> Self {
+        Self::new(
+            SystemDnsResolver,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+    }
+}
+
+impl<R> CachingDnsResolver<R> {
+    pub fn new(inner: R, positive_ttl: Duration, negative_ttl: Duration) -> Self {
+        Self {
+            inner,
+            positive_ttl,
+            negative_ttl,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    pub fn positive_ttl(&self) -> Duration {
+        self.positive_ttl
+    }
+
+    pub fn negative_ttl(&self) -> Duration {
+        self.negative_ttl
+    }
+}
+
+impl<R> DnsResolver for CachingDnsResolver<R>
+where
+    R: DnsResolver + Clone,
+{
+    fn resolve(
+        &self,
+        ctx: CallContext,
+        host: String,
+        port: u16,
+    ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
+        let inner = self.inner.clone();
+        let cache = self.cache.clone();
+        let positive_ttl = self.positive_ttl;
+        let negative_ttl = self.negative_ttl;
+        Box::pin(async move {
+            let key = DnsCacheKey {
+                host: host.clone(),
+                port,
+            };
+            let now = Instant::now();
+            if let Ok(guard) = cache.lock() {
+                if let Some(entry) = guard.get(&key) {
+                    if entry.expires_at > now {
+                        match &entry.outcome {
+                            DnsCacheOutcome::Ok(addrs) => {
+                                ctx.listener().dns_start(&ctx, &host, port);
+                                ctx.listener().dns_end(&ctx, &host, addrs);
+                                return Ok(addrs.clone());
+                            }
+                            DnsCacheOutcome::Err(message) => {
+                                ctx.listener().dns_start(&ctx, &host, port);
+                                let error = WireError::dns(
+                                    message.clone(),
+                                    io::Error::new(io::ErrorKind::NotFound, message.clone()),
+                                );
+                                ctx.listener().dns_failed(&ctx, &host, &error);
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+
+            match inner.resolve(ctx.clone(), host.clone(), port).await {
+                Ok(addrs) => {
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(
+                            key,
+                            DnsCacheEntry {
+                                expires_at: Instant::now() + positive_ttl,
+                                outcome: DnsCacheOutcome::Ok(addrs.clone()),
+                            },
+                        );
+                        // Opportunistic sweep of a few expired entries.
+                        if guard.len() > 256 {
+                            let now = Instant::now();
+                            guard.retain(|_, entry| entry.expires_at > now);
+                        }
+                    }
+                    Ok(addrs)
+                }
+                Err(error) => {
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(
+                            key,
+                            DnsCacheEntry {
+                                expires_at: Instant::now() + negative_ttl,
+                                outcome: DnsCacheOutcome::Err(error.message().to_owned()),
+                            },
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TokioTcpConnector;
 
@@ -433,5 +572,65 @@ mod tests {
         let mut sleep = hyper::rt::Timer::sleep(&timer, Duration::from_secs(5));
         timer.reset(&mut sleep, timer.now() + Duration::from_millis(1));
         sleep.await;
+    }
+
+    #[tokio::test]
+    async fn caching_dns_resolver_reuses_positive_results() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use openwire_core::{
+            BoxFuture, CallContext, DnsResolver, NoopEventListener, SharedEventListener, WireError,
+        };
+
+        use super::CachingDnsResolver;
+
+        #[derive(Clone)]
+        struct CountingResolver {
+            hits: Arc<AtomicUsize>,
+            addr: SocketAddr,
+        }
+
+        impl DnsResolver for CountingResolver {
+            fn resolve(
+                &self,
+                ctx: CallContext,
+                host: String,
+                port: u16,
+            ) -> BoxFuture<Result<Vec<SocketAddr>, WireError>> {
+                let hits = self.hits.clone();
+                let mut addr = self.addr;
+                Box::pin(async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    ctx.listener().dns_start(&ctx, &host, port);
+                    addr.set_port(port);
+                    let addrs = vec![addr];
+                    ctx.listener().dns_end(&ctx, &host, &addrs);
+                    Ok(addrs)
+                })
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let inner = CountingResolver {
+            hits: hits.clone(),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 0),
+        };
+        let resolver =
+            CachingDnsResolver::new(inner, Duration::from_secs(60), Duration::from_secs(1));
+        let listener: SharedEventListener = Arc::new(NoopEventListener);
+        let ctx = CallContext::new(listener, None);
+
+        let first = resolver
+            .resolve(ctx.clone(), "example.com".into(), 80)
+            .await
+            .expect("first");
+        let second = resolver
+            .resolve(ctx, "example.com".into(), 80)
+            .await
+            .expect("second");
+        assert_eq!(first, second);
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 }
