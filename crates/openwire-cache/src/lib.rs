@@ -918,14 +918,12 @@ fn header_value_count(headers: &HeaderMap, name: HeaderName) -> usize {
 }
 
 fn explicit_expires_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
-    let expires = match headers.get(EXPIRES) {
-        Some(value) => value
-            .to_str()
-            .ok()
-            .and_then(|value| httpdate::parse_http_date(value).ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-        None => return None,
-    };
+    let expires = headers
+        .get(EXPIRES)?
+        .to_str()
+        .ok()
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let date = parse_http_date_header(headers, DATE).unwrap_or(now);
     Some(expires.duration_since(date).unwrap_or_default())
 }
