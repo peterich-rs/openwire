@@ -260,9 +260,7 @@ enum DeflateAutoState {
         peeked_len: usize,
     },
     /// Decoder selected; remaining stream is already wired with the prefix.
-    Decoding {
-        reader: BoxAsyncBufRead,
-    },
+    Decoding { reader: BoxAsyncBufRead },
 }
 
 impl DeflateAutoDecoder {
@@ -276,11 +274,7 @@ impl DeflateAutoDecoder {
         }
     }
 
-    fn finish_peek(
-        reader: BoxAsyncBufRead,
-        peeked: [u8; 2],
-        peeked_len: usize,
-    ) -> BoxAsyncBufRead {
+    fn finish_peek(reader: BoxAsyncBufRead, peeked: [u8; 2], peeked_len: usize) -> BoxAsyncBufRead {
         let use_zlib = looks_like_zlib_header(&peeked[..peeked_len]);
         let prefixed: BoxAsyncBufRead = Box::pin(PrefixedReader {
             prefix: peeked,
@@ -367,8 +361,7 @@ impl AsyncRead for PrefixedReader {
         if self.prefix_pos < self.prefix_len {
             let available = self.prefix_len - self.prefix_pos;
             let copy = available.min(buf.len());
-            buf[..copy]
-                .copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + copy]);
+            buf[..copy].copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + copy]);
             self.prefix_pos += copy;
             return Poll::Ready(Ok(copy));
         }
@@ -486,8 +479,7 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response =
-            decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
+        let response = decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
 
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
         assert!(response.headers().get(CONTENT_LENGTH).is_none());
@@ -501,8 +493,7 @@ mod tests {
             .body(ResponseBody::empty())
             .expect("response");
 
-        let response =
-            decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
+        let response = decode_response(response, &Method::GET, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES);
 
         assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "made-up");
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "20");

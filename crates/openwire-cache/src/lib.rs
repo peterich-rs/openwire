@@ -505,7 +505,11 @@ impl MemoryCacheStore {
             .sum()
     }
 
-    fn enforce_limits(entries: &mut HashMap<String, Vec<CachedResponse>>, max_entries: usize, max_body_bytes: usize) {
+    fn enforce_limits(
+        entries: &mut HashMap<String, Vec<CachedResponse>>,
+        max_entries: usize,
+        max_body_bytes: usize,
+    ) {
         while entries.len() > max_entries {
             if let Some(oldest) = entries.keys().next().cloned() {
                 entries.remove(&oldest);

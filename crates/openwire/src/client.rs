@@ -558,7 +558,8 @@ impl Default for ClientBuilder {
                 max_requests_total: 64,
                 max_requests_per_host: 5,
                 #[cfg(feature = "compression")]
-                max_decompressed_body_bytes: crate::compression::DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
+                max_decompressed_body_bytes:
+                    crate::compression::DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
                 strict_host_header: false,
             },
             policy: PolicyConfig {
@@ -1480,8 +1481,8 @@ mod tests {
     use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
 
     use super::{
-        cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions, ClientBuilder,
-        ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
+        cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions,
+        ClientBuilder, ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
         DEFAULT_HTTP2_MAX_LOCAL_STREAMS, DEFAULT_MAX_CONNECTIONS_PER_HOST,
         DEFAULT_MAX_CONNECTIONS_TOTAL, DEFAULT_POOL_MAX_LIFETIME,
     };

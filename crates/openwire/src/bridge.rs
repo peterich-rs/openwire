@@ -92,15 +92,11 @@ fn normalize_host_header(
             let existing = existing.to_str().map_err(|error| {
                 WireError::invalid_request(format!("Host header is not valid ASCII: {error}"))
             })?;
-            if !existing.eq_ignore_ascii_case(
-                expected
-                    .to_str()
-                    .map_err(|error| {
-                        WireError::invalid_request(format!(
-                            "synthesized Host header is not valid ASCII: {error}"
-                        ))
-                    })?,
-            ) {
+            if !existing.eq_ignore_ascii_case(expected.to_str().map_err(|error| {
+                WireError::invalid_request(format!(
+                    "synthesized Host header is not valid ASCII: {error}"
+                ))
+            })?) {
                 return Err(WireError::invalid_request(format!(
                     "Host header {existing:?} does not match request URI authority"
                 )));

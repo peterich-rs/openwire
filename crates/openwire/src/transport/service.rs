@@ -932,15 +932,14 @@ fn apply_forward_proxy_credentials(
         return Ok(());
     }
 
-    let value = http::HeaderValue::from_str(&credentials.basic_auth_header_value()).map_err(
-        |error| {
+    let value =
+        http::HeaderValue::from_str(&credentials.basic_auth_header_value()).map_err(|error| {
             WireError::with_source(
                 WireErrorKind::InvalidRequest,
                 "proxy basic auth header is not valid ASCII",
                 error,
             )
-        },
-    )?;
+        })?;
     request.headers_mut().insert(PROXY_AUTHORIZATION, value);
     Ok(())
 }

@@ -57,7 +57,9 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
     request
         .extensions_mut()
         .insert(WebSocketRequestMarker::new(subprotocols.clone()));
-    crate::bridge::normalize_request(&mut request).map_err(WebSocketError::Io)?;
+    // WebSocket handshakes do not currently thread ClientBuilder host policy;
+    // use the lenient default (caller-supplied Host is preserved).
+    crate::bridge::normalize_request(&mut request, false).map_err(WebSocketError::Io)?;
 
     let expected_accept = request
         .extensions()
