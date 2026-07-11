@@ -788,6 +788,7 @@ async fn send_connect_request(
 }
 
 fn build_connect_request(authority: &str, headers: &HeaderMap) -> Result<String, WireError> {
+    validate_connect_token(authority, "proxy CONNECT authority")?;
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     for (name, value) in headers {
         if *name == HOST {
@@ -800,6 +801,7 @@ fn build_connect_request(authority: &str, headers: &HeaderMap) -> Result<String,
                 name.as_str()
             ))
         })?;
+        validate_connect_token(value, "proxy CONNECT header value")?;
         request.push_str(name.as_str());
         request.push_str(": ");
         request.push_str(value);
@@ -807,6 +809,15 @@ fn build_connect_request(authority: &str, headers: &HeaderMap) -> Result<String,
     }
     request.push_str("\r\n");
     Ok(request)
+}
+
+fn validate_connect_token(value: &str, what: &str) -> Result<(), WireError> {
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(WireError::invalid_request(format!(
+            "{what} must not contain CR, LF, or NUL"
+        )));
+    }
+    Ok(())
 }
 
 async fn read_connect_response(

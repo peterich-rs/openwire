@@ -255,6 +255,36 @@ fn prepare_request_for_send_clears_proxy_authorization_when_selected_proxy_chang
 }
 
 #[test]
+fn prepare_request_for_send_injects_forward_proxy_url_credentials() {
+    let proxy = Proxy::http("http://user:pass@proxy.test:8080").expect("proxy");
+    let address = Address::from_uri(
+        &"http://example.com/resource".parse().expect("uri"),
+        Some(&SelectedProxy::from_proxy(&proxy)),
+    )
+    .expect("address");
+    let route = Route::http_forward(address, ([127, 0, 0, 1], 8080).into());
+    let request = Request::builder()
+        .uri("http://example.com/resource")
+        .body(RequestBody::empty())
+        .expect("request");
+    let request = prepare_request_for_send(
+        request,
+        Some(&SelectedProxy::from_proxy(&proxy)),
+        ConnectionProtocol::Http1,
+        route.kind(),
+    )
+    .expect("prepare");
+
+    assert_eq!(
+        request
+            .headers()
+            .get(PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic dXNlcjpwYXNz")
+    );
+}
+
+#[test]
 fn prepare_request_for_send_preserves_proxy_authorization_for_same_selected_proxy() {
     let proxy = Proxy::http("http://proxy.test:8080").expect("proxy");
     let selected_proxy = SelectedProxy::from_proxy(&proxy);

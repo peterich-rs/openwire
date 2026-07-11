@@ -218,18 +218,12 @@ impl ConnectionLimiter {
         };
 
         let global = match &inner.global {
-            Some(semaphore) => match semaphore.try_acquire_owned() {
-                Some(permit) => Some(permit),
-                None => return None,
-            },
+            Some(semaphore) => Some(semaphore.try_acquire_owned()?),
             None => None,
         };
 
         let per_address = match &inner.per_address {
-            Some(limiters) => match limiters.try_acquire(address) {
-                Some(permit) => Some(permit),
-                None => return None,
-            },
+            Some(limiters) => Some(limiters.try_acquire(address)?),
             None => None,
         };
 

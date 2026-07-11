@@ -1,23 +1,48 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use bytes::Bytes;
 use cookie as cookie_crate;
 use cookie_store::CookieStore;
 use http::header::HeaderValue;
 use openwire_core::CookieJar;
+use publicsuffix::List;
 
 use crate::sync_util::{read_rwlock, write_rwlock};
 
 pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 
-/// Default in-memory cookie jar backed by `cookie_store`.
-#[derive(Default)]
+/// Embedded Mozilla Public Suffix List used by the default jar.
+///
+/// Loaded once so `Domain=.com` style cookies are rejected per RFC 6265 §5.3.
+static PUBLIC_SUFFIX_LIST: LazyLock<List> = LazyLock::new(|| {
+    List::from_bytes(include_bytes!("../data/public_suffix_list.dat"))
+        .expect("embedded public suffix list must parse")
+});
+
+/// Default in-memory cookie jar backed by `cookie_store` with public-suffix
+/// rejection enabled.
 pub struct Jar(RwLock<CookieStore>);
 
+impl Default for Jar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Jar {
-    /// Creates an empty in-memory cookie jar.
+    /// Creates an empty in-memory cookie jar with the embedded public suffix list.
     pub fn new() -> Self {
-        Self::default()
+        Self(RwLock::new(CookieStore::new(Some(
+            PUBLIC_SUFFIX_LIST.clone(),
+        ))))
+    }
+
+    /// Creates a jar with an explicit public suffix list.
+    ///
+    /// Pass `None` only for tests that intentionally disable public-suffix
+    /// rejection.
+    pub fn with_public_suffix_list(list: Option<List>) -> Self {
+        Self(RwLock::new(CookieStore::new(list)))
     }
 
     /// Adds a single cookie string for the given URL.
@@ -149,5 +174,40 @@ mod tests {
         assert_eq!(cookie_name_hint(""), None);
         assert_eq!(cookie_name_hint("session id=abc"), None);
         assert_eq!(cookie_name_hint(" =abc"), None);
+    }
+
+    #[test]
+    fn default_jar_rejects_public_suffix_domain_cookies() {
+        let jar = Jar::new();
+        let url = url::Url::parse("https://evil.example.com/").expect("url");
+        jar.add_cookie_str("session=bad; Domain=com; Path=/", &url);
+        jar.add_cookie_str("ok=1; Domain=example.com; Path=/", &url);
+
+        let other = url::Url::parse("https://victim.com/").expect("url");
+        assert!(
+            jar.cookies(&other).is_none(),
+            "public-suffix Domain=com cookie must not leak across hosts"
+        );
+
+        let same_registrable = url::Url::parse("https://other.example.com/").expect("url");
+        let cookies = jar
+            .cookies(&same_registrable)
+            .expect("same eTLD+1 should receive Domain=example.com cookie");
+        assert_eq!(cookies.to_str().ok(), Some("ok=1"));
+    }
+
+    #[test]
+    fn default_jar_honors_secure_attribute() {
+        let jar = Jar::new();
+        let https = url::Url::parse("https://example.com/").expect("url");
+        jar.add_cookie_str("session=secret; Secure; Path=/", &https);
+
+        let http = url::Url::parse("http://example.com/").expect("url");
+        assert!(jar.cookies(&http).is_none());
+        assert_eq!(
+            jar.cookies(&https)
+                .and_then(|value| value.to_str().ok().map(str::to_owned)),
+            Some("session=secret".to_owned())
+        );
     }
 }

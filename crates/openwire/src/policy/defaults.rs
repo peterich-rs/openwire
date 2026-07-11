@@ -46,6 +46,7 @@ pub struct DefaultRetryPolicy {
     retry_on_connection_failure: bool,
     max_retries: usize,
     retry_canceled_requests: bool,
+    retry_non_idempotent: bool,
 }
 
 impl DefaultRetryPolicy {
@@ -76,6 +77,14 @@ impl DefaultRetryPolicy {
     pub fn set_retry_canceled_requests(&mut self, enabled: bool) {
         self.retry_canceled_requests = enabled;
     }
+
+    pub fn retry_non_idempotent(&self) -> bool {
+        self.retry_non_idempotent
+    }
+
+    pub fn set_retry_non_idempotent(&mut self, enabled: bool) {
+        self.retry_non_idempotent = enabled;
+    }
 }
 
 impl Default for DefaultRetryPolicy {
@@ -84,6 +93,7 @@ impl Default for DefaultRetryPolicy {
             retry_on_connection_failure: true,
             max_retries: 1,
             retry_canceled_requests: false,
+            retry_non_idempotent: false,
         }
     }
 }
@@ -177,6 +187,10 @@ impl RetryPolicy for DefaultRetryPolicy {
 
     fn should_retry_response(&self, ctx: &ResponseRetryContext<'_>) -> Option<&'static str> {
         if !ctx.is_body_replayable() || ctx.retry_count() as usize >= self.max_retries {
+            return None;
+        }
+
+        if !ctx.request_method().is_idempotent() && !self.retry_non_idempotent {
             return None;
         }
 
@@ -318,10 +332,11 @@ impl RedirectPolicy for DefaultRedirectPolicy {
 }
 
 fn is_redirect_status(status: StatusCode) -> bool {
+    // 300 Multiple Choices is intentionally excluded: most clients require
+    // application-level selection rather than automatic following.
     matches!(
         status,
-        StatusCode::MULTIPLE_CHOICES
-            | StatusCode::MOVED_PERMANENTLY
+        StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::SEE_OTHER
             | StatusCode::TEMPORARY_REDIRECT
@@ -356,7 +371,7 @@ mod tests {
     #[test]
     fn default_retry_policy_handles_response_status_retries() {
         let policy = DefaultRetryPolicy::default();
-        let method = Method::POST;
+        let method = Method::GET;
 
         let request_timeout =
             ResponseRetryContext::new(http::StatusCode::REQUEST_TIMEOUT, 0, true, &method, None);
@@ -432,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn default_redirect_policy_follows_multiple_choices_with_location() {
+    fn default_redirect_policy_does_not_follow_multiple_choices() {
         let policy = DefaultRedirectPolicy::default();
         let method = Method::GET;
         let current = "http://example.test/start".parse().expect("current uri");
@@ -448,8 +463,24 @@ mod tests {
 
         assert!(matches!(
             policy.should_redirect(&ctx),
-            RedirectDecision::Follow
+            RedirectDecision::Stop
         ));
+    }
+
+    #[test]
+    fn default_retry_policy_skips_non_idempotent_response_retries_by_default() {
+        let policy = DefaultRetryPolicy::default();
+        let method = Method::POST;
+        let request_timeout =
+            ResponseRetryContext::new(http::StatusCode::REQUEST_TIMEOUT, 0, true, &method, None);
+        assert_eq!(policy.should_retry_response(&request_timeout), None);
+
+        let mut enabled = DefaultRetryPolicy::default();
+        enabled.set_retry_non_idempotent(true);
+        assert_eq!(
+            enabled.should_retry_response(&request_timeout),
+            Some("http_408")
+        );
     }
 
     fn describe_decision(decision: RedirectDecision) -> &'static str {

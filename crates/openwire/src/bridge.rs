@@ -6,8 +6,25 @@ const DEFAULT_USER_AGENT: &str = concat!("openwire/", env!("CARGO_PKG_VERSION"))
 const CHUNKED: HeaderValue = HeaderValue::from_static("chunked");
 const DEFAULT_USER_AGENT_VALUE: HeaderValue = HeaderValue::from_static(DEFAULT_USER_AGENT);
 
-#[derive(Debug, Default)]
-pub(crate) struct BridgeInterceptor;
+#[derive(Clone, Debug)]
+pub(crate) struct BridgeInterceptor {
+    #[cfg(feature = "compression")]
+    max_decompressed_body_bytes: usize,
+    strict_host_header: bool,
+}
+
+impl BridgeInterceptor {
+    pub(crate) fn new(
+        #[cfg(feature = "compression")] max_decompressed_body_bytes: usize,
+        strict_host_header: bool,
+    ) -> Self {
+        Self {
+            #[cfg(feature = "compression")]
+            max_decompressed_body_bytes,
+            strict_host_header,
+        }
+    }
+}
 
 impl Interceptor for BridgeInterceptor {
     fn intercept(
@@ -17,7 +34,10 @@ impl Interceptor for BridgeInterceptor {
     ) -> BoxFuture<Result<http::Response<ResponseBody>, WireError>> {
         #[cfg(feature = "compression")]
         let request_method = exchange.request().method().clone();
-        let normalization = normalize_request(exchange.request_mut());
+        #[cfg(feature = "compression")]
+        let max_decompressed_body_bytes = self.max_decompressed_body_bytes;
+        let strict_host_header = self.strict_host_header;
+        let normalization = normalize_request(exchange.request_mut(), strict_host_header);
         #[cfg(feature = "compression")]
         let transparent_compression = normalization.as_ref().copied().unwrap_or(false);
         Box::pin(async move {
@@ -29,6 +49,7 @@ impl Interceptor for BridgeInterceptor {
                     return Ok(crate::compression::decode_response(
                         response,
                         &request_method,
+                        max_decompressed_body_bytes,
                     ));
                 }
             }
@@ -37,7 +58,10 @@ impl Interceptor for BridgeInterceptor {
     }
 }
 
-pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<bool, WireError> {
+pub(crate) fn normalize_request(
+    request: &mut Request<RequestBody>,
+    strict_host_header: bool,
+) -> Result<bool, WireError> {
     #[cfg(feature = "websocket")]
     {
         if request
@@ -48,7 +72,7 @@ pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<bo
             crate::websocket::handshake::inject_handshake(request)?;
         }
     }
-    normalize_host_header(request)?;
+    normalize_host_header(request, strict_host_header)?;
     normalize_user_agent_header(request);
     normalize_body_headers(request);
     #[cfg(feature = "compression")]
@@ -58,13 +82,30 @@ pub(crate) fn normalize_request(request: &mut Request<RequestBody>) -> Result<bo
     Ok(transparent_compression)
 }
 
-fn normalize_host_header(request: &mut Request<RequestBody>) -> Result<(), WireError> {
-    if request.headers().contains_key(HOST) {
+fn normalize_host_header(
+    request: &mut Request<RequestBody>,
+    strict_host_header: bool,
+) -> Result<(), WireError> {
+    let expected = synthesized_host_header(request.uri())?;
+    if let Some(existing) = request.headers().get(HOST) {
+        if strict_host_header {
+            let existing = existing.to_str().map_err(|error| {
+                WireError::invalid_request(format!("Host header is not valid ASCII: {error}"))
+            })?;
+            if !existing.eq_ignore_ascii_case(expected.to_str().map_err(|error| {
+                WireError::invalid_request(format!(
+                    "synthesized Host header is not valid ASCII: {error}"
+                ))
+            })?) {
+                return Err(WireError::invalid_request(format!(
+                    "Host header {existing:?} does not match request URI authority"
+                )));
+            }
+        }
         return Ok(());
     }
 
-    let host = synthesized_host_header(request.uri())?;
-    request.headers_mut().insert(HOST, host);
+    request.headers_mut().insert(HOST, expected);
     Ok(())
 }
 
@@ -151,7 +192,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_request(&mut request).expect("normalize");
+        normalize_request(&mut request, false).expect("normalize");
 
         assert_eq!(
             request
@@ -170,7 +211,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_request(&mut request).expect("normalize");
+        normalize_request(&mut request, false).expect("normalize");
 
         assert_eq!(
             request
@@ -189,7 +230,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_request(&mut request).expect("normalize");
+        normalize_request(&mut request, false).expect("normalize");
 
         assert_eq!(
             request
@@ -208,7 +249,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_request(&mut request).expect("normalize");
+        normalize_request(&mut request, false).expect("normalize");
 
         assert_eq!(
             request
@@ -228,7 +269,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_request(&mut request).expect("normalize");
+        normalize_request(&mut request, false).expect("normalize");
 
         assert_eq!(
             request
@@ -289,7 +330,7 @@ mod tests {
             .extensions_mut()
             .insert(WebSocketRequestMarker::new(vec!["chat".into()]));
 
-        super::normalize_request(&mut request).expect("normalize");
+        super::normalize_request(&mut request, false).expect("normalize");
 
         let headers = request.headers();
         assert_eq!(headers.get("upgrade").unwrap(), "websocket");
@@ -331,7 +372,7 @@ mod tests {
             .extensions_mut()
             .insert(WebSocketRequestMarker::new(Vec::new()));
 
-        let err = super::normalize_request(&mut request).expect_err("must reject");
+        let err = super::normalize_request(&mut request, false).expect_err("must reject");
         assert_eq!(err.kind(), crate::WireErrorKind::InvalidRequest);
     }
 

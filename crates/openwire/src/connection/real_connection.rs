@@ -6,6 +6,9 @@ use openwire_core::{next_connection_id, CoalescingInfo, ConnectionId};
 use super::{Address, ConnectionPermit, Route};
 use crate::sync_util::lock_mutex;
 
+/// Default local concurrent-stream budget for HTTP/2 connections.
+pub(crate) const DEFAULT_HTTP2_MAX_LOCAL_STREAMS: usize = 100;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectionProtocol {
     Http1,
@@ -48,6 +51,8 @@ struct RealConnectionInner {
     route: Route,
     protocol: ConnectionProtocol,
     coalescing: CoalescingInfo,
+    max_http2_streams: usize,
+    created_at: Instant,
     _permit: Option<ConnectionPermit>,
     state: Mutex<RealConnectionState>,
 }
@@ -85,6 +90,24 @@ impl RealConnection {
         permit: Option<ConnectionPermit>,
         coalescing: CoalescingInfo,
     ) -> Self {
+        Self::with_id_permit_coalescing_and_stream_cap(
+            id,
+            route,
+            protocol,
+            permit,
+            coalescing,
+            DEFAULT_HTTP2_MAX_LOCAL_STREAMS,
+        )
+    }
+
+    pub(crate) fn with_id_permit_coalescing_and_stream_cap(
+        id: ConnectionId,
+        route: Route,
+        protocol: ConnectionProtocol,
+        permit: Option<ConnectionPermit>,
+        coalescing: CoalescingInfo,
+        max_http2_streams: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(RealConnectionInner {
                 id,
@@ -92,6 +115,8 @@ impl RealConnection {
                 route,
                 protocol,
                 coalescing,
+                max_http2_streams: max_http2_streams.max(1),
+                created_at: Instant::now(),
                 _permit: permit,
                 state: Mutex::new(RealConnectionState {
                     health: ConnectionHealth::Healthy,
@@ -101,6 +126,10 @@ impl RealConnection {
                 }),
             }),
         }
+    }
+
+    pub(crate) fn created_at(&self) -> Instant {
+        self.inner.created_at
     }
 
     pub(crate) fn id(&self) -> ConnectionId {
@@ -143,6 +172,9 @@ impl RealConnection {
 
         match self.inner.protocol {
             ConnectionProtocol::Http1 if state.allocations > 0 => return false,
+            ConnectionProtocol::Http2 if state.allocations >= self.inner.max_http2_streams => {
+                return false;
+            }
             ConnectionProtocol::Http1 | ConnectionProtocol::Http2 => {}
         }
 
@@ -296,15 +328,35 @@ mod tests {
     }
 
     #[test]
-    fn http2_connection_does_not_apply_a_local_stream_cap() {
-        let connection = test_connection(ConnectionProtocol::Http2);
+    fn http2_connection_enforces_local_stream_cap() {
+        let address = Address::new(
+            UriScheme::Http,
+            AuthorityKey::new("example.com", 80),
+            None,
+            None,
+            ProtocolPolicy::Http1Only,
+            DnsPolicy::System,
+        );
+        let route = Route::direct(
+            address,
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 80)),
+        );
+        let connection = RealConnection::with_id_permit_coalescing_and_stream_cap(
+            openwire_core::next_connection_id(),
+            route,
+            ConnectionProtocol::Http2,
+            None,
+            openwire_core::CoalescingInfo::default(),
+            4,
+        );
 
-        for _ in 0..128 {
+        for _ in 0..4 {
             assert!(connection.try_acquire());
         }
+        assert!(!connection.try_acquire());
         assert_eq!(
             connection.snapshot().allocation,
-            ConnectionAllocationState::InUse { allocations: 128 }
+            ConnectionAllocationState::InUse { allocations: 4 }
         );
 
         assert!(connection.release());

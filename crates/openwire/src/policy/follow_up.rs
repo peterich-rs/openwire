@@ -148,11 +148,14 @@ impl Service<Exchange> for FollowUpPolicyService {
                             continue;
                         }
 
+                        let max_retries = request_config
+                            .map(|config| config.max_retries)
+                            .unwrap_or_else(|| config.retry.default_config().max_retries());
                         if should_retry_misdirected_request(
                             &snapshot,
                             &response,
                             retries,
-                            &config.retry,
+                            max_retries,
                         ) {
                             retries += 1;
                             let next_attempt = attempt + 1;
@@ -449,11 +452,11 @@ fn should_retry_misdirected_request(
     snapshot: &RequestSnapshot,
     response: &Response<ResponseBody>,
     retry_count: u32,
-    retry: &RetryPolicyConfig,
+    max_retries: usize,
 ) -> bool {
     response.status() == StatusCode::MISDIRECTED_REQUEST
         && snapshot.is_replayable()
-        && retry_count < retry.default_config().max_retries() as u32
+        && retry_count < max_retries as u32
         && response
             .extensions()
             .get::<CoalescedConnectionRetryable>()
@@ -579,8 +582,7 @@ impl RequestSnapshot {
         let mut headers = self.headers;
         headers.remove(HOST);
         if !same_origin {
-            headers.remove(AUTHORIZATION);
-            headers.remove(COOKIE);
+            strip_sensitive_cross_origin_headers(&mut headers);
         }
         if should_switch_to_get {
             headers.remove(CONTENT_LENGTH);
@@ -643,10 +645,10 @@ fn validate_request_uri(uri: &Uri) -> Result<(), WireError> {
 }
 
 fn is_redirect_status(status: StatusCode) -> bool {
+    // 300 Multiple Choices is intentionally excluded (see DefaultRedirectPolicy).
     matches!(
         status,
-        StatusCode::MULTIPLE_CHOICES
-            | StatusCode::MOVED_PERMANENTLY
+        StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::SEE_OTHER
             | StatusCode::TEMPORARY_REDIRECT
@@ -708,6 +710,28 @@ impl OriginKey {
 
 fn same_origin(left: &Uri, right: &Uri) -> Result<bool, WireError> {
     Ok(OriginKey::from_uri(left)? == OriginKey::from_uri(right)?)
+}
+
+/// Headers dropped on cross-origin redirects to avoid credential leakage.
+///
+/// `Proxy-Authorization` is intentionally preserved so sticky HTTP forward
+/// proxies can continue to authenticate after a redirect; transport clears it
+/// when the selected proxy endpoint changes.
+fn strip_sensitive_cross_origin_headers(headers: &mut HeaderMap) {
+    headers.remove(AUTHORIZATION);
+    headers.remove(COOKIE);
+    const EXTRA_SENSITIVE: &[&str] = &[
+        "x-api-key",
+        "x-auth-token",
+        "x-csrf-token",
+        "x-access-token",
+        "x-session-token",
+    ];
+    for name in EXTRA_SENSITIVE {
+        if let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(header_name);
+        }
+    }
 }
 
 #[cfg(test)]

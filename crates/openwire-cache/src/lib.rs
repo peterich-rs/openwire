@@ -18,6 +18,10 @@ use url::Url;
 
 const MAX_DELTA_SECONDS: u64 = 2_147_483_648;
 const LAST_MODIFIED_HEURISTIC_DENOMINATOR: u64 = 10;
+/// Default maximum number of URI keys retained by [`MemoryCacheStore`].
+pub const DEFAULT_MEMORY_CACHE_MAX_ENTRIES: usize = 1_024;
+/// Default maximum total cached body bytes retained by [`MemoryCacheStore`].
+pub const DEFAULT_MEMORY_CACHE_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct CacheInterceptor<S = MemoryCacheStore> {
@@ -462,9 +466,66 @@ pub trait CacheStore: Send + Sync + 'static {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemoryCacheStore {
     entries: Arc<RwLock<HashMap<String, Vec<CachedResponse>>>>,
+    max_entries: usize,
+    max_body_bytes: usize,
+}
+
+impl Default for MemoryCacheStore {
+    fn default() -> Self {
+        Self::with_limits(
+            DEFAULT_MEMORY_CACHE_MAX_ENTRIES,
+            DEFAULT_MEMORY_CACHE_MAX_BODY_BYTES,
+        )
+    }
+}
+
+impl MemoryCacheStore {
+    /// Creates a memory store with default entry and body-byte limits.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a memory store with explicit capacity limits.
+    pub fn with_limits(max_entries: usize, max_body_bytes: usize) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            max_entries: max_entries.max(1),
+            max_body_bytes,
+        }
+    }
+
+    fn total_body_bytes(entries: &HashMap<String, Vec<CachedResponse>>) -> usize {
+        entries
+            .values()
+            .flat_map(|candidates| candidates.iter())
+            .map(|entry| entry.body.len())
+            .sum()
+    }
+
+    fn enforce_limits(
+        entries: &mut HashMap<String, Vec<CachedResponse>>,
+        max_entries: usize,
+        max_body_bytes: usize,
+    ) {
+        while entries.len() > max_entries {
+            if let Some(oldest) = entries.keys().next().cloned() {
+                entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        while Self::total_body_bytes(entries) > max_body_bytes && !entries.is_empty() {
+            if let Some(oldest) = entries.keys().next().cloned() {
+                entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -496,6 +557,10 @@ impl CacheStore for MemoryCacheStore {
 
     async fn put_candidate(&self, key: String, value: CachedResponse) {
         let mut entries = self.entries.write().await;
+        if value.body.len() > self.max_body_bytes {
+            // Oversized bodies are never stored.
+            return;
+        }
         let candidates = entries.entry(key).or_default();
         if let Some(existing) = candidates
             .iter_mut()
@@ -505,6 +570,7 @@ impl CacheStore for MemoryCacheStore {
         } else {
             candidates.push(value);
         }
+        Self::enforce_limits(&mut entries, self.max_entries, self.max_body_bytes);
     }
 
     async fn remove_candidate(&self, key: &str, value: &CachedResponse) {
@@ -852,14 +918,12 @@ fn header_value_count(headers: &HeaderMap, name: HeaderName) -> usize {
 }
 
 fn explicit_expires_lifetime(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
-    let expires = match headers.get(EXPIRES) {
-        Some(value) => value
-            .to_str()
-            .ok()
-            .and_then(|value| httpdate::parse_http_date(value).ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-        None => return None,
-    };
+    let expires = headers
+        .get(EXPIRES)?
+        .to_str()
+        .ok()
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let date = parse_http_date_header(headers, DATE).unwrap_or(now);
     Some(expires.duration_since(date).unwrap_or_default())
 }
@@ -917,7 +981,34 @@ fn response_age(headers: &HeaderMap) -> Duration {
 }
 
 fn cache_key(uri: &Uri) -> String {
-    uri.to_string()
+    normalize_cache_uri(uri)
+}
+
+fn normalize_cache_uri(uri: &Uri) -> String {
+    let Ok(mut url) = Url::parse(&uri.to_string()) else {
+        return uri.to_string();
+    };
+
+    if let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) {
+        let _ = url.set_host(Some(&host));
+    }
+
+    // Drop default ports so http://example.com and http://example.com:80 share a key.
+    match url.scheme() {
+        "http" if url.port() == Some(80) => {
+            let _ = url.set_port(None);
+        }
+        "https" if url.port() == Some(443) => {
+            let _ = url.set_port(None);
+        }
+        _ => {}
+    }
+
+    if url.path().is_empty() {
+        url.set_path("/");
+    }
+
+    url.as_str().to_owned()
 }
 
 fn build_response(

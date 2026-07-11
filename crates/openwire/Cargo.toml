@@ -18,6 +18,7 @@ compression = [
     "async-compression/futures-io",
     "async-compression/gzip",
     "async-compression/zlib",
+    "async-compression/deflate",
     "async-compression/brotli",
     "async-compression/zstd",
 ]
@@ -32,6 +33,7 @@ base64.workspace = true
 bytes.workspace = true
 cookie = "0.18.0"
 cookie_store = { version = "0.21.1", default-features = false, features = ["public_suffix"] }
+publicsuffix = "2.3.0"
 futures-channel.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 http.workspace = true
