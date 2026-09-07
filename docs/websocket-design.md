@@ -543,8 +543,11 @@ pub enum CloseInitiator { Local, Remote }
 
 All methods have empty default impls (additive change; existing impls compile
 unchanged). Existing HTTP events fire normally during the handshake itself -
-`dns_start/end`, `connect_start/end`, `tls_start/end`, `request_headers_*`,
-`response_headers_*` all fire as for any HTTP/1.1 GET. `response_body_end`
+`dns_start/end`, `connect_start/end`, `tls_start/end` / `tls_handshake`,
+`proxy_select_start/end`, `request_headers_*`,
+`response_headers_*` all fire as for any HTTP/1.1 GET. WebSocket handshake
+execution still constructs its `CallContext` at `execute()` time; HTTP `Call`
+objects create the listener at `new_call`. `response_body_end`
 does **not** fire on a successful upgrade (the response has no body to
 consume). Once `call_start` has fired, every WebSocket call terminates the
 shared call lifecycle exactly once: `call_end` fires when openwire observes a

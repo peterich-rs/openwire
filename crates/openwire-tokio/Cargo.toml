@@ -15,5 +15,8 @@ keywords.workspace = true
 hyper.workspace = true
 openwire-core.workspace = true
 pin-project-lite.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "io-util"] }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }

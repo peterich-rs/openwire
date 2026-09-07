@@ -53,6 +53,7 @@ where
     ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
         let store = self.store.clone();
         Box::pin(async move {
+            let ctx = exchange.context().clone();
             let invalidation_target = request_method_invalidates_cache(exchange.request().method())
                 .then(|| exchange.request().uri().clone());
             let request_policy = request_cache_policy(exchange.request());
@@ -66,7 +67,9 @@ where
                 for entry in store.get_candidates(cache_key).await.into_iter().rev() {
                     if entry.matches_request(&request_policy, &request_headers) {
                         if request_policy.lookup && entry.is_servable_for(&request_policy) {
-                            return Ok(entry.into_response());
+                            let response = entry.into_response();
+                            ctx.listener().cache_hit(&ctx, &response);
+                            return Ok(response);
                         }
 
                         if !request_policy.only_if_cached
@@ -79,12 +82,18 @@ where
                 }
 
                 if request_policy.only_if_cached {
-                    return Ok(gateway_timeout_response());
+                    let response = gateway_timeout_response();
+                    ctx.listener().satisfaction_failure(&ctx, &response);
+                    return Ok(response);
                 }
             }
 
             if let Some(entry) = validation_entry.as_ref() {
+                let cached = entry.clone().into_response();
+                ctx.listener().cache_conditional_hit(&ctx, &cached);
                 entry.apply_revalidation_headers(exchange.request_mut().headers_mut());
+            } else if cache_key.is_some() {
+                ctx.listener().cache_miss(&ctx);
             }
 
             let response = next.run(exchange).await?;
@@ -111,7 +120,9 @@ where
                     } else {
                         store.remove_candidate(&cache_key, entry).await;
                     }
-                    return Ok(freshened.into_response());
+                    let response = freshened.into_response();
+                    ctx.listener().cache_hit(&ctx, &response);
+                    return Ok(response);
                 }
             }
 

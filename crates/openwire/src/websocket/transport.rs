@@ -80,7 +80,7 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
     ctx.listener().call_start(&ctx, &request);
 
     let connect = async {
-        let address = build_address(client, request.uri())?;
+        let address = build_address(client, request.uri(), &ctx)?;
         let route_plan = client
             .ws_connector()
             .route_plan(ctx.clone(), &address)
@@ -254,8 +254,15 @@ async fn run_handshake(
     Ok((response, channel, validated))
 }
 
-fn build_address(client: &crate::Client, uri: &Uri) -> Result<Address, WireError> {
+fn build_address(
+    client: &crate::Client,
+    uri: &Uri,
+    ctx: &CallContext,
+) -> Result<Address, WireError> {
+    ctx.listener().proxy_select_start(ctx, uri);
     let selection = client.ws_proxy_selector().select(uri)?;
+    ctx.listener()
+        .proxy_select_end(ctx, uri, &selection.to_events());
     let selected_proxy = selection.iter().find_map(|choice| match choice {
         ProxyChoice::Direct => None,
         ProxyChoice::Proxy(proxy) => Some(SelectedProxy::from_proxy(proxy)),

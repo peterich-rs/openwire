@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use http::Uri;
+use openwire_core::ProxyEvent;
 use url::Url;
 
 use crate::WireError;
@@ -264,6 +265,19 @@ impl ProxySelection {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &ProxyChoice> {
         self.choices.iter()
+    }
+
+    pub(crate) fn to_events(&self) -> Vec<ProxyEvent> {
+        if self.is_empty() {
+            return vec![ProxyEvent::Direct];
+        }
+        self.choices
+            .iter()
+            .map(|choice| match choice {
+                ProxyChoice::Direct => ProxyEvent::Direct,
+                ProxyChoice::Proxy(proxy) => ProxyEvent::Url(proxy.target.to_string()),
+            })
+            .collect()
     }
 
     fn from_proxies(proxies: Vec<Proxy>) -> Self {

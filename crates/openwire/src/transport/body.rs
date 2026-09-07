@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::task::AtomicWaker;
-use http::Response;
+use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -117,6 +117,134 @@ impl Drop for ResponseLease {
     }
 }
 
+pub(super) struct ObservedOutgoingBody {
+    inner: RequestBody,
+    ctx: CallContext,
+    bytes_sent: u64,
+    started: bool,
+    finished: bool,
+}
+
+impl ObservedOutgoingBody {
+    pub(super) fn wrap(body: RequestBody, ctx: CallContext) -> RequestBody {
+        RequestBody::from_body(Self {
+            inner: body,
+            ctx,
+            bytes_sent: 0,
+            started: false,
+            finished: false,
+        })
+    }
+
+    fn finish_successfully(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.ensure_started();
+        self.ctx.mark_request_write_complete();
+        self.ctx
+            .listener()
+            .request_body_end(&self.ctx, self.bytes_sent);
+    }
+
+    fn finish_with_error(&mut self, error: &WireError) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.ensure_started();
+        self.ctx.mark_request_failed_emitted();
+        self.ctx.listener().request_failed(&self.ctx, error);
+    }
+
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.ctx.listener().request_body_start(&self.ctx);
+    }
+}
+
+impl Drop for ObservedOutgoingBody {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.started && self.inner.is_end_stream() {
+            // Hyper may stop polling after the exact Content-Length payload
+            // without a trailing `None` frame.
+            self.finish_successfully();
+        } else {
+            self.finished = true;
+        }
+    }
+}
+
+impl Body for ObservedOutgoingBody {
+    type Data = Bytes;
+    type Error = WireError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        this.ensure_started();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_sent += data.len() as u64;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finish_with_error(&error);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finish_successfully();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+pub(super) fn present_empty_outgoing_body(body: &RequestBody) -> bool {
+    !body.is_absent() && body.is_end_stream()
+}
+
+pub(super) fn emit_present_empty_body_events(ctx: &CallContext) {
+    ctx.listener().request_body_start(ctx);
+    ctx.listener().request_body_end(ctx, 0);
+    ctx.mark_request_write_complete();
+}
+
+pub(super) fn instrument_outgoing_body(
+    request: Request<RequestBody>,
+    ctx: &CallContext,
+) -> Request<RequestBody> {
+    if request.body().is_absent() {
+        ctx.mark_request_write_complete();
+        return request;
+    }
+    if request.body().is_end_stream() {
+        return request;
+    }
+    let (parts, body) = request.into_parts();
+    Request::from_parts(parts, ObservedOutgoingBody::wrap(body, ctx.clone()))
+}
+
 pub(super) struct ObservedIncomingBody {
     inner: Incoming,
     ctx: CallContext,
@@ -126,6 +254,7 @@ pub(super) struct ObservedIncomingBody {
     deadline_signal: Option<Arc<BodyDeadlineSignal>>,
     span: tracing::Span,
     finished: bool,
+    body_started: bool,
 }
 
 impl ObservedIncomingBody {
@@ -147,9 +276,18 @@ impl ObservedIncomingBody {
                 deadline_signal,
                 span,
                 finished: false,
+                body_started: false,
             }
             .boxed(),
         )
+    }
+
+    fn ensure_body_started(&mut self) {
+        if self.body_started {
+            return;
+        }
+        self.body_started = true;
+        self.ctx.listener().response_body_start(&self.ctx);
     }
 
     fn finish_successfully(&mut self) {
@@ -157,6 +295,7 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
+        self.ensure_body_started();
         self.ctx
             .listener()
             .response_body_end(&self.ctx, self.bytes_read);
@@ -168,6 +307,7 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
+        self.ensure_body_started();
         self.span.in_scope(|| {
             tracing::debug!(
                 call_id = self.ctx.call_id().as_u64(),
@@ -188,6 +328,7 @@ impl ObservedIncomingBody {
             return;
         }
         self.finished = true;
+        self.ensure_body_started();
         if self.ctx.body_force_discard() {
             // Decode/body-layer errors set this flag so Drop discards the
             // connection instead of treating the body as a clean abandon.
@@ -401,6 +542,7 @@ impl Body for ObservedIncomingBody {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
+                    this.ensure_body_started();
                     this.bytes_read += data.len() as u64;
                 }
                 Poll::Ready(Some(Ok(frame)))

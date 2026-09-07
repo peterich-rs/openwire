@@ -32,6 +32,7 @@ use super::bindings::{
     ConnectionBindings, ConnectionTaskRegistry,
 };
 use super::body::{
+    emit_present_empty_body_events, instrument_outgoing_body, present_empty_outgoing_body,
     spawn_body_deadline_signal, BoundResponse, ObservedIncomingBody, ResponseLease,
     ResponseLeaseShared,
 };
@@ -252,9 +253,8 @@ impl TransportService {
         exchange: Exchange,
     ) -> Result<Response<ResponseBody>, WireError> {
         let (mut request, ctx, attempt) = exchange.into_parts();
-        cache_request_addresses(&mut request, &*self.proxy_selector)?;
+        cache_request_addresses(&mut request, &*self.proxy_selector, &ctx)?;
         let prepared = self.exchange_finder.prepare(&request)?;
-        let request_body_len = request.body().replayable_len();
         let policy_trace = request
             .extensions()
             .get::<PolicyTraceContext>()
@@ -288,9 +288,6 @@ impl TransportService {
             )
             .await?;
 
-            if let Some(bytes) = request_body_len {
-                ctx.listener().request_body_end(&ctx, bytes);
-            }
             ctx.listener().response_headers_start(&ctx);
             let (parts, body) = response.response.into_parts();
             let deadline_expired =
@@ -841,6 +838,8 @@ async fn send_bound_request(
         connection.protocol(),
         connection.route().kind(),
     )?;
+    ctx.reset_request_exchange_observation();
+    let request = instrument_outgoing_body(request, &ctx);
 
     match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
@@ -857,9 +856,9 @@ async fn send_bound_request(
                 map_hyper_error(error)
             })?;
             let request_requests_close = connection_header_requests_close(request.headers());
-            ctx.listener().request_headers_start(&ctx);
-            let response = sender.try_send_request(request);
-            ctx.listener().request_headers_end(&ctx);
+            let response = dispatch_try_send_request(&ctx, request, |request| {
+                sender.try_send_request(request)
+            });
             let response = response.await;
             let mut response = response.map_err(|error| {
                 cleanup_failed_request(
@@ -870,7 +869,7 @@ async fn send_bound_request(
                     &availability,
                     &ctx,
                 );
-                map_try_send_error(error)
+                map_try_send_error_with_events(&ctx, error)
             })?;
             let reusable = http1_exchange_allows_reuse(request_requests_close, &response);
             response.extensions_mut().insert(info);
@@ -904,9 +903,9 @@ async fn send_bound_request(
                 );
                 map_hyper_error(error)
             })?;
-            ctx.listener().request_headers_start(&ctx);
-            let response = sender.try_send_request(request);
-            ctx.listener().request_headers_end(&ctx);
+            let response = dispatch_try_send_request(&ctx, request, |request| {
+                sender.try_send_request(request)
+            });
             let response = response.await;
             let mut response = response.map_err(|error| {
                 cleanup_failed_request(
@@ -917,7 +916,7 @@ async fn send_bound_request(
                     &availability,
                     &ctx,
                 );
-                map_try_send_error(error)
+                map_try_send_error_with_events(&ctx, error)
             })?;
             response.extensions_mut().insert(info);
             if let Some(selected_proxy) = selected_proxy {
@@ -942,6 +941,20 @@ async fn send_bound_request(
     }
 }
 
+fn dispatch_try_send_request<F, T>(ctx: &CallContext, request: Request<RequestBody>, send: F) -> T
+where
+    F: FnOnce(Request<RequestBody>) -> T,
+{
+    let present_empty = present_empty_outgoing_body(request.body());
+    ctx.listener().request_headers_start(ctx);
+    let pending = send(request);
+    ctx.listener().request_headers_end(ctx);
+    if present_empty {
+        emit_present_empty_body_events(ctx);
+    }
+    pending
+}
+
 fn map_try_send_error<T>(error: TrySendError<T>) -> WireError {
     let committed = error.message().is_none();
     let error = map_hyper_error(error.into_error());
@@ -950,6 +963,19 @@ fn map_try_send_error<T>(error: TrySendError<T>) -> WireError {
     } else {
         error
     }
+}
+
+fn map_try_send_error_with_events<T>(ctx: &CallContext, error: TrySendError<T>) -> WireError {
+    let mapped = map_try_send_error(error);
+    if ctx.request_failed_emitted() {
+        return mapped;
+    }
+    if ctx.request_write_complete() {
+        ctx.listener().response_failed(ctx, &mapped);
+    } else {
+        ctx.listener().request_failed(ctx, &mapped);
+    }
+    mapped
 }
 
 fn record_connection_acquired(ctx: &CallContext, info: &ConnectionInfo, reused: bool) {

@@ -263,8 +263,289 @@ async fn cancel_after_response_headers_fails_body_read() {
         &[
             "call_start GET",
             "response_headers_end 200 OK",
+            "canceled",
             "call_failed Canceled",
         ],
+    );
+}
+
+#[tokio::test]
+async fn cancel_before_execute_emits_canceled() {
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let call = client.new_call(empty_request("http://example.com/unused"));
+    call.cancel();
+    assert!(events.events().iter().any(|event| event == "canceled"));
+    assert!(
+        !events
+            .events()
+            .iter()
+            .any(|event| event.starts_with("call_start")),
+        "cancel before execute should not start the call: {:?}",
+        events.events()
+    );
+}
+
+#[tokio::test]
+async fn enqueue_emits_dispatcher_queue_events() {
+    let server = spawn_http1(|_request| async move { ok_text("queued events") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .new_call(empty_request(server.http_url("/queued-events")))
+        .enqueue()
+        .expect("queued call")
+        .await_response()
+        .await
+        .expect("queued response");
+    let _ = response.into_body().text().await.expect("body");
+
+    assert_event_subsequence(
+        &events.events(),
+        &[
+            "dispatcher_queue_start",
+            "dispatcher_queue_end",
+            "call_start GET",
+            "proxy_select_start",
+            "proxy_select_end",
+            "follow_up_decision 200 OK next=none",
+            "response_body_start",
+            "response_body_end",
+            "call_end",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn present_request_body_emits_start_and_end() {
+    let server = spawn_http1(|_request| async move { ok_text("posted") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/body-events"))
+        .body(RequestBody::from_static(b"hello"))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    assert_event_subsequence(
+        &events.events(),
+        &[
+            "request_body_start",
+            "request_body_end 5",
+            "follow_up_decision 200 OK next=none",
+            "response_body_start",
+            "response_body_end",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn absent_request_body_skips_request_body_events() {
+    let server = spawn_http1(|_request| async move { ok_text("absent") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let response = client
+        .execute(empty_request(server.http_url("/absent-body")))
+        .await
+        .expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    assert!(
+        !events
+            .events()
+            .iter()
+            .any(|event| event.starts_with("request_body_")),
+        "absent bodies should not emit request body events: {:?}",
+        events.events()
+    );
+}
+
+#[tokio::test]
+async fn explicit_empty_request_body_emits_start_and_end_zero() {
+    let server = spawn_http1(|_request| async move { ok_text("posted") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/explicit-empty-body-events"))
+        .body(RequestBody::explicit_empty())
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    assert_event_subsequence(
+        &events.events(),
+        &[
+            "request_headers_start",
+            "request_headers_end",
+            "request_body_start",
+            "request_body_end 0",
+            "follow_up_decision 200 OK next=none",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn empty_static_request_body_emits_start_and_end_zero() {
+    let server = spawn_http1(|_request| async move { ok_text("posted") }).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/empty-static-body-events"))
+        .body(RequestBody::from_static(b""))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    let _ = response.into_body().text().await.expect("body");
+
+    assert_event_subsequence(
+        &events.events(),
+        &["request_body_start", "request_body_end 0"],
+    );
+}
+
+#[tokio::test]
+async fn streaming_request_body_error_emits_request_failed_not_response_failed() {
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let _ = http_body_util::BodyExt::collect(request.into_body()).await;
+        ok_text("unused")
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .event_listener_factory(events.clone())
+        .max_retries(0)
+        .build()
+        .expect("client");
+    let request = Request::builder()
+        .method("POST")
+        .uri(server.http_url("/upload-fail"))
+        .body(RequestBody::from_stream(stream::iter(vec![
+            Ok::<Bytes, WireError>(Bytes::from_static(b"chunk")),
+            Err(WireError::body(
+                "upload failed",
+                io::Error::other("upload failed"),
+            )),
+        ])))
+        .expect("request");
+
+    let error = client
+        .execute(request)
+        .await
+        .expect_err("upload should fail");
+    assert_eq!(error.kind(), WireErrorKind::Body);
+
+    let events = events.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("request_failed")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("response_failed")),
+        "upload failure should not also emit response_failed: {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn absent_body_header_exchange_failure_emits_response_failed() {
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let server = spawn_raw_http1_close_after_request_head(accepted_connections.clone()).await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .event_listener_factory(events.clone())
+        .max_retries(0)
+        .build()
+        .expect("client");
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/drop-after-head",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("server closes before response headers");
+    assert!(error.request_committed(), "error = {error:?}");
+
+    let events = events.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("response_failed")),
+        "events = {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("request_failed")),
+        "absent-body send completion is a response-header failure: {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("request_body_")),
+        "absent bodies should not emit request body events: {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn response_body_start_waits_for_first_data() {
+    let server =
+        spawn_raw_http1_headers_then_delayed_body(Duration::from_millis(150), b"hello").await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .event_listener_factory(events.clone())
+        .build()
+        .expect("client");
+
+    let response = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/delayed-body",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !events
+            .events()
+            .iter()
+            .any(|event| event == "response_body_start"),
+        "response_body_start must wait for first byte: {:?}",
+        events.events()
+    );
+
+    let body = response.into_body().text().await.expect("body");
+    assert_eq!(body, "hello");
+    assert_event_subsequence(
+        &events.events(),
+        &["response_body_start", "response_body_end 5", "call_end"],
     );
 }
 
@@ -3922,10 +4203,13 @@ async fn pool_lookup_events_report_miss_then_hit_for_reused_connections() {
         &events,
         &[
             "call_start GET",
+            "proxy_select_start",
+            "proxy_select_end",
             "pool_miss",
             "dns_start",
             "connect_end",
             "connection_acquired ",
+            "response_body_start",
             "connection_released ",
             "call_start GET",
             "pool_hit ",
@@ -4313,7 +4597,6 @@ async fn success_events_follow_stable_order() {
             "connection_acquired ",
             "request_headers_start",
             "request_headers_end",
-            "request_body_end 0",
             "response_headers_start",
             "response_headers_end 200 OK",
             "response_body_end 7",
@@ -4345,7 +4628,6 @@ async fn request_send_events_surround_transport_handoff() {
             "connection_acquired ",
             "request_headers_start",
             "request_headers_end",
-            "request_body_end 0",
             "response_headers_start",
             "response_headers_end 200 OK",
         ],
@@ -6723,6 +7005,43 @@ async fn spawn_raw_http1_response(response: Vec<u8>) -> RawHttpServer {
                     let mut buffer = [0u8; 1024];
                     let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer)).await;
                     let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
+async fn spawn_raw_http1_headers_then_delayed_body(
+    delay: Duration,
+    body: &'static [u8],
+) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut shutdown_rx => {}
+            accepted = listener.accept() => {
+                if let Ok((mut stream, _)) = accepted {
+                    let mut buffer = [0u8; 1024];
+                    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buffer)).await;
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream.write_all(body).await;
                     let _ = stream.shutdown().await;
                 }
             }

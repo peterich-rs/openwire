@@ -2,11 +2,23 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use async_compression::futures::bufread::{
-    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
-};
+#[cfg(feature = "brotli")]
+use async_compression::futures::bufread::BrotliDecoder;
+#[cfg(feature = "gzip")]
+use async_compression::futures::bufread::GzipDecoder;
+#[cfg(feature = "zstd")]
+use async_compression::futures::bufread::ZstdDecoder;
+#[cfg(feature = "deflate")]
+use async_compression::futures::bufread::{DeflateDecoder, ZlibDecoder};
 use bytes::Bytes;
-use futures_util::io::{AsyncBufRead, AsyncRead, BufReader};
+#[cfg(any(
+    feature = "brotli",
+    feature = "gzip",
+    feature = "deflate",
+    feature = "zstd"
+))]
+use futures_util::io::BufReader;
+use futures_util::io::{AsyncBufRead, AsyncRead};
 use futures_util::TryStreamExt;
 use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
@@ -15,8 +27,24 @@ use http_body_util::BodyExt;
 use openwire_core::{CallContext, RequestBody, ResponseBody, WireError};
 use pin_project_lite::pin_project;
 
-const ACCEPTED_ENCODINGS: HeaderValue = HeaderValue::from_static("br, gzip, deflate, zstd");
 const DECODE_BUFFER_SIZE: usize = 8 * 1024;
+
+fn accepted_encodings() -> Option<HeaderValue> {
+    let tokens: &[&str] = &[
+        #[cfg(feature = "brotli")]
+        "br",
+        #[cfg(feature = "gzip")]
+        "gzip",
+        #[cfg(feature = "deflate")]
+        "deflate",
+        #[cfg(feature = "zstd")]
+        "zstd",
+    ];
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(HeaderValue::from_str(&tokens.join(", ")).expect("static encoding tokens"))
+}
 
 /// Default cap on transparent response decompression output.
 ///
@@ -25,6 +53,12 @@ const DECODE_BUFFER_SIZE: usize = 8 * 1024;
 pub const DEFAULT_MAX_DECOMPRESSED_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 type BoxAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send + Sync>>;
+#[cfg(any(
+    feature = "brotli",
+    feature = "gzip",
+    feature = "deflate",
+    feature = "zstd"
+))]
 type BoxAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync>>;
 
 pub(crate) fn normalize_request(request: &mut http::Request<RequestBody>) -> bool {
@@ -32,9 +66,10 @@ pub(crate) fn normalize_request(request: &mut http::Request<RequestBody>) -> boo
         return false;
     }
 
-    request
-        .headers_mut()
-        .insert(ACCEPT_ENCODING, ACCEPTED_ENCODINGS.clone());
+    let Some(accepted) = accepted_encodings() else {
+        return false;
+    };
+    request.headers_mut().insert(ACCEPT_ENCODING, accepted);
     true
 }
 
@@ -113,32 +148,47 @@ fn response_can_have_body(method: &Method, status: StatusCode) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponseEncoding {
+    #[cfg(feature = "brotli")]
     Brotli,
+    #[cfg(feature = "gzip")]
     Gzip,
+    #[cfg(feature = "deflate")]
     Deflate,
+    #[cfg(feature = "zstd")]
     Zstd,
 }
 
 impl ResponseEncoding {
     fn parse(value: &str) -> Option<Self> {
+        #[cfg(feature = "brotli")]
         if value.eq_ignore_ascii_case("br") {
-            Some(Self::Brotli)
-        } else if value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip") {
-            Some(Self::Gzip)
-        } else if value.eq_ignore_ascii_case("deflate") {
-            Some(Self::Deflate)
-        } else if value.eq_ignore_ascii_case("zstd") {
-            Some(Self::Zstd)
-        } else {
-            None
+            return Some(Self::Brotli);
         }
+        #[cfg(feature = "gzip")]
+        if value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip") {
+            return Some(Self::Gzip);
+        }
+        #[cfg(feature = "deflate")]
+        if value.eq_ignore_ascii_case("deflate") {
+            return Some(Self::Deflate);
+        }
+        #[cfg(feature = "zstd")]
+        if value.eq_ignore_ascii_case("zstd") {
+            return Some(Self::Zstd);
+        }
+        let _ = value;
+        None
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            #[cfg(feature = "brotli")]
             Self::Brotli => "br",
+            #[cfg(feature = "gzip")]
             Self::Gzip => "gzip",
+            #[cfg(feature = "deflate")]
             Self::Deflate => "deflate",
+            #[cfg(feature = "zstd")]
             Self::Zstd => "zstd",
         }
     }
@@ -232,21 +282,31 @@ impl Body for DecodedResponseBody {
     }
 }
 
+#[cfg(any(
+    feature = "brotli",
+    feature = "gzip",
+    feature = "deflate",
+    feature = "zstd"
+))]
 fn decode_layer(reader: BoxAsyncBufRead, encoding: ResponseEncoding) -> BoxAsyncBufRead {
     match encoding {
+        #[cfg(feature = "brotli")]
         ResponseEncoding::Brotli => {
             let decoded: BoxAsyncRead = Box::pin(BrotliDecoder::new(reader));
             Box::pin(BufReader::new(decoded))
         }
+        #[cfg(feature = "gzip")]
         ResponseEncoding::Gzip => {
             let decoded: BoxAsyncRead = Box::pin(GzipDecoder::new(reader));
             Box::pin(BufReader::new(decoded))
         }
+        #[cfg(feature = "deflate")]
         ResponseEncoding::Deflate => {
             // HTTP "deflate" is ambiguous (zlib-wrapped vs raw). Detect via the
             // first two bytes (RFC 1950 CMF/FLG check) before wrapping.
             Box::pin(BufReader::new(DeflateAutoDecoder::new(reader)))
         }
+        #[cfg(feature = "zstd")]
         ResponseEncoding::Zstd => {
             let decoded: BoxAsyncRead = Box::pin(ZstdDecoder::new(reader));
             Box::pin(BufReader::new(decoded))
@@ -254,11 +314,23 @@ fn decode_layer(reader: BoxAsyncBufRead, encoding: ResponseEncoding) -> BoxAsync
     }
 }
 
+#[cfg(not(any(
+    feature = "brotli",
+    feature = "gzip",
+    feature = "deflate",
+    feature = "zstd"
+)))]
+fn decode_layer(_reader: BoxAsyncBufRead, encoding: ResponseEncoding) -> BoxAsyncBufRead {
+    match encoding {}
+}
+
 /// Chooses zlib-wrapped vs raw DEFLATE after buffering a two-byte header peek.
+#[cfg(feature = "deflate")]
 struct DeflateAutoDecoder {
     state: DeflateAutoState,
 }
 
+#[cfg(feature = "deflate")]
 enum DeflateAutoState {
     /// Accumulating the first two payload bytes.
     Peeking {
@@ -270,6 +342,7 @@ enum DeflateAutoState {
     Decoding { reader: BoxAsyncBufRead },
 }
 
+#[cfg(feature = "deflate")]
 impl DeflateAutoDecoder {
     fn new(reader: BoxAsyncBufRead) -> Self {
         Self {
@@ -298,6 +371,7 @@ impl DeflateAutoDecoder {
     }
 }
 
+#[cfg(feature = "deflate")]
 impl AsyncRead for DeflateAutoDecoder {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -352,6 +426,7 @@ impl AsyncRead for DeflateAutoDecoder {
 }
 
 /// Replays a short peeked prefix before reading the remainder of the stream.
+#[cfg(feature = "deflate")]
 struct PrefixedReader {
     prefix: [u8; 2],
     prefix_len: usize,
@@ -359,6 +434,7 @@ struct PrefixedReader {
     inner: BoxAsyncBufRead,
 }
 
+#[cfg(feature = "deflate")]
 impl AsyncRead for PrefixedReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -376,6 +452,7 @@ impl AsyncRead for PrefixedReader {
     }
 }
 
+#[cfg(feature = "deflate")]
 impl AsyncBufRead for PrefixedReader {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
@@ -400,6 +477,7 @@ impl AsyncBufRead for PrefixedReader {
     }
 }
 
+#[cfg(feature = "deflate")]
 fn looks_like_zlib_header(header: &[u8]) -> bool {
     if header.len() < 2 {
         // Not enough data; zlib is the historical HTTP default.
@@ -431,10 +509,7 @@ mod tests {
     use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
     use http::{Method, Request, Response};
 
-    use super::{
-        decode_response, looks_like_zlib_header, normalize_request, ACCEPTED_ENCODINGS,
-        DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
-    };
+    use super::{decode_response, normalize_request, DEFAULT_MAX_DECOMPRESSED_BODY_BYTES};
     use crate::{RequestBody, ResponseBody};
 
     #[test]
@@ -445,11 +520,28 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        assert!(normalize_request(&mut request));
-        assert_eq!(
-            request.headers().get(ACCEPT_ENCODING),
-            Some(&ACCEPTED_ENCODINGS)
-        );
+        let any_codec = cfg!(feature = "gzip")
+            || cfg!(feature = "deflate")
+            || cfg!(feature = "brotli")
+            || cfg!(feature = "zstd");
+        assert_eq!(normalize_request(&mut request), any_codec);
+        if !any_codec {
+            assert!(request.headers().get(ACCEPT_ENCODING).is_none());
+            return;
+        }
+        let value = request
+            .headers()
+            .get(ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .expect("accept-encoding");
+        #[cfg(feature = "brotli")]
+        assert!(value.split(',').any(|part| part.trim() == "br"));
+        #[cfg(feature = "gzip")]
+        assert!(value.split(',').any(|part| part.trim() == "gzip"));
+        #[cfg(feature = "deflate")]
+        assert!(value.split(',').any(|part| part.trim() == "deflate"));
+        #[cfg(feature = "zstd")]
+        assert!(value.split(',').any(|part| part.trim() == "zstd"));
     }
 
     #[test]
@@ -524,10 +616,11 @@ mod tests {
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "20");
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn zlib_header_detection_accepts_rfc1950_header() {
         // CMF=0x78, FLG=0x9c is the common default zlib header.
-        assert!(looks_like_zlib_header(&[0x78, 0x9c]));
-        assert!(!looks_like_zlib_header(&[0x01, 0x02]));
+        assert!(super::looks_like_zlib_header(&[0x78, 0x9c]));
+        assert!(!super::looks_like_zlib_header(&[0x01, 0x02]));
     }
 }

@@ -20,12 +20,12 @@ bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
+hyper = { workspace = true, features = ["server"] }
 openwire-core.workspace = true
 openwire-tokio.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tokio-rustls.workspace = true
-tokio-tungstenite = { version = "0.24", optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tracing.workspace = true

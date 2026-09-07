@@ -30,9 +30,10 @@ blocks, and stable observability hooks.
   bridge normalization or network I/O
 - synthesized `Host` headers follow scheme-based URI normalization by omitting
   default `:80` / `:443` ports while preserving caller-supplied `Host` values
-- transparent response decompression for `br`, `gzip`, `deflate`, and `zstd`
-  through the default `compression` feature, with a default 128 MiB
-  decompressed-size cap against compression bombs
+- transparent response decompression. The default `compression` feature enables
+  `gzip`, `deflate`, `brotli`, and `zstd`; size-sensitive dependents can enable
+  only `gzip` (or any subset). Decompressed output is capped at 128 MiB by
+  default against compression bombs
 - default cookie jar rejects public-suffix `Domain` cookies (RFC 6265 §5.3)
   and honors the `Secure` attribute
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
@@ -77,6 +78,31 @@ The next planned crates.io release is `0.1.1`:
 [dependencies]
 openwire = "0.1.1"
 ```
+
+Default features are `tls-rustls`, `platform-verifier`, `compression` (all
+codecs), and `cookies`. Size-sensitive dependents should disable defaults and
+opt into the codecs they need. OpenWire no longer enables `tokio/full` or `hyper/full`. Other workspace
+pins also disable unused default features (`tower/timeout`, `rustls` logging,
+`futures-util` macros, `tokio-rustls` logging). Declare any extra Tokio/Hyper
+features your own crate uses. `h2` / `tokio-rustls` may still turn on Tokio's
+own default feature set through Cargo unification.
+
+```toml
+[dependencies]
+openwire = { version = "0.1.1", default-features = false, features = ["tls-rustls", "gzip"] }
+```
+
+Optional features:
+
+| Feature | Default | What it enables |
+| --- | --- | --- |
+| `tls-rustls` | yes | Rustls TLS connector |
+| `platform-verifier` | yes | Platform certificate verifier |
+| `compression` | yes | `gzip` + `deflate` + `brotli` + `zstd` |
+| `gzip` / `deflate` / `brotli` / `zstd` | via `compression` | Individual transparent decode codecs |
+| `cookies` | yes | Built-in `Jar` (`cookie_store` + public suffix list) |
+| `json` | no | `RequestBody::from_json` / `ResponseBody::json`, JSON pretty-print in `LoggerInterceptor` |
+| `websocket` | no | RFC 6455 WebSocket client |
 
 Optional companion crates are published with the same workspace version, for
 example `openwire-cache = "0.1.1"` or `openwire-tungstenite = "0.1.1"`.
@@ -249,12 +275,14 @@ proxy authenticator are not forwarded into the proxy tunnel handshake.
 
 ## Transparent Compression
 
-With the default `compression` feature enabled, the bridge injects
-`Accept-Encoding: br, gzip, deflate, zstd` for normal HTTP requests that do not
-already set `Accept-Encoding` and are not range requests. Responses using those
-encodings are decoded as a stream before they reach application interceptors or
-callers, and the decoded response omits the wire `Content-Encoding` and
-compressed `Content-Length` headers.
+With compression codecs enabled, the bridge injects `Accept-Encoding` listing
+only those codecs (default: `br, gzip, deflate, zstd`) for normal HTTP requests
+that do not already set `Accept-Encoding` and are not range requests. Enabling
+`compression-core` without a codec injects no `Accept-Encoding`. Responses
+using enabled encodings are decoded as a stream before they reach application
+interceptors or callers, and the decoded response omits the wire
+`Content-Encoding` and compressed `Content-Length` headers. Disabled codecs are
+left untouched on the wire.
 
 If a caller sets `Accept-Encoding` explicitly, OpenWire leaves the response
 body and headers untouched so the caller owns the wire encoding semantics.

@@ -8,6 +8,26 @@ use crate::{CallContext, ConnectionId, RequestBody, ResponseBody, WireError};
 pub type SharedEventListener = Arc<dyn EventListener>;
 pub type SharedEventListenerFactory = Arc<dyn EventListenerFactory>;
 
+/// One proxy candidate published to [`EventListener`].
+///
+/// `Direct` is the OkHttp `Proxy.NO_PROXY` equivalent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyEvent {
+    Direct,
+    Url(String),
+}
+
+/// TLS session summary published after a successful handshake.
+///
+/// Peer certificates are omitted to keep the callback cheap and avoid leaking
+/// identity material into generic observers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsHandshake {
+    pub alpn: Option<Vec<u8>>,
+    pub protocol_version: Option<String>,
+    pub cipher_suite: Option<String>,
+}
+
 pub trait EventListener: Send + Sync + 'static {
     /// Fired once when a call begins execution.
     ///
@@ -26,6 +46,17 @@ pub trait EventListener: Send + Sync + 'static {
     /// when the terminal failure happens during response-body consumption.
     fn call_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
+    /// Fired when a call is queued on the client's executor via `Call::enqueue`.
+    ///
+    /// Direct `execute()` calls do not emit dispatcher events.
+    fn dispatcher_queue_start(&self, _ctx: &CallContext) {}
+
+    /// Fired when a previously queued call begins executing.
+    fn dispatcher_queue_end(&self, _ctx: &CallContext) {}
+
+    fn proxy_select_start(&self, _ctx: &CallContext, _uri: &Uri) {}
+    fn proxy_select_end(&self, _ctx: &CallContext, _uri: &Uri, _proxies: &[ProxyEvent]) {}
+
     fn dns_start(&self, _ctx: &CallContext, _host: &str, _port: u16) {}
     fn dns_end(&self, _ctx: &CallContext, _host: &str, _addrs: &[SocketAddr]) {}
     fn dns_failed(&self, _ctx: &CallContext, _host: &str, _error: &WireError) {}
@@ -38,12 +69,29 @@ pub trait EventListener: Send + Sync + 'static {
     fn tls_end(&self, _ctx: &CallContext, _server_name: &str) {}
     fn tls_failed(&self, _ctx: &CallContext, _server_name: &str, _error: &WireError) {}
 
+    /// Fired after a successful TLS handshake with negotiated session details.
+    ///
+    /// Always paired with `tls_end` on the success path.
+    fn tls_handshake(&self, _ctx: &CallContext, _server_name: &str, _handshake: &TlsHandshake) {}
+
     fn request_headers_start(&self, _ctx: &CallContext) {}
     fn request_headers_end(&self, _ctx: &CallContext) {}
+
+    /// Fired just prior to sending a present request body.
+    ///
+    /// Absent bodies (`RequestBody::absent`) do not emit start/end events.
+    fn request_body_start(&self, _ctx: &CallContext) {}
     fn request_body_end(&self, _ctx: &CallContext, _bytes_sent: u64) {}
+
+    /// Fired when request headers or body fail to be written.
+    fn request_failed(&self, _ctx: &CallContext, _error: &WireError) {}
 
     fn response_headers_start(&self, _ctx: &CallContext) {}
     fn response_headers_end(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
+
+    /// Fired when response body data is first available, or when the body is
+    /// closed without a prior read (OkHttp 4.3 semantics).
+    fn response_body_start(&self, _ctx: &CallContext) {}
 
     /// Fired when the response body is closed or exhausted successfully.
     ///
@@ -53,6 +101,16 @@ pub trait EventListener: Send + Sync + 'static {
 
     /// Fired when the response body cannot be read to the point it was closed.
     fn response_body_failed(&self, _ctx: &CallContext, _error: &WireError) {}
+
+    /// Fired when response headers fail to be read. Body-phase failures use
+    /// `response_body_failed` instead.
+    fn response_failed(&self, _ctx: &CallContext, _error: &WireError) {}
+
+    /// Fired when a call is canceled.
+    ///
+    /// May run concurrently with other callbacks, including before `call_start`
+    /// or after `call_end`. Invoked at most once per listener instance.
+    fn canceled(&self) {}
 
     fn pool_lookup(&self, _ctx: &CallContext, _hit: bool, _connection_id: Option<ConnectionId>) {}
 
@@ -94,6 +152,27 @@ pub trait EventListener: Send + Sync + 'static {
 
     fn retry(&self, _ctx: &CallContext, _attempt: u32, _reason: &str) {}
     fn redirect(&self, _ctx: &CallContext, _attempt: u32, _location: &Uri) {}
+
+    /// Fired for every retry decision, including when the client will not retry.
+    fn retry_decision(&self, _ctx: &CallContext, _error: &WireError, _retry: bool) {}
+
+    /// Fired for every follow-up decision (auth, redirect, response-status retry).
+    ///
+    /// `next_request` is `None` when the network response is returned to the caller.
+    fn follow_up_decision(
+        &self,
+        _ctx: &CallContext,
+        _response: &Response<ResponseBody>,
+        _next_request: Option<&Request<RequestBody>>,
+    ) {
+    }
+
+    /// Fired when a cache cannot satisfy `only-if-cached` (or equivalent).
+    fn satisfaction_failure(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
+
+    fn cache_hit(&self, _ctx: &CallContext, _response: &Response<ResponseBody>) {}
+    fn cache_miss(&self, _ctx: &CallContext) {}
+    fn cache_conditional_hit(&self, _ctx: &CallContext, _cached: &Response<ResponseBody>) {}
 
     // ─── WebSocket lifecycle (feature = "websocket") ───
     /// Fired once when the 101 response has been validated and the engine has
