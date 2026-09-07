@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use hyper::Uri;
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, CoalescingInfo, Connected, Connection, ConnectionInfo,
-    ConnectionIo, TlsAlpnPreference, TlsConnector, WireError,
+    ConnectionIo, TlsAlpnPreference, TlsConnector, TlsHandshake, WireError,
 };
 use openwire_tokio::TokioIo;
 use pin_project_lite::pin_project;
@@ -207,6 +207,11 @@ impl TlsConnector for RustlsTlsConnector {
                 .map(|protocol| protocol == b"h2")
                 .unwrap_or(false);
             let coalescing = coalescing_info_from_session(tls_stream.get_ref().1);
+            ctx.listener().tls_handshake(
+                &ctx,
+                &host,
+                &tls_handshake_from_session(tls_stream.get_ref().1),
+            );
 
             ctx.listener().tls_end(&ctx, &host);
 
@@ -326,6 +331,18 @@ fn build_connected(
 
 fn connection_info_from_stream(stream: &dyn ConnectionIo) -> ConnectionInfo {
     stream.connected().connection_info_or_default()
+}
+
+fn tls_handshake_from_session(session: &rustls::ClientConnection) -> TlsHandshake {
+    TlsHandshake {
+        alpn: session.alpn_protocol().map(ToOwned::to_owned),
+        protocol_version: session
+            .protocol_version()
+            .map(|version| format!("{version:?}")),
+        cipher_suite: session
+            .negotiated_cipher_suite()
+            .map(|suite| format!("{:?}", suite.suite())),
+    }
 }
 
 fn coalescing_info_from_session(session: &rustls::ClientConnection) -> CoalescingInfo {

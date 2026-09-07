@@ -23,8 +23,8 @@ pub use error::{
     BoxError, EstablishmentStage, FailurePhase, WireError, WireErrorDiagnostics, WireErrorKind,
 };
 pub use event::{
-    EventListener, EventListenerFactory, NoopEventListener, NoopEventListenerFactory,
-    SharedEventListener, SharedEventListenerFactory,
+    EventListener, EventListenerFactory, NoopEventListener, NoopEventListenerFactory, ProxyEvent,
+    SharedEventListener, SharedEventListenerFactory, TlsHandshake,
 };
 pub use interceptor::{
     BoxWireService, Exchange, Interceptor, InterceptorLayer, Next, SharedInterceptor, WireResponse,

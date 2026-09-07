@@ -8,8 +8,9 @@ use http::header::{
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
-    AuthKind, BoxFuture, BoxWireService, CookieJar, Exchange, RedirectContext, RedirectDecision,
-    RequestBody, ResponseBody, ResponseRetryContext, RetryAfter, RetryContext, WireError,
+    AuthKind, BoxFuture, BoxWireService, CallContext, CookieJar, Exchange, RedirectContext,
+    RedirectDecision, RequestBody, ResponseBody, ResponseRetryContext, RetryAfter, RetryContext,
+    WireError,
 };
 use tower::Service;
 use url::Url;
@@ -20,7 +21,7 @@ use crate::auth::{
 };
 use crate::client::{CallOptions, EffectiveRequestConfig};
 use crate::connection::CachedAddresses;
-use crate::cookie::SharedCookieJar;
+pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 use crate::proxy::SelectedProxy;
 use crate::trace::PolicyTraceContext;
 use crate::transport::{CoalescedConnectionRetryable, NoCoalescedConnections};
@@ -137,6 +138,8 @@ impl Service<Exchange> for FollowUpPolicyService {
                             policy_trace.retry_count = retries;
                             policy_trace.redirect_count = redirects;
                             policy_trace.auth_count = auths;
+                            ctx.listener()
+                                .follow_up_decision(&ctx, &response, Some(&next_request));
                             tracing::debug!(
                                 call_id = ctx.call_id().as_u64(),
                                 attempt = next_attempt,
@@ -166,6 +169,10 @@ impl Service<Exchange> for FollowUpPolicyService {
                             policy_trace.retry_count = retries;
                             policy_trace.redirect_count = redirects;
                             policy_trace.auth_count = auths;
+                            let mut next_request = snapshot.to_retry_request(policy_trace)?;
+                            next_request.extensions_mut().insert(NoCoalescedConnections);
+                            ctx.listener()
+                                .follow_up_decision(&ctx, &response, Some(&next_request));
                             ctx.listener().retry(&ctx, retries, "misdirected_request");
                             tracing::debug!(
                                 call_id = ctx.call_id().as_u64(),
@@ -178,8 +185,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                             );
 
                             let _ = drain_intermediate_response(response).await;
-                            request = snapshot.to_retry_request(policy_trace)?;
-                            request.extensions_mut().insert(NoCoalescedConnections);
+                            request = next_request;
                             attempt = next_attempt;
                             continue;
                         }
@@ -192,6 +198,9 @@ impl Service<Exchange> for FollowUpPolicyService {
                             policy_trace.retry_count = retries;
                             policy_trace.redirect_count = redirects;
                             policy_trace.auth_count = auths;
+                            let next_request = snapshot.to_retry_request(policy_trace)?;
+                            ctx.listener()
+                                .follow_up_decision(&ctx, &response, Some(&next_request));
                             ctx.listener().retry(&ctx, retries, reason);
                             tracing::debug!(
                                 call_id = ctx.call_id().as_u64(),
@@ -205,19 +214,19 @@ impl Service<Exchange> for FollowUpPolicyService {
                             );
 
                             let _ = drain_intermediate_response(response).await;
-                            request = snapshot.to_retry_request(policy_trace)?;
+                            request = next_request;
                             attempt = next_attempt;
                             continue;
                         }
 
                         if let Some(policy) = config.redirect.default_policy() {
                             if !policy.follow_redirects() {
-                                return Ok(response);
+                                return emit_terminal_follow_up(&ctx, response);
                             }
                         }
 
                         if !is_redirect_status(response.status()) {
-                            return Ok(response);
+                            return emit_terminal_follow_up(&ctx, response);
                         }
 
                         let Some(location) = response
@@ -225,7 +234,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                             .get(LOCATION)
                             .and_then(|value| value.to_str().ok())
                         else {
-                            return Ok(response);
+                            return emit_terminal_follow_up(&ctx, response);
                         };
 
                         let next_uri = resolve_redirect_uri(&snapshot.uri, location)?;
@@ -243,7 +252,9 @@ impl Service<Exchange> for FollowUpPolicyService {
                                 snapshot.is_replayable(),
                             )) {
                             RedirectDecision::Follow => {}
-                            RedirectDecision::Stop => return Ok(response),
+                            RedirectDecision::Stop => {
+                                return emit_terminal_follow_up(&ctx, response);
+                            }
                             RedirectDecision::Error(error) => return Err(error),
                         }
 
@@ -269,8 +280,10 @@ impl Service<Exchange> for FollowUpPolicyService {
                             selected_proxy,
                         )?
                         else {
-                            return Ok(response);
+                            return emit_terminal_follow_up(&ctx, response);
                         };
+                        ctx.listener()
+                            .follow_up_decision(&ctx, &response, Some(&next_request));
                         let _ = drain_intermediate_response(response).await;
                         ctx.listener().redirect(&ctx, redirects + 1, &next_uri);
                         request = next_request;
@@ -285,6 +298,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                             &snapshot.method,
                         );
                         let Some(reason) = config.retry.policy().should_retry(&retry_ctx) else {
+                            ctx.listener().retry_decision(&ctx, &error, false);
                             return Err(error);
                         };
 
@@ -293,6 +307,7 @@ impl Service<Exchange> for FollowUpPolicyService {
                         policy_trace.retry_count = retries;
                         policy_trace.redirect_count = redirects;
                         policy_trace.auth_count = auths;
+                        ctx.listener().retry_decision(&ctx, &error, true);
                         ctx.listener().retry(&ctx, retries, reason);
                         tracing::debug!(
                             call_id = ctx.call_id().as_u64(),
@@ -310,6 +325,14 @@ impl Service<Exchange> for FollowUpPolicyService {
             }
         })
     }
+}
+
+fn emit_terminal_follow_up(
+    ctx: &CallContext,
+    response: Response<ResponseBody>,
+) -> Result<Response<ResponseBody>, WireError> {
+    ctx.listener().follow_up_decision(ctx, &response, None);
+    Ok(response)
 }
 
 fn apply_request_overrides(

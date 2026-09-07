@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{LazyLock, RwLock};
 
 use bytes::Bytes;
 use cookie as cookie_crate;
@@ -8,8 +8,6 @@ use openwire_core::CookieJar;
 use publicsuffix::List;
 
 use crate::sync_util::{read_rwlock, write_rwlock};
-
-pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 
 /// Embedded Mozilla Public Suffix List used by the default jar.
 ///

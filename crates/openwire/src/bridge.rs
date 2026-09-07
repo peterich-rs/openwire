@@ -8,18 +8,18 @@ const DEFAULT_USER_AGENT_VALUE: HeaderValue = HeaderValue::from_static(DEFAULT_U
 
 #[derive(Clone, Debug)]
 pub(crate) struct BridgeInterceptor {
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-core")]
     max_decompressed_body_bytes: usize,
     strict_host_header: bool,
 }
 
 impl BridgeInterceptor {
     pub(crate) fn new(
-        #[cfg(feature = "compression")] max_decompressed_body_bytes: usize,
+        #[cfg(feature = "compression-core")] max_decompressed_body_bytes: usize,
         strict_host_header: bool,
     ) -> Self {
         Self {
-            #[cfg(feature = "compression")]
+            #[cfg(feature = "compression-core")]
             max_decompressed_body_bytes,
             strict_host_header,
         }
@@ -32,20 +32,20 @@ impl Interceptor for BridgeInterceptor {
         mut exchange: Exchange,
         next: Next,
     ) -> BoxFuture<Result<http::Response<ResponseBody>, WireError>> {
-        #[cfg(feature = "compression")]
+        #[cfg(feature = "compression-core")]
         let request_method = exchange.request().method().clone();
-        #[cfg(feature = "compression")]
+        #[cfg(feature = "compression-core")]
         let max_decompressed_body_bytes = self.max_decompressed_body_bytes;
         let strict_host_header = self.strict_host_header;
         let normalization = normalize_request(exchange.request_mut(), strict_host_header);
-        #[cfg(feature = "compression")]
+        #[cfg(feature = "compression-core")]
         let transparent_compression = normalization.as_ref().copied().unwrap_or(false);
         Box::pin(async move {
             normalization?;
-            #[cfg(feature = "compression")]
+            #[cfg(feature = "compression-core")]
             let ctx = exchange.context().clone();
             let response = next.run(exchange).await?;
-            #[cfg(feature = "compression")]
+            #[cfg(feature = "compression-core")]
             {
                 if transparent_compression {
                     return Ok(crate::compression::decode_response(
@@ -78,9 +78,9 @@ pub(crate) fn normalize_request(
     normalize_host_header(request, strict_host_header)?;
     normalize_user_agent_header(request);
     normalize_body_headers(request);
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-core")]
     let transparent_compression = crate::compression::normalize_request(request);
-    #[cfg(not(feature = "compression"))]
+    #[cfg(not(feature = "compression-core"))]
     let transparent_compression = false;
     Ok(transparent_compression)
 }

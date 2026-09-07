@@ -66,7 +66,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A[User API<br/>Client::execute / Call::execute] --> B[Resolve effective request config<br/>Create CallContext and EventListener]
+    A[User API<br/>Client::execute / Call::execute] --> B[Reuse EventListener from Call construction<br/>Create CallContext]
     B --> C[Application Interceptors]
     C --> D[FollowUpPolicyService]
     D --> E[Request Validation]
@@ -107,9 +107,10 @@ transport byte stream but below user-facing application interceptors. That
 includes `Host`, `User-Agent`, request body framing headers, WebSocket handshake
 headers, and transparent compression. When OpenWire synthesizes `Host`, it uses
 the URI authority's normal form by omitting default `:80` / `:443` ports while
-preserving explicit caller-supplied `Host` values. When the default
-`compression` feature is
-enabled, bridge injects `Accept-Encoding: br, gzip, deflate, zstd` only for
+preserving explicit caller-supplied `Host` values. When any compression codec feature is
+enabled (`gzip`, `deflate`, `brotli`, `zstd`; default umbrella `compression`
+enables all four), bridge injects `Accept-Encoding` listing only the enabled
+codecs, and only for
 requests that did not already specify `Accept-Encoding` and are not range
 requests. Matching compressed responses are decoded as a stream on the return
 path, with `Content-Encoding` and compressed `Content-Length` removed before the
@@ -175,7 +176,7 @@ These are the intended customization points:
 | Trait / Surface | Role |
 | --- | --- |
 | `Interceptor` | application or network request/response interception |
-| `EventListener` / `EventListenerFactory` | call-level and transport-level observability |
+| `EventListener` / `EventListenerFactory` | call-level and transport-level observability. Factory runs at `Call` construction so `canceled` and dispatcher events have a listener before execute |
 | `CookieJar` | request cookie application and response cookie persistence |
 | `Authenticator` | origin and proxy authentication follow-ups, with `AuthContext::challenges()` exposing RFC 9110 / RFC 7235 `WWW-Authenticate` and `Proxy-Authenticate` challenges |
 | `RetryPolicy` | connection-failure and response-status retry decisions |
@@ -187,6 +188,35 @@ These are the intended customization points:
 | `RoutePlanner` | direct and proxy route construction |
 | `WireExecutor` | background task spawning |
 | `hyper::rt::Timer` | timer integration |
+
+Typical `EventListener` nesting (OkHttp-aligned). OpenWire extras are marked with `*`:
+
+```
+call_start / call_end / call_failed / canceled
+  dispatcher_queue_start / dispatcher_queue_end   (Call::enqueue only)
+  proxy_select_start / proxy_select_end
+  dns_start / dns_end / dns_failed*
+  connect_start / connect_end / connect_failed
+    tls_start / tls_handshake* / tls_end / tls_failed*
+  pool_lookup* / route_plan* / connect_race_*
+  connection_acquired / connection_released
+    request_headers_start / request_headers_end
+    request_body_start / request_body_end / request_failed
+    response_headers_start / response_headers_end
+    response_body_start / response_body_end / response_body_failed / response_failed
+  retry / retry_decision / redirect / follow_up_decision
+  cache_hit / cache_miss / cache_conditional_hit / satisfaction_failure
+```
+
+`EventListenerFactory::create` runs when `Client::new_call` (or `Call::try_clone`) builds the `Call`, not at execute time. Direct `execute()` does not emit dispatcher events.
+
+## 5b. Cargo features
+
+Default: `tls-rustls`, `platform-verifier`, `compression`, `cookies`.
+
+Codec features `gzip`, `deflate`, `brotli`, and `zstd` can be enabled independently. `compression` is the umbrella of all four. `compression-core` is the internal module gate pulled in by any codec; enabling it with no codec compiles and injects no `Accept-Encoding`. Workspace pins follow a minimum-feature policy: `tokio` and `hyper` no longer enable `full`; `tower` is `util` only; `rustls` / `tokio-rustls` keep `std` + `tls12` + `aws_lc_rs` and drop `logging`; `futures-util` keeps `std` + `async-await` and adds `io`/`sink` only where used. Production crates request Tokio `rt`/`net`/`time`/`io-util`/`sync` and hyper `client`/`http1`/`http2`. `openwire-test` additionally enables `hyper/server`. `openwire-cache` depends on `openwire` with `default-features = false`.
+
+The built-in `Jar` is behind `cookies`. Custom `CookieJar` implementations do not need that feature. `json` gates JSON body helpers and `LoggerInterceptor` pretty-print.
 
 `openwire-cache` is intentionally an application interceptor rather than a
 transport feature. Fresh cache hits short-circuit before the follow-up

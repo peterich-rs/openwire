@@ -1,9 +1,10 @@
 mod auth;
 mod bridge;
 mod client;
-#[cfg(feature = "compression")]
+#[cfg(feature = "compression-core")]
 mod compression;
 mod connection;
+#[cfg(feature = "cookies")]
 mod cookie;
 mod logging;
 mod policy;
@@ -21,16 +22,17 @@ pub use connection::{
     ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,
     TlsIdentity, UriScheme,
 };
+#[cfg(feature = "cookies")]
 pub use cookie::Jar;
 pub use logging::{HttpLogger, LogLevel, LoggerInterceptor, StderrLogger};
 pub use openwire_core::{
     AuthChallenge, AuthChallengeParam, AuthContext, AuthKind, Authenticator, BoxFuture,
     BoxTaskHandle, CallContext, CallId, Connected, Connection, ConnectionId, ConnectionInfo,
     CookieJar, DnsResolver, EstablishmentStage, EventListener, EventListenerFactory, Exchange,
-    HyperExecutor, Interceptor, Next, NoopEventListener, NoopEventListenerFactory, RedirectContext,
-    RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext, RetryPolicy,
-    SharedTimer, TaskHandle, TcpConnector, TlsAlpnPreference, TlsConnector, WireError,
-    WireErrorKind, WireExecutor,
+    HyperExecutor, Interceptor, Next, NoopEventListener, NoopEventListenerFactory, ProxyEvent,
+    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext,
+    RetryPolicy, SharedTimer, TaskHandle, TcpConnector, TlsAlpnPreference, TlsConnector,
+    TlsHandshake, WireError, WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

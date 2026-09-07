@@ -11,7 +11,7 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use openwire_core::{
     BoxFuture, CallContext, ConnectionId, DnsResolver, EventListener, EventListenerFactory,
-    RequestBody, ResponseBody, SharedEventListener, WireError,
+    ProxyEvent, RequestBody, ResponseBody, SharedEventListener, TlsHandshake, WireError,
 };
 use openwire_tokio::{TokioExecutor, TokioIo};
 use rcgen::generate_simple_self_signed;
@@ -148,6 +148,30 @@ impl EventListener for RecordingEventListener {
         self.push(format!("call_failed {:?}", error.kind()));
     }
 
+    fn dispatcher_queue_start(&self, _ctx: &CallContext) {
+        self.push("dispatcher_queue_start");
+    }
+
+    fn dispatcher_queue_end(&self, _ctx: &CallContext) {
+        self.push("dispatcher_queue_end");
+    }
+
+    fn proxy_select_start(&self, _ctx: &CallContext, uri: &http::Uri) {
+        self.push(format!("proxy_select_start {uri}"));
+    }
+
+    fn proxy_select_end(&self, _ctx: &CallContext, uri: &http::Uri, proxies: &[ProxyEvent]) {
+        let list = proxies
+            .iter()
+            .map(|proxy| match proxy {
+                ProxyEvent::Direct => "DIRECT".to_string(),
+                ProxyEvent::Url(url) => url.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        self.push(format!("proxy_select_end {uri} [{list}]"));
+    }
+
     fn dns_start(&self, _ctx: &CallContext, host: &str, _port: u16) {
         self.push(format!("dns_start {host}"));
     }
@@ -164,6 +188,15 @@ impl EventListener for RecordingEventListener {
         self.push(format!("connect_end {} {}", connection_id.as_u64(), addr));
     }
 
+    fn tls_handshake(&self, _ctx: &CallContext, server_name: &str, handshake: &TlsHandshake) {
+        let alpn = handshake
+            .alpn
+            .as_ref()
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        self.push(format!("tls_handshake {server_name} alpn={alpn}"));
+    }
+
     fn request_headers_start(&self, _ctx: &CallContext) {
         self.push("request_headers_start");
     }
@@ -172,8 +205,16 @@ impl EventListener for RecordingEventListener {
         self.push("request_headers_end");
     }
 
+    fn request_body_start(&self, _ctx: &CallContext) {
+        self.push("request_body_start");
+    }
+
     fn request_body_end(&self, _ctx: &CallContext, bytes_sent: u64) {
         self.push(format!("request_body_end {bytes_sent}"));
+    }
+
+    fn request_failed(&self, _ctx: &CallContext, error: &WireError) {
+        self.push(format!("request_failed {}", error.kind()));
     }
 
     fn response_headers_start(&self, _ctx: &CallContext) {
@@ -184,8 +225,20 @@ impl EventListener for RecordingEventListener {
         self.push(format!("response_headers_end {}", response.status()));
     }
 
+    fn response_body_start(&self, _ctx: &CallContext) {
+        self.push("response_body_start");
+    }
+
     fn response_body_failed(&self, _ctx: &CallContext, error: &WireError) {
         self.push(format!("response_body_failed {}", error.kind()));
+    }
+
+    fn response_failed(&self, _ctx: &CallContext, error: &WireError) {
+        self.push(format!("response_failed {}", error.kind()));
+    }
+
+    fn canceled(&self) {
+        self.push("canceled");
     }
 
     fn response_body_end(&self, _ctx: &CallContext, bytes_read: u64) {
@@ -263,6 +316,46 @@ impl EventListener for RecordingEventListener {
 
     fn redirect(&self, _ctx: &CallContext, attempt: u32, location: &http::Uri) {
         self.push(format!("redirect {attempt} {location}"));
+    }
+
+    fn retry_decision(&self, _ctx: &CallContext, error: &WireError, retry: bool) {
+        self.push(format!("retry_decision {} retry={retry}", error.kind()));
+    }
+
+    fn follow_up_decision(
+        &self,
+        _ctx: &CallContext,
+        response: &Response<ResponseBody>,
+        next_request: Option<&Request<RequestBody>>,
+    ) {
+        match next_request {
+            Some(request) => self.push(format!(
+                "follow_up_decision {} next={} {}",
+                response.status(),
+                request.method(),
+                request.uri()
+            )),
+            None => self.push(format!(
+                "follow_up_decision {} next=none",
+                response.status()
+            )),
+        }
+    }
+
+    fn satisfaction_failure(&self, _ctx: &CallContext, response: &Response<ResponseBody>) {
+        self.push(format!("satisfaction_failure {}", response.status()));
+    }
+
+    fn cache_hit(&self, _ctx: &CallContext, response: &Response<ResponseBody>) {
+        self.push(format!("cache_hit {}", response.status()));
+    }
+
+    fn cache_miss(&self, _ctx: &CallContext) {
+        self.push("cache_miss");
+    }
+
+    fn cache_conditional_hit(&self, _ctx: &CallContext, cached: &Response<ResponseBody>) {
+        self.push(format!("cache_conditional_hit {}", cached.status()));
     }
 
     #[cfg(feature = "websocket")]

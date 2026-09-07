@@ -17,10 +17,12 @@ bytes.workspace = true
 http.workspace = true
 httpdate.workspace = true
 openwire.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 url.workspace = true
 
 [dev-dependencies]
 hyper.workspace = true
+openwire = { workspace = true, default-features = true }
 openwire-rustls.workspace = true
 openwire-test.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+#[cfg(feature = "json")]
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -372,11 +373,19 @@ fn emit_lines(config: &LoggerConfig, lines: &[String]) {
 }
 
 fn pretty_json(bytes: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let mut rendered = Vec::new();
-    serde_json::to_writer_pretty(&mut rendered, &value).ok()?;
-    rendered.write_all(b"\n").ok()?;
-    String::from_utf8(rendered).ok()
+    #[cfg(feature = "json")]
+    {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let mut rendered = Vec::new();
+        serde_json::to_writer_pretty(&mut rendered, &value).ok()?;
+        rendered.write_all(b"\n").ok()?;
+        return String::from_utf8(rendered).ok();
+    }
+    #[cfg(not(feature = "json"))]
+    {
+        let _ = bytes;
+        None
+    }
 }
 
 fn is_json(headers: &HeaderMap<HeaderValue>) -> bool {
@@ -533,7 +542,10 @@ mod tests {
         let lines = lines.lock().expect("lines").join("\n");
         assert!(lines.contains("--> POST https://api.example.com/users"));
         assert!(lines.contains("Authorization: ██"));
+        #[cfg(feature = "json")]
         assert!(lines.contains("\"name\": \"Alice\""));
+        #[cfg(not(feature = "json"))]
+        assert!(lines.contains("\"name\":\"Alice\""));
         assert!(lines.contains("<-- 201 Created https://api.example.com/users"));
         assert!(lines.contains("<-- END HTTP (25-byte body)"));
     }

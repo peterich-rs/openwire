@@ -17,11 +17,11 @@ fastwebsockets.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 openwire-core = { workspace = true, features = ["websocket"] }
 openwire-tokio.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util", "sync"] }
 
 [dev-dependencies]
 http.workspace = true
-openwire = { workspace = true, features = ["websocket"] }
+openwire = { workspace = true, default-features = true, features = ["websocket"] }
 openwire-test = { workspace = true, features = ["websocket"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite.workspace = true

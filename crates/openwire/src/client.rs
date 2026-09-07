@@ -14,8 +14,8 @@ use hyper::rt::Timer;
 use openwire_core::{
     Authenticator, BoxTaskHandle, BoxWireService, CallContext, CookieJar, DnsResolver,
     EventListenerFactory, Exchange, InterceptorLayer, NoopEventListenerFactory, RedirectPolicy,
-    RequestBody, ResponseBody, RetryPolicy, SharedEventListenerFactory, SharedInterceptor,
-    SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
+    RequestBody, ResponseBody, RetryPolicy, SharedEventListener, SharedEventListenerFactory,
+    SharedInterceptor, SharedTimer, TcpConnector, TlsConnector, WireError, WireExecutor,
 };
 use openwire_tokio::{CachingDnsResolver, TokioExecutor, TokioTcpConnector, TokioTimer};
 use tower::layer::Layer;
@@ -30,9 +30,9 @@ use crate::connection::{
     Address, CachedAddresses, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
     RequestAdmissionLimiter, RequestAdmissionPermit, ResolvedAddress, RoutePlanner,
 };
-use crate::cookie::SharedCookieJar;
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
+    SharedCookieJar,
 };
 use crate::proxy::{
     resolved_proxy_candidates_with_sticky, ProxyRules, ProxySelector, SelectedProxy,
@@ -109,7 +109,7 @@ pub(crate) struct TransportConfig {
     pub(crate) max_connections_per_host: usize,
     pub(crate) max_requests_total: usize,
     pub(crate) max_requests_per_host: usize,
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-core")]
     pub(crate) max_decompressed_body_bytes: usize,
     pub(crate) strict_host_header: bool,
 }
@@ -167,11 +167,28 @@ struct PoolReaperState {
     handle: Option<BoxTaskHandle>,
 }
 
-#[derive(Default)]
 struct CallState {
     executed: AtomicBool,
     canceled: AtomicBool,
+    canceled_notified: AtomicBool,
+    listener: SharedEventListener,
     waker: AtomicWaker,
+}
+
+impl CallState {
+    fn new(listener: SharedEventListener) -> Self {
+        Self {
+            executed: AtomicBool::new(false),
+            canceled: AtomicBool::new(false),
+            canceled_notified: AtomicBool::new(false),
+            listener,
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn listener(&self) -> SharedEventListener {
+        self.listener.clone()
+    }
 }
 
 impl ClientBuilder {
@@ -397,7 +414,7 @@ impl ClientBuilder {
     /// Caps transparent response decompression output size.
     ///
     /// Only applies when the `compression` feature is enabled.
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-core")]
     pub fn max_decompressed_body_bytes(mut self, max_bytes: usize) -> Self {
         self.transport.max_decompressed_body_bytes = max_bytes;
         self
@@ -513,7 +530,7 @@ impl ClientBuilder {
             self.application_interceptors,
             self.network_interceptors,
             self.policy.clone(),
-            #[cfg(feature = "compression")]
+            #[cfg(feature = "compression-core")]
             self.transport.max_decompressed_body_bytes,
             self.transport.strict_host_header,
         );
@@ -556,7 +573,7 @@ impl Default for ClientBuilder {
                 max_connections_per_host: DEFAULT_MAX_CONNECTIONS_PER_HOST,
                 max_requests_total: 64,
                 max_requests_per_host: 5,
-                #[cfg(feature = "compression")]
+                #[cfg(feature = "compression-core")]
                 max_decompressed_body_bytes:
                     crate::compression::DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
                 strict_host_header: false,
@@ -586,11 +603,12 @@ impl Client {
     }
 
     pub fn new_call(&self, request: Request<RequestBody>) -> Call {
+        let listener = self.inner.event_listener_factory.create(&request);
         Call {
             client: self.clone(),
             request,
             options: CallOptions::default(),
-            state: Arc::new(CallState::default()),
+            state: Arc::new(CallState::new(listener)),
         }
     }
 
@@ -753,6 +771,9 @@ impl CallState {
     fn cancel(&self) {
         self.canceled.store(true, Ordering::Release);
         self.waker.wake();
+        if !self.canceled_notified.swap(true, Ordering::AcqRel) {
+            self.listener.canceled();
+        }
     }
 
     fn is_canceled(&self) -> bool {
@@ -798,11 +819,13 @@ impl Call {
     /// Creates a fresh, unexecuted call with the same request and options when
     /// the request body is replayable.
     pub fn try_clone(&self) -> Option<Self> {
+        let request = clone_request(&self.request)?;
+        let listener = self.client.inner.event_listener_factory.create(&request);
         Some(Self {
             client: self.client.clone(),
-            request: clone_request(&self.request)?,
+            request,
             options: self.options,
-            state: Arc::new(CallState::default()),
+            state: Arc::new(CallState::new(listener)),
         })
     }
 
@@ -853,13 +876,16 @@ impl Call {
 
     /// Queues this call on the client's configured executor and returns a handle
     /// that can be awaited for the response.
-    pub fn enqueue(self) -> Result<QueuedCall, WireError> {
+    pub fn enqueue(mut self) -> Result<QueuedCall, WireError> {
         self.mark_executed()?;
+        let ctx = self.build_context();
+        ctx.listener().dispatcher_queue_start(&ctx);
         let handle = self.handle();
         let executor = self.client.inner.executor.clone();
         let (sender, receiver) = oneshot::channel();
         let task = executor.spawn(Box::pin(async move {
-            let result = self.execute_marked().await;
+            ctx.listener().dispatcher_queue_end(&ctx);
+            let result = self.execute_prepared(ctx).await;
             let _ = sender.send(result);
         }))?;
 
@@ -870,9 +896,10 @@ impl Call {
         })
     }
 
-    pub async fn execute(self) -> Result<Response<ResponseBody>, WireError> {
+    pub async fn execute(mut self) -> Result<Response<ResponseBody>, WireError> {
         self.mark_executed()?;
-        self.execute_marked().await
+        let ctx = self.build_context();
+        self.execute_prepared(ctx).await
     }
 
     fn mark_executed(&self) -> Result<(), WireError> {
@@ -888,7 +915,7 @@ impl Call {
         }
     }
 
-    async fn execute_marked(mut self) -> Result<Response<ResponseBody>, WireError> {
+    fn build_context(&mut self) -> CallContext {
         let request_config = self
             .client
             .inner
@@ -896,12 +923,14 @@ impl Call {
             .with_overrides(self.options);
         self.request.extensions_mut().insert(request_config);
         self.request.extensions_mut().insert(self.options);
-        let ctx = CallContext::from_factory(
-            &self.client.inner.event_listener_factory,
+        CallContext::from_listener(
+            self.state.listener(),
             &self.request,
             request_config.call_timeout,
-        );
+        )
+    }
 
+    async fn execute_prepared(self, ctx: CallContext) -> Result<Response<ResponseBody>, WireError> {
         let span = tracing::info_span!(
             "openwire.call",
             call_id = ctx.call_id().as_u64(),
@@ -1024,7 +1053,7 @@ fn build_service_chain(
     application_interceptors: Vec<SharedInterceptor>,
     network_interceptors: Vec<SharedInterceptor>,
     policy: PolicyConfig,
-    #[cfg(feature = "compression")] max_decompressed_body_bytes: usize,
+    #[cfg(feature = "compression-core")] max_decompressed_body_bytes: usize,
     strict_host_header: bool,
 ) -> BoxWireService {
     let mut network: BoxWireService = BoxCloneSyncService::new(transport);
@@ -1034,7 +1063,7 @@ fn build_service_chain(
     }
     network = BoxCloneSyncService::new(
         InterceptorLayer::new(Arc::new(BridgeInterceptor::new(
-            #[cfg(feature = "compression")]
+            #[cfg(feature = "compression-core")]
             max_decompressed_body_bytes,
             strict_host_header,
         )) as SharedInterceptor)
@@ -1169,12 +1198,15 @@ impl EffectiveRequestConfig {
 pub(crate) fn cache_request_addresses(
     request: &mut Request<RequestBody>,
     proxy_selector: &dyn ProxySelector,
+    ctx: &CallContext,
 ) -> Result<Arc<[ResolvedAddress]>, WireError> {
     let previous_selected_proxy = request.extensions().get::<SelectedProxy>().cloned();
-    let candidates = resolved_proxy_candidates_with_sticky(
-        proxy_selector.select(request.uri())?,
-        previous_selected_proxy.as_ref(),
-    );
+    ctx.listener().proxy_select_start(ctx, request.uri());
+    let selection = proxy_selector.select(request.uri())?;
+    ctx.listener()
+        .proxy_select_end(ctx, request.uri(), &selection.to_events());
+    let candidates =
+        resolved_proxy_candidates_with_sticky(selection, previous_selected_proxy.as_ref());
     clear_proxy_authorization_if_proxy_dropped_from_candidates(request, &candidates);
 
     let mut addresses = Vec::new();
@@ -1461,7 +1493,10 @@ mod tests {
     use futures_util::stream;
     use http::header::PROXY_AUTHORIZATION;
     use http::Request;
-    use openwire_core::{BoxFuture, RequestBody, TaskHandle, WireError};
+    use openwire_core::{
+        BoxFuture, CallContext, NoopEventListener, RequestBody, SharedEventListener, TaskHandle,
+        WireError,
+    };
 
     use super::{
         cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions,
@@ -1479,6 +1514,13 @@ mod tests {
         fn select(&self, _uri: &http::Uri) -> Result<ProxySelection, WireError> {
             Ok(self.0.clone())
         }
+    }
+
+    fn test_call_context() -> CallContext {
+        CallContext::new(
+            std::sync::Arc::new(NoopEventListener) as SharedEventListener,
+            None,
+        )
     }
     struct CountingTaskHandle {
         aborts: Arc<AtomicUsize>,
@@ -1607,7 +1649,8 @@ mod tests {
             .expect("request");
 
         let addresses =
-            cache_request_addresses(&mut request, &ProxyRules::new()).expect("addresses");
+            cache_request_addresses(&mut request, &ProxyRules::new(), &test_call_context())
+                .expect("addresses");
 
         assert_eq!(
             request
@@ -1639,6 +1682,7 @@ mod tests {
                     .push_proxy(fallback.clone())
                     .push_proxy(sticky.clone()),
             ),
+            &test_call_context(),
         )
         .expect("addresses");
 
@@ -1685,6 +1729,7 @@ mod tests {
         let addresses = cache_request_addresses(
             &mut request,
             &StaticProxySelector(ProxySelection::direct().push_proxy(current_proxy.clone())),
+            &test_call_context(),
         )
         .expect("addresses");
 
@@ -1715,9 +1760,12 @@ mod tests {
             .extensions_mut()
             .insert(SelectedProxy::from_proxy(&proxy));
 
-        let addresses =
-            cache_request_addresses(&mut request, &StaticProxySelector(ProxySelection::direct()))
-                .expect("addresses");
+        let addresses = cache_request_addresses(
+            &mut request,
+            &StaticProxySelector(ProxySelection::direct()),
+            &test_call_context(),
+        )
+        .expect("addresses");
 
         assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
         assert_eq!(

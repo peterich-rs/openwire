@@ -186,7 +186,7 @@ fn tung_to_engine(message: TungMessage) -> Option<EngineFrame> {
 fn map_error(error: tokio_tungstenite::tungstenite::Error) -> WebSocketEngineError {
     use tokio_tungstenite::tungstenite::Error as TE;
     match error {
-        TE::Io(io) => WebSocketEngineError::Io(WireError::with_source(
+        TE::Io(io) => WebSocketEngineError::io(WireError::with_source(
             openwire_core::WireErrorKind::Protocol,
             "tungstenite IO error",
             io,

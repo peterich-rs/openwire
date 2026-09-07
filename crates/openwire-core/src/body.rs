@@ -104,6 +104,22 @@ impl RequestBody {
     pub fn is_absent(&self) -> bool {
         self.presence == RequestBodyPresence::Absent
     }
+
+    /// Wraps an arbitrary body as a present, non-replayable request body.
+    ///
+    /// Used by transport observers that instrument an already-built `RequestBody`.
+    pub fn from_body<B>(body: B) -> Self
+    where
+        B: Body<Data = Bytes, Error = WireError> + Send + Sync + 'static,
+    {
+        Self {
+            inner: RequestBodyInner::Streaming {
+                inner: body.boxed(),
+            },
+            replayable_len: None,
+            presence: RequestBodyPresence::Present,
+        }
+    }
 }
 
 impl Default for RequestBody {

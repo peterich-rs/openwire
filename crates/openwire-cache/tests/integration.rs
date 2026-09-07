@@ -57,10 +57,19 @@ async fn fresh_get_responses_are_served_from_cache() {
     assert_eq!(
         events
             .events()
-            .into_iter()
+            .iter()
             .filter(|event| event.starts_with("connect_end "))
             .count(),
         1
+    );
+    let recorded = events.events();
+    assert!(
+        recorded.iter().any(|event| event == "cache_miss"),
+        "first fetch should miss: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|event| event == "cache_hit 200 OK"),
+        "second fetch should hit: {recorded:?}"
     );
 }
 

@@ -55,6 +55,10 @@ struct CallContextInner {
     connection_established: AtomicBool,
     /// When set, response-body Drop discards the connection (decode/body errors).
     body_force_discard: AtomicBool,
+    /// When set, the request has been fully written (or had no present body).
+    request_write_complete: AtomicBool,
+    /// When set, `request_failed` was already published for this attempt.
+    request_failed_emitted: AtomicBool,
     tls_alpn_preference: TlsAlpnPreference,
 }
 
@@ -89,6 +93,8 @@ impl CallContext {
                 deadline,
                 connection_established: AtomicBool::new(false),
                 body_force_discard: AtomicBool::new(false),
+                request_write_complete: AtomicBool::new(false),
+                request_failed_emitted: AtomicBool::new(false),
                 tls_alpn_preference,
             }),
         }
@@ -99,7 +105,18 @@ impl CallContext {
         request: &http::Request<crate::RequestBody>,
         deadline: Option<Duration>,
     ) -> Self {
-        let listener = factory.create(request);
+        Self::from_listener(factory.create(request), request, deadline)
+    }
+
+    /// Builds a context that reuses an already-created listener.
+    ///
+    /// Used when `EventListenerFactory::create` ran at `Call` construction so
+    /// cancel-before-execute and dispatcher events share the same listener.
+    pub fn from_listener(
+        listener: SharedEventListener,
+        request: &http::Request<crate::RequestBody>,
+        deadline: Option<Duration>,
+    ) -> Self {
         let tls_alpn_preference = request
             .extensions()
             .get::<TlsAlpnPreference>()
@@ -122,6 +139,39 @@ impl CallContext {
 
     pub fn body_force_discard(&self) -> bool {
         self.inner.body_force_discard.load(Ordering::Acquire)
+    }
+
+    /// Clears per-attempt request-exchange observation flags.
+    ///
+    /// `CallContext` is reused across retries and follow-ups, so transport must
+    /// reset these before each send.
+    pub fn reset_request_exchange_observation(&self) {
+        self.inner
+            .request_write_complete
+            .store(false, Ordering::Release);
+        self.inner
+            .request_failed_emitted
+            .store(false, Ordering::Release);
+    }
+
+    pub fn mark_request_write_complete(&self) {
+        self.inner
+            .request_write_complete
+            .store(true, Ordering::Release);
+    }
+
+    pub fn request_write_complete(&self) -> bool {
+        self.inner.request_write_complete.load(Ordering::Acquire)
+    }
+
+    pub fn mark_request_failed_emitted(&self) {
+        self.inner
+            .request_failed_emitted
+            .store(true, Ordering::Release);
+    }
+
+    pub fn request_failed_emitted(&self) -> bool {
+        self.inner.request_failed_emitted.load(Ordering::Acquire)
     }
 
     pub fn created_at(&self) -> Instant {
@@ -181,5 +231,24 @@ mod tests {
         let ctx = CallContext::from_factory(&factory, &request, None);
 
         assert_eq!(ctx.tls_alpn_preference(), TlsAlpnPreference::Http1Only);
+    }
+
+    #[test]
+    fn request_exchange_observation_flags_reset_independently() {
+        let factory = Arc::new(NoopEventListenerFactory) as SharedEventListenerFactory;
+        let request = http::Request::builder()
+            .uri("https://example.com/")
+            .body(RequestBody::empty())
+            .expect("request");
+        let ctx = CallContext::from_factory(&factory, &request, None);
+
+        ctx.mark_request_write_complete();
+        ctx.mark_request_failed_emitted();
+        assert!(ctx.request_write_complete());
+        assert!(ctx.request_failed_emitted());
+
+        ctx.reset_request_exchange_observation();
+        assert!(!ctx.request_write_complete());
+        assert!(!ctx.request_failed_emitted());
     }
 }

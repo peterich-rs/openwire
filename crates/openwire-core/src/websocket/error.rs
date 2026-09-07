@@ -20,7 +20,7 @@ pub enum WebSocketError {
     Timeout(TimeoutKind),
 
     #[error("transport io error: {0}")]
-    Io(#[source] WireError),
+    Io(#[source] Box<WireError>),
 
     #[error("local cancellation")]
     LocalCancelled,
@@ -65,12 +65,53 @@ pub enum WebSocketEngineError {
     UnsupportedExtension(String),
 
     #[error("io error: {0}")]
-    Io(#[source] WireError),
+    Io(#[source] Box<WireError>),
 }
 
 impl WebSocketError {
     /// Convenience constructor for the bridge / transport branch.
     pub fn handshake(reason: HandshakeFailure, status: Option<http::StatusCode>) -> Self {
         Self::Handshake { status, reason }
+    }
+
+    pub fn io(error: WireError) -> Self {
+        Self::Io(Box::new(error))
+    }
+}
+
+impl From<WireError> for WebSocketError {
+    fn from(error: WireError) -> Self {
+        Self::io(error)
+    }
+}
+
+impl WebSocketEngineError {
+    pub fn io(error: WireError) -> Self {
+        Self::Io(Box::new(error))
+    }
+}
+
+impl From<WireError> for WebSocketEngineError {
+    fn from(error: WireError) -> Self {
+        Self::io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WebSocketEngineError, WebSocketError};
+
+    #[test]
+    fn websocket_errors_fit_result_small_err() {
+        assert!(
+            std::mem::size_of::<WebSocketError>() < 128,
+            "WebSocketError is {} bytes",
+            std::mem::size_of::<WebSocketError>()
+        );
+        assert!(
+            std::mem::size_of::<WebSocketEngineError>() < 128,
+            "WebSocketEngineError is {} bytes",
+            std::mem::size_of::<WebSocketEngineError>()
+        );
     }
 }

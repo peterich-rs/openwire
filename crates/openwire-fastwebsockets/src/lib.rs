@@ -354,7 +354,7 @@ fn map_error_with_limit(
 }
 
 fn protocol_io_error(message: &'static str, error: std::io::Error) -> WebSocketEngineError {
-    WebSocketEngineError::Io(WireError::with_source(
+    WebSocketEngineError::io(WireError::with_source(
         WireErrorKind::Protocol,
         message,
         error,
@@ -362,7 +362,7 @@ fn protocol_io_error(message: &'static str, error: std::io::Error) -> WebSocketE
 }
 
 fn closed_sink_error(message: &'static str) -> WebSocketEngineError {
-    WebSocketEngineError::Io(WireError::new(WireErrorKind::Protocol, message))
+    WebSocketEngineError::io(WireError::new(WireErrorKind::Protocol, message))
 }
 
 #[cfg(test)]

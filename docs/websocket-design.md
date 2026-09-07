@@ -543,8 +543,11 @@ pub enum CloseInitiator { Local, Remote }
 
 All methods have empty default impls (additive change; existing impls compile
 unchanged). Existing HTTP events fire normally during the handshake itself -
-`dns_start/end`, `connect_start/end`, `tls_start/end`, `request_headers_*`,
-`response_headers_*` all fire as for any HTTP/1.1 GET. `response_body_end`
+`dns_start/end`, `connect_start/end`, `tls_start/end` / `tls_handshake`,
+`proxy_select_start/end`, `request_headers_*`,
+`response_headers_*` all fire as for any HTTP/1.1 GET. WebSocket handshake
+execution still constructs its `CallContext` at `execute()` time; HTTP `Call`
+objects create the listener at `new_call`. `response_body_end`
 does **not** fire on a successful upgrade (the response has no body to
 consume). Once `call_start` has fired, every WebSocket call terminates the
 shared call lifecycle exactly once: `call_end` fires when openwire observes a
@@ -611,7 +614,7 @@ pub enum WebSocketError {
     Timeout(TimeoutKind),
 
     #[error("transport io error: {0}")]
-    Io(#[source] WireError),
+    Io(#[source] Box<WireError>),
 
     #[error("local cancellation")]
     LocalCancelled,
@@ -635,11 +638,13 @@ pub enum WebSocketEngineError {
     InvalidCloseCode(u16),
     PayloadTooLarge { limit: usize, received: usize },
     UnsupportedExtension(String),
-    Io(WireError),
+    Io(Box<WireError>),
 }
 ```
 
-`WebSocketError` is a leaf type; it does not implement `From<WebSocketError>
+`Io` boxes `WireError` so `Result<_, WebSocketError>` stays under clippy's
+`result_large_err` limit. `From<WireError>` wraps into that boxed `Io` variant.
+`WebSocketError` is still a leaf type; it does not implement `From<WebSocketError>
 for WireError` because `WireError` is the HTTP-shape error and the conversion
 is lossy. Callers of `Client::new_websocket` get `WebSocketError` directly.
 Internal places that need to interoperate with `WireError` (e.g., emitting
