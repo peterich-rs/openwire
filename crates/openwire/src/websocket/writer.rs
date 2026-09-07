@@ -257,7 +257,7 @@ fn map_engine_error(error: WebSocketEngineError) -> WebSocketError {
 
 pub(crate) fn websocket_error_as_wire_error(error: &WebSocketError) -> WireError {
     match error {
-        WebSocketError::Io(error) => error.clone(),
+        WebSocketError::Io(error) => error.as_ref().clone(),
         WebSocketError::Timeout(_) => WireError::timeout(error.to_string()),
         WebSocketError::LocalCancelled => {
             WireError::new(WireErrorKind::Canceled, "websocket call cancelled")

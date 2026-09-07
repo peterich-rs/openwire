@@ -51,7 +51,7 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
     let max_message_size = max_message_size.unwrap_or(DEFAULT_MAX_MESSAGE_SIZE);
     let send_queue_size = send_queue_size.unwrap_or(DEFAULT_SEND_QUEUE_SIZE);
     let heartbeat = validate_runtime_config(send_queue_size, ping_interval, pong_timeout)
-        .map_err(WebSocketError::Io)?;
+        .map_err(WebSocketError::from)?;
     let engine: SharedWebSocketEngine = engine.unwrap_or_else(|| Arc::new(NativeEngine::new()));
 
     request
@@ -59,14 +59,14 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
         .insert(WebSocketRequestMarker::new(subprotocols.clone()));
     // WebSocket handshakes do not currently thread ClientBuilder host policy;
     // use the lenient default (caller-supplied Host is preserved).
-    crate::bridge::normalize_request(&mut request, false).map_err(WebSocketError::Io)?;
+    crate::bridge::normalize_request(&mut request, false).map_err(WebSocketError::from)?;
 
     let expected_accept = request
         .extensions()
         .get::<WebSocketRequestMarker>()
         .map(|marker| marker.expected_accept.clone())
         .ok_or_else(|| {
-            WebSocketError::Io(WireError::internal(
+            WebSocketError::io(WireError::internal(
                 "WebSocketRequestMarker missing after bridge normalization",
                 std::io::Error::other("missing marker"),
             ))
@@ -106,7 +106,7 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
 
     let io = match tokio::time::timeout(handshake_timeout, connect).await {
         Ok(Ok(io)) => io,
-        Ok(Err(error)) => return Err(fail_before_open(&ctx, WebSocketError::Io(error))),
+        Ok(Err(error)) => return Err(fail_before_open(&ctx, WebSocketError::from(error))),
         Err(_) => {
             return Err(fail_before_open(
                 &ctx,
@@ -229,7 +229,7 @@ async fn run_handshake(
 ) -> Result<(http::Response<()>, WebSocketChannel, ValidatedHandshake), WebSocketError> {
     let (response, upgraded) = crate::transport::protocol::bind_websocket_handshake(io, request)
         .await
-        .map_err(WebSocketError::Io)?;
+        .map_err(WebSocketError::from)?;
 
     let validated = validate_handshake_response(&response, &expected_accept, &offered_subprotocols)
         .map_err(|reason| WebSocketError::handshake(reason, Some(response.status())))?;

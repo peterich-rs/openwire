@@ -93,14 +93,14 @@ impl NativeSink {
             match Pin::new(&mut self.write).poll_write(cx, &self.buf[..]) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(WebSocketEngineError::Io(WireError::internal(
+                    return Poll::Ready(Err(WebSocketEngineError::io(WireError::internal(
                         "websocket peer closed write half",
                         std::io::Error::from(std::io::ErrorKind::WriteZero),
                     ))));
                 }
                 Poll::Ready(Ok(n)) => self.buf.advance(n),
                 Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(WebSocketEngineError::Io(WireError::with_source(
+                    return Poll::Ready(Err(WebSocketEngineError::io(WireError::with_source(
                         openwire_core::WireErrorKind::Protocol,
                         "websocket write failed",
                         error,
@@ -112,7 +112,7 @@ impl NativeSink {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(error)) => {
-                Poll::Ready(Err(WebSocketEngineError::Io(WireError::with_source(
+                Poll::Ready(Err(WebSocketEngineError::io(WireError::with_source(
                     openwire_core::WireErrorKind::Protocol,
                     "websocket flush failed",
                     error,
@@ -219,7 +219,7 @@ impl NativeStream {
                 }
             }
             Poll::Ready(Err(error)) => {
-                Poll::Ready(Err(WebSocketEngineError::Io(WireError::with_source(
+                Poll::Ready(Err(WebSocketEngineError::io(WireError::with_source(
                     openwire_core::WireErrorKind::Protocol,
                     "websocket read failed",
                     error,

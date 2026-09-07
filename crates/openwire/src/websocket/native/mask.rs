@@ -7,7 +7,7 @@ pub(crate) fn mask_in_place(payload: &mut [u8], key: [u8; 4]) {
 pub(crate) fn random_mask_key() -> Result<[u8; 4], openwire_core::websocket::WebSocketEngineError> {
     let mut key = [0u8; 4];
     getrandom::getrandom(&mut key).map_err(|error| {
-        openwire_core::websocket::WebSocketEngineError::Io(openwire_core::WireError::internal(
+        openwire_core::websocket::WebSocketEngineError::io(openwire_core::WireError::internal(
             "failed to generate WebSocket mask key",
             std::io::Error::other(error.to_string()),
         ))
