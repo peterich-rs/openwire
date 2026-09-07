@@ -9,7 +9,7 @@ on:
       version:
         description: Workspace version to publish
         required: true
-        default: "0.1.1"
+        default: "0.1.2"
       dry_run:
         description: Run package preflight instead of publishing
         required: true

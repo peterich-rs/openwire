@@ -2,7 +2,7 @@
 
 OpenWire publishes the user-facing crates through crates.io so downstream users
 can depend on standard registry versions instead of Git source paths. The next
-planned release is `0.1.1`.
+planned release is `0.1.2`.
 
 ## Published Crates
 
@@ -67,11 +67,11 @@ After the release PR is merged:
 1. Create and push a release tag that matches the workspace version:
 
    ```sh
-   git tag v0.1.1
-   git push origin v0.1.1
+   git tag v0.1.2
+   git push origin v0.1.2
    ```
 
-2. Pushing the `v0.1.1` tag automatically runs the `Publish Crates` GitHub
+2. Pushing the `v0.1.2` tag automatically runs the `Publish Crates` GitHub
    Actions workflow as a real publish.
 
 Create the release tag only after the release PR has merged. If the intended tag
@@ -96,7 +96,7 @@ the time reported by crates.io and rerun `Publish Crates` from `main` with:
 - `dry_run=false`
 - `start_at` set to the first crate that did not publish
 
-For example, if the first five `0.1.1` crates published and the rate limit
+For example, if the first five `0.1.2` crates published and the rate limit
 stopped at `openwire-fastwebsockets`, rerun with
 `start_at=openwire-fastwebsockets`. The workflow only allows non-tag publishing
 when `start_at` is set and the ref is `main`.
@@ -106,10 +106,10 @@ when `start_at` is set and the ref is `main`.
 After the workflow finishes, verify the registry and downstream install path:
 
 ```sh
-cargo info openwire@0.1.1
+cargo info openwire@0.1.2
 tmpdir="$(mktemp -d)"
 cd "$tmpdir"
 cargo init --bin
-cargo add openwire@0.1.1
+cargo add openwire@0.1.2
 cargo check
 ```

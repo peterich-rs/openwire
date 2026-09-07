@@ -72,11 +72,11 @@ keeps the client API and higher-level policy / planning surfaces.
 
 ## Installation
 
-The next planned crates.io release is `0.1.1`:
+The next planned crates.io release is `0.1.2`:
 
 ```toml
 [dependencies]
-openwire = "0.1.1"
+openwire = "0.1.2"
 ```
 
 Default features are `tls-rustls`, `platform-verifier`, `compression` (all
@@ -89,7 +89,7 @@ own default feature set through Cargo unification.
 
 ```toml
 [dependencies]
-openwire = { version = "0.1.1", default-features = false, features = ["tls-rustls", "gzip"] }
+openwire = { version = "0.1.2", default-features = false, features = ["tls-rustls", "gzip"] }
 ```
 
 Optional features:
@@ -105,7 +105,7 @@ Optional features:
 | `websocket` | no | RFC 6455 WebSocket client |
 
 Optional companion crates are published with the same workspace version, for
-example `openwire-cache = "0.1.1"` or `openwire-tungstenite = "0.1.1"`.
+example `openwire-cache = "0.1.2"` or `openwire-tungstenite = "0.1.2"`.
 Release and versioning steps are documented in `docs/release-process.md`.
 
 ## Quick Start
