@@ -37,122 +37,101 @@ pub(crate) enum WriterCommand {
     Cancel,
 }
 
-/// Drives the engine's outbound `Sink`. Control is preferred but the control
-/// lane is bounded so data still drains. `shutdown` is a Drop-cancel path that
-/// cannot be lost on a full control lane.
-async fn run_writer(
-    mut sink: BoxEngineSink,
-    mut control: mpsc::Receiver<WriterCommand>,
-    mut data: mpsc::Receiver<Message>,
+struct WriterIo {
+    sink: BoxEngineSink,
+    control: mpsc::Receiver<WriterCommand>,
+    data: mpsc::Receiver<Message>,
+    data_open: bool,
+}
+
+struct WriterContext {
     close_timeout: Duration,
     receiver_tx: mpsc::Sender<Result<Message, WebSocketError>>,
     ctx: Option<CallContext>,
     listener: Option<SharedEventListener>,
     session: SessionState,
-    shutdown: Arc<Notify>,
-) {
-    let mut data_open = true;
+}
+
+/// Drives the engine's outbound `Sink`. Control is preferred but the control
+/// lane is bounded so data still drains. `shutdown` is a Drop-cancel path that
+/// cannot be lost on a full control lane.
+async fn run_writer(mut io: WriterIo, ctx: WriterContext, shutdown: Arc<Notify>) {
     loop {
         tokio::select! {
             biased;
             _ = shutdown.notified() => {
-                if drain_data_lane(&mut sink, &mut data, &session, ctx.as_ref(), listener.as_ref(), &receiver_tx).await {
+                if drain_data_lane(&mut io, &ctx).await {
                     return;
                 }
-                let _ = sink.flush().await;
+                let _ = io.sink.flush().await;
                 let error = WebSocketError::LocalCancelled;
-                emit_terminal_failure(ctx.as_ref(), listener.as_ref(), &error, &session);
+                emit_terminal_failure(
+                    ctx.ctx.as_ref(),
+                    ctx.listener.as_ref(),
+                    &error,
+                    &ctx.session,
+                );
                 return;
             }
-            cmd = control.recv() => {
+            cmd = io.control.recv() => {
                 let Some(cmd) = cmd else {
-                    if drain_data_lane(&mut sink, &mut data, &session, ctx.as_ref(), listener.as_ref(), &receiver_tx).await {
-                        return;
-                    }
+                    let _ = drain_data_lane(&mut io, &ctx).await;
                     return;
                 };
-                if handle_control_command(
-                    cmd,
-                    &mut sink,
-                    &mut control,
-                    &mut data,
-                    &mut data_open,
-                    close_timeout,
-                    &receiver_tx,
-                    ctx.as_ref(),
-                    listener.as_ref(),
-                    &session,
-                ).await {
+                if handle_control_command(cmd, &mut io, &ctx).await {
                     return;
                 }
             }
-            message = data.recv(), if data_open => {
+            message = io.data.recv(), if io.data_open => {
                 match message {
                     Some(message) => {
-                        if send_data_frame(&mut sink, message, &session, ctx.as_ref(), listener.as_ref(), &receiver_tx).await {
+                        if send_data_frame(&mut io, message, &ctx).await {
                             return;
                         }
                     }
-                    None => data_open = false,
+                    None => io.data_open = false,
                 }
             }
         }
     }
 }
 
-async fn send_data_frame(
-    sink: &mut BoxEngineSink,
-    message: Message,
-    session: &SessionState,
-    ctx: Option<&CallContext>,
-    listener: Option<&SharedEventListener>,
-    receiver_tx: &mpsc::Sender<Result<Message, WebSocketError>>,
-) -> bool {
-    if session.remote_close_started() {
+async fn send_data_frame(io: &mut WriterIo, message: Message, ctx: &WriterContext) -> bool {
+    if ctx.session.remote_close_started() {
         return false;
     }
-    if let Err(error) = sink.send(message.into()).await {
+    if let Err(error) = io.sink.send(message.into()).await {
         let mapped = map_engine_error(error);
-        emit_terminal_failure(ctx, listener, &mapped, session);
-        let _ = receiver_tx.send(Err(mapped)).await;
+        emit_terminal_failure(
+            ctx.ctx.as_ref(),
+            ctx.listener.as_ref(),
+            &mapped,
+            &ctx.session,
+        );
+        let _ = ctx.receiver_tx.send(Err(mapped)).await;
         return true;
     }
     false
 }
 
-async fn drain_data_lane(
-    sink: &mut BoxEngineSink,
-    data: &mut mpsc::Receiver<Message>,
-    session: &SessionState,
-    ctx: Option<&CallContext>,
-    listener: Option<&SharedEventListener>,
-    receiver_tx: &mpsc::Sender<Result<Message, WebSocketError>>,
-) -> bool {
-    while let Ok(message) = data.try_recv() {
-        if send_data_frame(sink, message, session, ctx, listener, receiver_tx).await {
+async fn drain_data_lane(io: &mut WriterIo, ctx: &WriterContext) -> bool {
+    while let Ok(message) = io.data.try_recv() {
+        if send_data_frame(io, message, ctx).await {
             return true;
         }
     }
     false
 }
 
-async fn maybe_send_one_data(
-    sink: &mut BoxEngineSink,
-    data: &mut mpsc::Receiver<Message>,
-    data_open: &mut bool,
-    session: &SessionState,
-    ctx: Option<&CallContext>,
-    listener: Option<&SharedEventListener>,
-    receiver_tx: &mpsc::Sender<Result<Message, WebSocketError>>,
-) -> bool {
-    if !*data_open {
+async fn maybe_send_one_data(io: &mut WriterIo, ctx: &WriterContext) -> bool {
+    if !io.data_open {
         return false;
     }
-    match data.try_recv() {
-        Ok(message) => send_data_frame(sink, message, session, ctx, listener, receiver_tx).await,
+    match io.data.try_recv() {
+        Ok(message) => send_data_frame(io, message, ctx).await,
         Err(mpsc::error::TryRecvError::Empty) => false,
         Err(mpsc::error::TryRecvError::Disconnected) => {
-            *data_open = false;
+            io.data_open = false;
             false
         }
     }
@@ -161,117 +140,132 @@ async fn maybe_send_one_data(
 /// Returns true when the writer should stop.
 async fn handle_control_command(
     cmd: WriterCommand,
-    sink: &mut BoxEngineSink,
-    control: &mut mpsc::Receiver<WriterCommand>,
-    data: &mut mpsc::Receiver<Message>,
-    data_open: &mut bool,
-    close_timeout: Duration,
-    receiver_tx: &mpsc::Sender<Result<Message, WebSocketError>>,
-    ctx: Option<&CallContext>,
-    listener: Option<&SharedEventListener>,
-    session: &SessionState,
+    io: &mut WriterIo,
+    ctx: &WriterContext,
 ) -> bool {
     match cmd {
         WriterCommand::Ping(payload) => {
-            if session.remote_close_started() {
+            if ctx.session.remote_close_started() {
                 return false;
             }
-            if let Err(error) = sink.send(EngineFrame::Ping(payload)).await {
+            if let Err(error) = io.sink.send(EngineFrame::Ping(payload)).await {
                 let mapped = map_engine_error(error);
-                emit_terminal_failure(ctx, listener, &mapped, session);
-                let _ = receiver_tx.send(Err(mapped)).await;
+                emit_terminal_failure(
+                    ctx.ctx.as_ref(),
+                    ctx.listener.as_ref(),
+                    &mapped,
+                    &ctx.session,
+                );
+                let _ = ctx.receiver_tx.send(Err(mapped)).await;
                 return true;
             }
-            maybe_send_one_data(sink, data, data_open, session, ctx, listener, receiver_tx).await
+            maybe_send_one_data(io, ctx).await
         }
         WriterCommand::Pong(payload) => {
-            if session.remote_close_started() {
+            if ctx.session.remote_close_started() {
                 return false;
             }
-            if let Err(error) = sink.send(EngineFrame::Pong(payload)).await {
+            if let Err(error) = io.sink.send(EngineFrame::Pong(payload)).await {
                 let mapped = map_engine_error(error);
-                emit_terminal_failure(ctx, listener, &mapped, session);
-                let _ = receiver_tx.send(Err(mapped)).await;
+                emit_terminal_failure(
+                    ctx.ctx.as_ref(),
+                    ctx.listener.as_ref(),
+                    &mapped,
+                    &ctx.session,
+                );
+                let _ = ctx.receiver_tx.send(Err(mapped)).await;
                 return true;
             }
-            maybe_send_one_data(sink, data, data_open, session, ctx, listener, receiver_tx).await
+            maybe_send_one_data(io, ctx).await
         }
         WriterCommand::Close { code, reason, ack } => {
-            if session.remote_close_started() {
+            if ctx.session.remote_close_started() {
                 let _ = ack.send(());
                 return false;
             }
-            session.mark_local_close_started();
-            if let (Some(ctx), Some(listener)) = (ctx, listener) {
-                listener.websocket_closing(ctx, code, &reason, CloseInitiator::Local);
+            ctx.session.mark_local_close_started();
+            if let (Some(call_ctx), Some(listener)) = (ctx.ctx.as_ref(), ctx.listener.as_ref()) {
+                listener.websocket_closing(call_ctx, code, &reason, CloseInitiator::Local);
             }
-            if drain_data_lane(sink, data, session, ctx, listener, receiver_tx).await {
+            if drain_data_lane(io, ctx).await {
                 let _ = ack.send(());
                 return true;
             }
             let final_code = code;
             let final_reason = reason.clone();
-            let _ = sink.send(EngineFrame::Close { code, reason }).await;
-            let _ = sink.flush().await;
-            let mut data_open = *data_open;
-            let _ = tokio::time::timeout(close_timeout, async {
+            let _ = io.sink.send(EngineFrame::Close { code, reason }).await;
+            let _ = io.sink.flush().await;
+            let _ = tokio::time::timeout(ctx.close_timeout, async {
                 loop {
                     tokio::select! {
                         biased;
-                        other = control.recv() => {
+                        other = io.control.recv() => {
                             if matches!(other, Some(WriterCommand::Cancel) | None) {
                                 break;
                             }
                         }
-                        message = data.recv(), if data_open => {
+                        message = io.data.recv(), if io.data_open => {
                             if message.is_none() {
-                                data_open = false;
+                                io.data_open = false;
                             }
                         }
                     }
                 }
             })
             .await;
-            if session.try_mark_closed() {
-                if let (Some(ctx), Some(listener)) = (ctx, listener) {
-                    listener.websocket_closed(ctx, final_code, &final_reason);
+            if ctx.session.try_mark_closed() {
+                if let (Some(call_ctx), Some(listener)) = (ctx.ctx.as_ref(), ctx.listener.as_ref())
+                {
+                    listener.websocket_closed(call_ctx, final_code, &final_reason);
                 }
-                emit_call_end(ctx, session);
+                emit_call_end(ctx.ctx.as_ref(), &ctx.session);
             }
             let _ = ack.send(());
             true
         }
         WriterCommand::CloseAck { code, reason } => {
-            let _ = sink.send(EngineFrame::Close { code, reason }).await;
-            let _ = sink.flush().await;
+            let _ = io.sink.send(EngineFrame::Close { code, reason }).await;
+            let _ = io.sink.flush().await;
             true
         }
         WriterCommand::PingTimeout => {
-            if session.remote_close_started() {
+            if ctx.session.remote_close_started() {
                 return false;
             }
-            session.mark_local_close_started();
+            ctx.session.mark_local_close_started();
             let error = WebSocketError::Timeout(TimeoutKind::Ping);
-            emit_terminal_failure(ctx, listener, &error, session);
-            let _ = receiver_tx
+            emit_terminal_failure(
+                ctx.ctx.as_ref(),
+                ctx.listener.as_ref(),
+                &error,
+                &ctx.session,
+            );
+            let _ = ctx
+                .receiver_tx
                 .send(Err(WebSocketError::Timeout(TimeoutKind::Ping)))
                 .await;
-            let _ = sink
+            let _ = io
+                .sink
                 .send(EngineFrame::Close {
                     code: 1011,
                     reason: "ping timeout".into(),
                 })
                 .await;
-            let _ = sink.flush().await;
+            let _ = io.sink.flush().await;
             true
         }
         WriterCommand::Cancel => {
-            if drain_data_lane(sink, data, session, ctx, listener, receiver_tx).await {
+            if drain_data_lane(io, ctx).await {
                 return true;
             }
-            let _ = sink.flush().await;
+            let _ = io.sink.flush().await;
             let error = WebSocketError::LocalCancelled;
-            emit_terminal_failure(ctx, listener, &error, session);
+            emit_terminal_failure(
+                ctx.ctx.as_ref(),
+                ctx.listener.as_ref(),
+                &error,
+                &ctx.session,
+            );
             true
         }
     }
@@ -483,14 +477,19 @@ pub(crate) fn spawn_session(channel: WebSocketChannel, config: SessionConfig) ->
         async move {
             let _enter = span.enter();
             run_writer(
-                send,
-                control_rx,
-                data_rx,
-                close_timeout,
-                recv_tx,
-                ctx,
-                listener,
-                session,
+                WriterIo {
+                    sink: send,
+                    control: control_rx,
+                    data: data_rx,
+                    data_open: true,
+                },
+                WriterContext {
+                    close_timeout,
+                    receiver_tx: recv_tx,
+                    ctx,
+                    listener,
+                    session,
+                },
                 shutdown,
             )
             .await;
@@ -706,14 +705,19 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(8);
         let (data_tx, data_rx) = mpsc::channel(8);
         let writer = tokio::spawn(run_writer(
-            sink,
-            control_rx,
-            data_rx,
-            close_timeout,
-            recv_tx,
-            None,
-            None,
-            session,
+            WriterIo {
+                sink,
+                control: control_rx,
+                data: data_rx,
+                data_open: true,
+            },
+            WriterContext {
+                close_timeout,
+                receiver_tx: recv_tx,
+                ctx: None,
+                listener: None,
+                session,
+            },
             Arc::new(Notify::new()),
         ));
         (control_tx, data_tx, writer)
@@ -945,14 +949,19 @@ mod tests {
 
         let (recv_tx, _recv_rx) = mpsc::channel::<Result<Message, WebSocketError>>(4);
         let writer = tokio::spawn(run_writer(
-            sink,
-            control_rx,
-            data_rx,
-            Duration::from_millis(50),
-            recv_tx,
-            None,
-            None,
-            SessionState::default(),
+            WriterIo {
+                sink,
+                control: control_rx,
+                data: data_rx,
+                data_open: true,
+            },
+            WriterContext {
+                close_timeout: Duration::from_millis(50),
+                receiver_tx: recv_tx,
+                ctx: None,
+                listener: None,
+                session: SessionState::default(),
+            },
             Arc::new(Notify::new()),
         ));
 

@@ -59,10 +59,12 @@ struct AddressSemaphoreSet {
     inner: Arc<AddressSemaphoreSetInner>,
 }
 
+type AddressSemaphoreShards = Arc<[Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>>]>;
+
 #[derive(Debug)]
 struct AddressSemaphoreSetInner {
     limit: usize,
-    shards: Arc<[Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>>]>,
+    shards: AddressSemaphoreShards,
 }
 
 #[derive(Debug)]
@@ -239,7 +241,7 @@ impl AddressSemaphoreSet {
             Self {
                 inner: Arc::new(AddressSemaphoreSetInner {
                     limit,
-                    shards: Arc::<[Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>>]>::from(shards),
+                    shards: AddressSemaphoreShards::from(shards),
                 }),
             }
         })
