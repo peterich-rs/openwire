@@ -28,7 +28,8 @@ use crate::auth::SharedAuthenticator;
 use crate::bridge::BridgeInterceptor;
 use crate::connection::{
     Address, CachedAddresses, ConnectionPool, DefaultRoutePlanner, ExchangeFinder, PoolSettings,
-    RequestAdmissionLimiter, RequestAdmissionPermit, ResolvedAddress, RoutePlanner,
+    RequestAdmissionLimiter, RequestAdmissionPermit, RequestPriority, ResolvedAddress,
+    RoutePlanner,
 };
 use crate::policy::{
     AuthPolicyConfig, FollowUpPolicyService, PolicyConfig, RedirectPolicyConfig, RetryPolicyConfig,
@@ -86,10 +87,14 @@ pub struct QueuedCall {
     _task: BoxTaskHandle,
 }
 
-/// Default global connection cap.
+/// Default client-wide connection cap (sockets / FDs for this `Client`).
 pub const DEFAULT_MAX_CONNECTIONS_TOTAL: usize = 256;
-/// Default per-address connection cap.
-pub const DEFAULT_MAX_CONNECTIONS_PER_HOST: usize = 8;
+/// Default per-address connection cap. Unlimited: origin protection is opt-in.
+pub const DEFAULT_MAX_CONNECTIONS_PER_HOST: usize = usize::MAX;
+/// Default client-wide in-flight request cap.
+pub const DEFAULT_MAX_REQUESTS_TOTAL: usize = 64;
+/// Default per-address in-flight request cap. Unlimited: origin protection is opt-in.
+pub const DEFAULT_MAX_REQUESTS_PER_HOST: usize = usize::MAX;
 /// Default maximum connection lifetime in the pool (absolute age).
 pub const DEFAULT_POOL_MAX_LIFETIME: Duration = Duration::from_secs(600);
 /// Default local concurrent-stream budget for HTTP/2 connections.
@@ -104,14 +109,30 @@ pub(crate) struct TransportConfig {
     pub(crate) pool_max_lifetime: Option<Duration>,
     pub(crate) http2_keep_alive_interval: Option<Duration>,
     pub(crate) http2_keep_alive_while_idle: bool,
+    pub(crate) http2_keep_alive_timeout: Option<Duration>,
+    pub(crate) http2_initial_stream_window_size: Option<u32>,
+    pub(crate) http2_initial_connection_window_size: Option<u32>,
+    pub(crate) http2_adaptive_window: Option<bool>,
+    pub(crate) http2_max_frame_size: Option<u32>,
+    pub(crate) http2_max_header_list_size: Option<u32>,
+    pub(crate) http2_max_send_buf_size: Option<usize>,
+    pub(crate) http2_header_table_size: Option<u32>,
+    pub(crate) http2_max_concurrent_reset_streams: Option<usize>,
+    pub(crate) http1_writev: Option<bool>,
+    pub(crate) http1_title_case_headers: bool,
     pub(crate) max_http2_streams: usize,
     pub(crate) max_connections_total: usize,
     pub(crate) max_connections_per_host: usize,
     pub(crate) max_requests_total: usize,
     pub(crate) max_requests_per_host: usize,
+    pub(crate) max_queued_requests: usize,
     #[cfg(feature = "compression-core")]
     pub(crate) max_decompressed_body_bytes: usize,
     pub(crate) strict_host_header: bool,
+    pub(crate) tcp_nodelay: bool,
+    pub(crate) tcp_linger: Option<Option<Duration>>,
+    pub(crate) tcp_recv_buffer_size: Option<u32>,
+    pub(crate) tcp_send_buffer_size: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +145,7 @@ pub struct CallOptions {
     max_retries: Option<usize>,
     retry_canceled_requests: Option<bool>,
     allow_insecure_redirects: Option<bool>,
+    priority: Option<RequestPriority>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +158,7 @@ pub(crate) struct EffectiveRequestConfig {
     pub(crate) max_retries: usize,
     pub(crate) retry_canceled_requests: bool,
     pub(crate) allow_insecure_redirects: bool,
+    pub(crate) priority: RequestPriority,
 }
 
 pub struct ClientBuilder {
@@ -148,7 +171,7 @@ pub struct ClientBuilder {
     transport: TransportConfig,
     policy: PolicyConfig,
     dns_resolver: Arc<dyn DnsResolver>,
-    tcp_connector: Arc<dyn TcpConnector>,
+    tcp_connector: Option<Arc<dyn TcpConnector>>,
     tls_connector: Option<Arc<dyn TlsConnector>>,
     route_planner: Arc<dyn RoutePlanner>,
     proxy_selector: SharedProxySelector,
@@ -248,7 +271,7 @@ impl ClientBuilder {
     where
         C: TcpConnector,
     {
-        self.tcp_connector = Arc::new(connector);
+        self.tcp_connector = Some(Arc::new(connector));
         self
     }
 
@@ -384,6 +407,84 @@ impl ClientBuilder {
         self
     }
 
+    pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> Self {
+        self.transport.http2_keep_alive_timeout = Some(timeout);
+        self
+    }
+
+    pub fn http2_initial_stream_window_size(mut self, size: u32) -> Self {
+        self.transport.http2_initial_stream_window_size = Some(size);
+        self
+    }
+
+    pub fn http2_initial_connection_window_size(mut self, size: u32) -> Self {
+        self.transport.http2_initial_connection_window_size = Some(size);
+        self
+    }
+
+    pub fn http2_adaptive_window(mut self, enabled: bool) -> Self {
+        self.transport.http2_adaptive_window = Some(enabled);
+        self
+    }
+
+    pub fn http2_max_frame_size(mut self, size: u32) -> Self {
+        self.transport.http2_max_frame_size = Some(size);
+        self
+    }
+
+    pub fn http2_max_header_list_size(mut self, size: u32) -> Self {
+        self.transport.http2_max_header_list_size = Some(size);
+        self
+    }
+
+    pub fn http2_max_send_buf_size(mut self, size: usize) -> Self {
+        self.transport.http2_max_send_buf_size = Some(size);
+        self
+    }
+
+    pub fn http2_header_table_size(mut self, size: u32) -> Self {
+        self.transport.http2_header_table_size = Some(size);
+        self
+    }
+
+    pub fn http2_max_concurrent_reset_streams(mut self, max: usize) -> Self {
+        self.transport.http2_max_concurrent_reset_streams = Some(max);
+        self
+    }
+
+    /// `None` leaves hyper's auto writev heuristic. `Some(true)` forces vectored
+    /// writes; `Some(false)` flattens them.
+    pub fn http1_writev(mut self, enabled: Option<bool>) -> Self {
+        self.transport.http1_writev = enabled;
+        self
+    }
+
+    pub fn http1_title_case_headers(mut self, enabled: bool) -> Self {
+        self.transport.http1_title_case_headers = enabled;
+        self
+    }
+
+    pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.transport.tcp_nodelay = enabled;
+        self
+    }
+
+    /// `None` restores the OS default linger. `Some(duration)` sets `SO_LINGER`.
+    pub fn tcp_linger(mut self, linger: Option<Duration>) -> Self {
+        self.transport.tcp_linger = Some(linger);
+        self
+    }
+
+    pub fn tcp_recv_buffer_size(mut self, size: u32) -> Self {
+        self.transport.tcp_recv_buffer_size = Some(size);
+        self
+    }
+
+    pub fn tcp_send_buffer_size(mut self, size: u32) -> Self {
+        self.transport.tcp_send_buffer_size = Some(size);
+        self
+    }
+
     /// Caps how many concurrent streams OpenWire will open on a single HTTP/2
     /// connection before opening another connection.
     pub fn max_http2_streams(mut self, max_streams: usize) -> Self {
@@ -391,23 +492,44 @@ impl ClientBuilder {
         self
     }
 
+    /// Caps sockets for this `Client` (the process resource this client owns).
     pub fn max_connections_total(mut self, max_connections: usize) -> Self {
         self.transport.max_connections_total = max_connections;
         self
     }
 
+    /// Optional origin protection. Default is unlimited; client resource
+    /// accounting uses [`Self::max_connections_total`].
+    ///
+    /// This does not relax HTTP/1's one-exchange-per-connection rule or the
+    /// HTTP/2 local stream budget. Those stay on the connection, not this cap.
     pub fn max_connections_per_host(mut self, max_connections: usize) -> Self {
         self.transport.max_connections_per_host = max_connections;
         self
     }
 
+    /// Caps in-flight requests for this `Client`. Priority ranks waiters
+    /// against this shared budget across all addresses.
     pub fn max_requests_total(mut self, max_requests: usize) -> Self {
         self.transport.max_requests_total = max_requests;
         self
     }
 
+    /// Optional origin protection. Default is unlimited; client resource
+    /// accounting uses [`Self::max_requests_total`].
+    ///
+    /// This does not pipeline HTTP/1 or ignore HTTP/2 stream limits. Same-host
+    /// parallelism still uses extra HTTP/1 connections or HTTP/2 streams.
     pub fn max_requests_per_host(mut self, max_requests: usize) -> Self {
         self.transport.max_requests_per_host = max_requests;
+        self
+    }
+
+    /// Caps how many calls may wait for a request-admission slot. Default is
+    /// `usize::MAX` (unbounded). A finite cap fails acquire with
+    /// [`WireErrorKind::Capacity`] before taking a running slot.
+    pub fn max_queued_requests(mut self, max_queued: usize) -> Self {
+        self.transport.max_queued_requests = max_queued;
         self
     }
 
@@ -497,15 +619,27 @@ impl ClientBuilder {
         } else {
             None
         };
+        let tcp_connector = match self.tcp_connector {
+            Some(tcp_connector) => tcp_connector,
+            None => Arc::new(TokioTcpConnector::from_config(
+                openwire_tokio::TcpSocketConfig {
+                    nodelay: self.transport.tcp_nodelay,
+                    linger: self.transport.tcp_linger,
+                    recv_buffer_size: self.transport.tcp_recv_buffer_size,
+                    send_buffer_size: self.transport.tcp_send_buffer_size,
+                },
+            )) as Arc<dyn TcpConnector>,
+        };
         let proxy_selector = self.proxy_selector;
         let request_admission = RequestAdmissionLimiter::new(
             self.transport.max_requests_total,
             self.transport.max_requests_per_host,
+            self.transport.max_queued_requests,
         );
         let exchange_finder = Arc::new(ExchangeFinder::new(pool, proxy_selector.clone()));
         let connector = ConnectorStack {
             dns_resolver: self.dns_resolver,
-            tcp_connector: self.tcp_connector,
+            tcp_connector,
             tls_connector,
             connect_timeout: self.transport.connect_timeout,
             executor: self.executor.clone(),
@@ -568,15 +702,31 @@ impl Default for ClientBuilder {
                 pool_max_lifetime: Some(DEFAULT_POOL_MAX_LIFETIME),
                 http2_keep_alive_interval: None,
                 http2_keep_alive_while_idle: false,
+                http2_keep_alive_timeout: None,
+                http2_initial_stream_window_size: None,
+                http2_initial_connection_window_size: None,
+                http2_adaptive_window: None,
+                http2_max_frame_size: None,
+                http2_max_header_list_size: None,
+                http2_max_send_buf_size: None,
+                http2_header_table_size: None,
+                http2_max_concurrent_reset_streams: None,
+                http1_writev: None,
+                http1_title_case_headers: false,
                 max_http2_streams: DEFAULT_HTTP2_MAX_LOCAL_STREAMS,
                 max_connections_total: DEFAULT_MAX_CONNECTIONS_TOTAL,
                 max_connections_per_host: DEFAULT_MAX_CONNECTIONS_PER_HOST,
-                max_requests_total: 64,
-                max_requests_per_host: 5,
+                max_requests_total: DEFAULT_MAX_REQUESTS_TOTAL,
+                max_requests_per_host: DEFAULT_MAX_REQUESTS_PER_HOST,
+                max_queued_requests: usize::MAX,
                 #[cfg(feature = "compression-core")]
                 max_decompressed_body_bytes:
                     crate::compression::DEFAULT_MAX_DECOMPRESSED_BODY_BYTES,
                 strict_host_header: false,
+                tcp_nodelay: true,
+                tcp_linger: None,
+                tcp_recv_buffer_size: None,
+                tcp_send_buffer_size: None,
             },
             policy: PolicyConfig {
                 cookie_jar: None,
@@ -589,7 +739,7 @@ impl Default for ClientBuilder {
                 redirect: RedirectPolicyConfig::default(),
             },
             dns_resolver: Arc::new(CachingDnsResolver::system()),
-            tcp_connector: Arc::new(TokioTcpConnector),
+            tcp_connector: None,
             tls_connector: None,
             route_planner: Arc::new(DefaultRoutePlanner::default()),
             proxy_selector: Arc::new(ProxyRules::new()),
@@ -874,17 +1024,27 @@ impl Call {
         self
     }
 
+    pub fn priority(mut self, priority: RequestPriority) -> Self {
+        self.options.priority = Some(priority);
+        self
+    }
+
+    /// Sets RFC 9218 urgency (`0` highest … `7` lowest). Values above `7` clamp.
+    pub fn urgency(self, urgency: u8) -> Self {
+        self.priority(RequestPriority::from_urgency(urgency))
+    }
+
     /// Queues this call on the client's configured executor and returns a handle
     /// that can be awaited for the response.
     pub fn enqueue(mut self) -> Result<QueuedCall, WireError> {
         self.mark_executed()?;
+        self.request.extensions_mut().insert(DispatcherQueued);
         let ctx = self.build_context();
         ctx.listener().dispatcher_queue_start(&ctx);
         let handle = self.handle();
         let executor = self.client.inner.executor.clone();
         let (sender, receiver) = oneshot::channel();
         let task = executor.spawn(Box::pin(async move {
-            ctx.listener().dispatcher_queue_end(&ctx);
             let result = self.execute_prepared(ctx).await;
             let _ = sender.send(result);
         }))?;
@@ -1125,6 +1285,16 @@ impl CallOptions {
         self
     }
 
+    pub fn priority(mut self, priority: RequestPriority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Sets RFC 9218 urgency (`0` highest … `7` lowest). Values above `7` clamp.
+    pub fn urgency(self, urgency: u8) -> Self {
+        self.priority(RequestPriority::from_urgency(urgency))
+    }
+
     pub(crate) fn has_retry_overrides(self) -> bool {
         self.retry_on_connection_failure.is_some()
             || self.max_retries.is_some()
@@ -1152,6 +1322,7 @@ impl CallOptions {
         self.allow_insecure_redirects = other
             .allow_insecure_redirects
             .or(self.allow_insecure_redirects);
+        self.priority = other.priority.or(self.priority);
     }
 }
 
@@ -1172,6 +1343,7 @@ impl EffectiveRequestConfig {
             max_retries: retry.max_retries(),
             retry_canceled_requests: retry.retry_canceled_requests(),
             allow_insecure_redirects: redirect.allow_insecure_redirects(),
+            priority: RequestPriority::Normal,
         }
     }
 
@@ -1191,9 +1363,16 @@ impl EffectiveRequestConfig {
             allow_insecure_redirects: options
                 .allow_insecure_redirects
                 .unwrap_or(self.allow_insecure_redirects),
+            priority: options.priority.unwrap_or(self.priority),
         }
     }
 }
+
+/// Marker inserted by `Call::enqueue`. Transport emits `dispatcher_queue_end`
+/// after request admission succeeds and then removes the marker. Direct
+/// `execute()` never inserts it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DispatcherQueued;
 
 pub(crate) fn cache_request_addresses(
     request: &mut Request<RequestBody>,
@@ -1502,9 +1681,10 @@ mod tests {
         cache_request_addresses, pool_reaper_cadence, spawn_pool_reaper, CallOptions,
         ClientBuilder, ConnectionPool, EffectiveRequestConfig, PoolReaperController, PoolSettings,
         DEFAULT_HTTP2_MAX_LOCAL_STREAMS, DEFAULT_MAX_CONNECTIONS_PER_HOST,
-        DEFAULT_MAX_CONNECTIONS_TOTAL, DEFAULT_POOL_MAX_LIFETIME,
+        DEFAULT_MAX_CONNECTIONS_TOTAL, DEFAULT_MAX_REQUESTS_PER_HOST, DEFAULT_MAX_REQUESTS_TOTAL,
+        DEFAULT_POOL_MAX_LIFETIME,
     };
-    use crate::connection::CachedAddresses;
+    use crate::connection::{CachedAddresses, RequestPriority};
     use crate::proxy::{Proxy, ProxyRules, ProxySelection, ProxySelector, SelectedProxy};
 
     #[derive(Clone)]
@@ -1802,8 +1982,73 @@ mod tests {
             builder.transport.max_http2_streams,
             DEFAULT_HTTP2_MAX_LOCAL_STREAMS
         );
-        assert_eq!(builder.transport.max_requests_total, 64);
-        assert_eq!(builder.transport.max_requests_per_host, 5);
+        assert_eq!(
+            builder.transport.max_requests_total,
+            DEFAULT_MAX_REQUESTS_TOTAL
+        );
+        assert_eq!(
+            builder.transport.max_requests_per_host,
+            DEFAULT_MAX_REQUESTS_PER_HOST
+        );
+        assert_eq!(builder.transport.max_queued_requests, usize::MAX);
+        assert!(builder.transport.tcp_nodelay);
+        assert_eq!(builder.transport.tcp_linger, None);
+        assert_eq!(builder.transport.http2_keep_alive_timeout, None);
+        assert_eq!(builder.transport.http1_writev, None);
+        assert!(!builder.transport.http1_title_case_headers);
+    }
+
+    #[test]
+    fn client_builder_stores_http2_and_tcp_knobs() {
+        let builder = ClientBuilder::default()
+            .http2_keep_alive_timeout(Duration::from_secs(3))
+            .http2_initial_stream_window_size(32_768)
+            .http2_initial_connection_window_size(65_535)
+            .http2_adaptive_window(true)
+            .http2_max_frame_size(16_384)
+            .http2_max_header_list_size(16_384)
+            .http2_max_send_buf_size(256 * 1024)
+            .http2_header_table_size(4096)
+            .http2_max_concurrent_reset_streams(20)
+            .http1_writev(Some(false))
+            .http1_title_case_headers(true)
+            .tcp_nodelay(false)
+            .tcp_linger(Some(Duration::from_secs(1)))
+            .tcp_recv_buffer_size(32_768)
+            .tcp_send_buffer_size(16_384)
+            .max_queued_requests(8);
+
+        assert_eq!(
+            builder.transport.http2_keep_alive_timeout,
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            builder.transport.http2_initial_stream_window_size,
+            Some(32_768)
+        );
+        assert_eq!(
+            builder.transport.http2_initial_connection_window_size,
+            Some(65_535)
+        );
+        assert_eq!(builder.transport.http2_adaptive_window, Some(true));
+        assert_eq!(builder.transport.http2_max_frame_size, Some(16_384));
+        assert_eq!(builder.transport.http2_max_header_list_size, Some(16_384));
+        assert_eq!(builder.transport.http2_max_send_buf_size, Some(256 * 1024));
+        assert_eq!(builder.transport.http2_header_table_size, Some(4096));
+        assert_eq!(
+            builder.transport.http2_max_concurrent_reset_streams,
+            Some(20)
+        );
+        assert_eq!(builder.transport.http1_writev, Some(false));
+        assert!(builder.transport.http1_title_case_headers);
+        assert!(!builder.transport.tcp_nodelay);
+        assert_eq!(
+            builder.transport.tcp_linger,
+            Some(Some(Duration::from_secs(1)))
+        );
+        assert_eq!(builder.transport.tcp_recv_buffer_size, Some(32_768));
+        assert_eq!(builder.transport.tcp_send_buffer_size, Some(16_384));
+        assert_eq!(builder.transport.max_queued_requests, 8);
     }
 
     #[test]
@@ -1836,6 +2081,7 @@ mod tests {
             max_retries: 1,
             retry_canceled_requests: false,
             allow_insecure_redirects: false,
+            priority: RequestPriority::Normal,
         };
 
         let effective = defaults.with_overrides(
@@ -1857,6 +2103,7 @@ mod tests {
         assert_eq!(effective.max_retries, 0);
         assert!(effective.retry_canceled_requests);
         assert!(effective.allow_insecure_redirects);
+        assert_eq!(effective.priority, RequestPriority::Normal);
     }
 
     #[test]

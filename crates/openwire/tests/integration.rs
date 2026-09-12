@@ -21,8 +21,9 @@ use openwire::{
     AuthChallenge, AuthContext, Authenticator, BoxFuture, BoxTaskHandle, CallContext, Client,
     DefaultRoutePlanner, DnsResolver, EstablishmentStage, Exchange, Interceptor, Jar, Next,
     NoProxy, Proxy, ProxyRules, ProxySelection, ProxySelector, RedirectContext, RedirectDecision,
-    RedirectPolicy, RequestBody, ResponseBody, RetryContext, RetryPolicy, RoutePlan, RoutePlanner,
-    RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url, WireError, WireErrorKind,
+    RedirectPolicy, RequestBody, RequestPriority, ResponseBody, RetryContext, RetryPolicy,
+    RoutePlan, RoutePlanner, RustlsTlsConnector, TaskHandle, TcpConnector, TlsConnector, Url,
+    WireError, WireErrorKind,
 };
 #[cfg(feature = "websocket")]
 use openwire_core::websocket::Message as WebSocketMessage;
@@ -311,10 +312,10 @@ async fn enqueue_emits_dispatcher_queue_events() {
         &events.events(),
         &[
             "dispatcher_queue_start",
-            "dispatcher_queue_end",
             "call_start GET",
             "proxy_select_start",
             "proxy_select_end",
+            "dispatcher_queue_end",
             "follow_up_decision 200 OK next=none",
             "response_body_start",
             "response_body_end",
@@ -1067,6 +1068,110 @@ async fn request_limit_waiting_on_same_host_does_not_consume_global_capacity() {
             .expect("same-host queued call should complete after release")
             .expect("same-host queued task");
     assert_eq!(queued_same_host_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_priority_admits_interactive_before_later_bulk() {
+    let server = spawn_http1(|_request| async move { ok_text("priority") }).await;
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .max_requests_total(1)
+        .max_requests_per_host(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/held",
+            server.addr().port()
+        )))
+        .await
+        .expect("held response");
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let bulk = {
+        let client = client.clone();
+        let order = order.clone();
+        let url = format!("http://openwire.test:{}/bulk", server.addr().port());
+        tokio::spawn(async move {
+            let response = client
+                .new_call(empty_request(url))
+                .priority(RequestPriority::Bulk)
+                .execute()
+                .await
+                .expect("bulk response");
+            order.lock().expect("order").push("bulk");
+            response
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let interactive = {
+        let client = client.clone();
+        let order = order.clone();
+        let url = format!("http://openwire.test:{}/interactive", server.addr().port());
+        tokio::spawn(async move {
+            let response = client
+                .new_call(empty_request(url))
+                .priority(RequestPriority::Interactive)
+                .execute()
+                .await
+                .expect("interactive response");
+            order.lock().expect("order").push("interactive");
+            response
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    drop(first);
+    let interactive_response = interactive.await.expect("interactive task");
+    assert_eq!(&*order.lock().expect("order"), &["interactive"]);
+    drop(interactive_response);
+    let bulk_response = bulk.await.expect("bulk task");
+    assert_eq!(&*order.lock().expect("order"), &["interactive", "bulk"]);
+    drop(bulk_response);
+}
+
+#[tokio::test]
+async fn max_queued_requests_fails_with_capacity_before_taking_a_slot() {
+    let server = spawn_http1(|_request| async move { ok_text("queued") }).await;
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .max_requests_total(1)
+        .max_requests_per_host(1)
+        .max_queued_requests(1)
+        .build()
+        .expect("client");
+
+    let first = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/held",
+            server.addr().port()
+        )))
+        .await
+        .expect("held response");
+
+    let queued = {
+        let client = client.clone();
+        let url = format!("http://openwire.test:{}/waiter", server.addr().port());
+        tokio::spawn(async move { client.execute(empty_request(url)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = client
+        .execute(empty_request(format!(
+            "http://openwire.test:{}/overflow",
+            server.addr().port()
+        )))
+        .await
+        .expect_err("queue should be full");
+    assert_eq!(error.kind(), WireErrorKind::Capacity);
+
+    drop(first);
+    queued
+        .await
+        .expect("queued task")
+        .expect("queued request should complete after a slot frees");
 }
 
 #[tokio::test]
@@ -3427,6 +3532,50 @@ async fn custom_dns_routes_custom_host() {
     let response = client.execute(request).await.expect("response");
     let body = response.into_body().text().await.expect("body");
     assert_eq!(body, "dns ok");
+}
+
+#[tokio::test]
+async fn http1_overlapping_calls_do_not_pipeline_when_per_host_caps_are_unlimited() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let server = spawn_http1({
+        let barrier = barrier.clone();
+        move |_request| {
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                ok_text("http1")
+            }
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+    let client_b = client.clone();
+    let url_a = server.http_url("/a");
+    let url_b = server.http_url("/b");
+    let (response_a, response_b) = tokio::try_join!(
+        client.execute(empty_request(url_a)),
+        client_b.execute(empty_request(url_b)),
+    )
+    .expect("overlapping HTTP/1 responses");
+    let id_a = response_a
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection a")
+        .id;
+    let id_b = response_b
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection b")
+        .id;
+    assert_ne!(
+        id_a, id_b,
+        "HTTP/1 must use a second connection instead of pipelining"
+    );
+    let (body_a, body_b) =
+        tokio::try_join!(response_a.into_body().text(), response_b.into_body().text(),)
+            .expect("bodies");
+    assert_eq!(body_a, "http1");
+    assert_eq!(body_b, "http1");
 }
 
 #[tokio::test]
@@ -6513,7 +6662,9 @@ impl TcpConnector for FailingTcpConnector {
                 return Err(error);
             }
 
-            TokioTcpConnector.connect(ctx, addr, timeout).await
+            TokioTcpConnector::default()
+                .connect(ctx, addr, timeout)
+                .await
         })
     }
 }
@@ -6539,7 +6690,9 @@ impl TcpConnector for AttemptCountingTcpConnector {
         let attempts = self.attempts.clone();
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::Relaxed);
-            TokioTcpConnector.connect(ctx, addr, timeout).await
+            TokioTcpConnector::default()
+                .connect(ctx, addr, timeout)
+                .await
         })
     }
 }
@@ -6565,7 +6718,9 @@ impl TcpConnector for RecordingTimeoutTcpConnector {
         let timeouts = self.timeouts.clone();
         Box::pin(async move {
             timeouts.lock().expect("connector timeouts").push(timeout);
-            TokioTcpConnector.connect(ctx, addr, timeout).await
+            TokioTcpConnector::default()
+                .connect(ctx, addr, timeout)
+                .await
         })
     }
 }
@@ -6611,7 +6766,7 @@ impl TcpConnector for ScriptedRaceTcpConnector {
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(script.delay).await;
-            TokioTcpConnector
+            TokioTcpConnector::default()
                 .connect(ctx, script.actual_addr, timeout)
                 .await
         })

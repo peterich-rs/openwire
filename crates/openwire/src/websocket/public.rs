@@ -18,25 +18,33 @@ pub struct WebSocketSender {
 }
 
 struct SenderInner {
-    tx: mpsc::Sender<WriterCommand>,
+    control: mpsc::Sender<WriterCommand>,
+    data: mpsc::Sender<Message>,
     closed: AtomicBool,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for SenderInner {
     fn drop(&mut self) {
-        // Best-effort cancel signal so the writer task wakes up and flushes
-        // when the last sender clone goes out of scope. If the channel is
-        // already closed (writer already returned) the send is a no-op.
-        let _ = self.tx.try_send(WriterCommand::Cancel);
+        // Control may be full of pings/pongs. Notify is a slot-independent
+        // shutdown so Drop cannot be lost on the bounded control lane.
+        let _ = self.control.try_send(WriterCommand::Cancel);
+        self.shutdown.notify_waiters();
     }
 }
 
 impl WebSocketSender {
-    pub(crate) fn new(tx: mpsc::Sender<WriterCommand>) -> Self {
+    pub(crate) fn new(
+        control: mpsc::Sender<WriterCommand>,
+        data: mpsc::Sender<Message>,
+        shutdown: Arc<tokio::sync::Notify>,
+    ) -> Self {
         Self {
             inner: Arc::new(SenderInner {
-                tx,
+                control,
+                data,
                 closed: AtomicBool::new(false),
+                shutdown,
             }),
         }
     }
@@ -47,8 +55,8 @@ impl WebSocketSender {
         }
         validate_outbound_message(&message)?;
         self.inner
-            .tx
-            .send(WriterCommand::Send(message))
+            .data
+            .send(message)
             .await
             .map_err(|_| WebSocketError::LocalCancelled)
     }
@@ -82,7 +90,7 @@ impl WebSocketSender {
         }
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.inner
-            .tx
+            .control
             .send(WriterCommand::Close {
                 code,
                 reason,
@@ -96,13 +104,13 @@ impl WebSocketSender {
 
     pub fn queue_size(&self) -> usize {
         self.inner
-            .tx
+            .data
             .max_capacity()
-            .saturating_sub(self.inner.tx.capacity())
+            .saturating_sub(self.inner.data.capacity())
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire) || self.inner.tx.is_closed()
+        self.inner.closed.load(Ordering::Acquire) || self.inner.control.is_closed()
     }
 }
 
@@ -140,6 +148,8 @@ impl WebSocket {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use openwire_core::websocket::{
         Message, WebSocketEngineError, WebSocketError, MAX_CLOSE_REASON_BYTES,
@@ -150,10 +160,23 @@ mod tests {
     use super::WebSocketSender;
     use crate::websocket::writer::WriterCommand;
 
+    fn test_sender() -> (
+        WebSocketSender,
+        mpsc::Receiver<WriterCommand>,
+        mpsc::Receiver<Message>,
+    ) {
+        let (control_tx, control_rx) = mpsc::channel::<WriterCommand>(4);
+        let (data_tx, data_rx) = mpsc::channel::<Message>(4);
+        (
+            WebSocketSender::new(control_tx, data_tx, Arc::new(tokio::sync::Notify::new())),
+            control_rx,
+            data_rx,
+        )
+    }
+
     #[tokio::test]
     async fn close_accepts_maximum_sized_reason() {
-        let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
-        let sender = WebSocketSender::new(tx);
+        let (sender, mut rx, _data_rx) = test_sender();
         let reason = "a".repeat(MAX_CLOSE_REASON_BYTES);
 
         let close = tokio::spawn({
@@ -187,8 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_rejects_oversized_reason_without_closing_sender() {
-        let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
-        let sender = WebSocketSender::new(tx);
+        let (sender, mut rx, mut data_rx) = test_sender();
         let reason = "a".repeat(MAX_CLOSE_REASON_BYTES + 1);
 
         let error = sender
@@ -208,16 +230,15 @@ mod tests {
             .await
             .expect("sender remains usable");
         assert!(matches!(
-            rx.recv().await,
-            Some(WriterCommand::Send(Message::Text(text))) if text == "still open"
+            data_rx.recv().await,
+            Some(Message::Text(text)) if text == "still open"
         ));
     }
 
     #[tokio::test]
     async fn close_rejects_reserved_wire_codes_without_closing_sender() {
         for code in [1005, 1006, 1015] {
-            let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
-            let sender = WebSocketSender::new(tx);
+            let (sender, mut rx, _data_rx) = test_sender();
 
             let error = sender
                 .close(code, "")
@@ -237,8 +258,7 @@ mod tests {
     #[tokio::test]
     async fn close_accepts_iana_registered_wire_codes() {
         for code in [1012u16, 1013, 1014] {
-            let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
-            let sender = WebSocketSender::new(tx);
+            let (sender, mut rx, _data_rx) = test_sender();
 
             let close = tokio::spawn({
                 let sender = sender.clone();
@@ -275,8 +295,7 @@ mod tests {
         ];
 
         for message in invalid_messages {
-            let (tx, mut rx) = mpsc::channel::<WriterCommand>(4);
-            let sender = WebSocketSender::new(tx);
+            let (sender, _control_rx, mut data_rx) = test_sender();
 
             let error = sender
                 .send(message)
@@ -284,8 +303,35 @@ mod tests {
                 .expect_err("invalid control message should fail");
 
             assert!(matches!(error, WebSocketError::Engine(_)));
-            assert!(rx.try_recv().is_err());
+            assert!(data_rx.try_recv().is_err());
             assert!(!sender.is_closed());
         }
+    }
+
+    #[tokio::test]
+    async fn close_is_not_blocked_by_a_full_data_queue() {
+        let (control_tx, mut control_rx) = mpsc::channel::<WriterCommand>(4);
+        let (data_tx, _data_rx) = mpsc::channel::<Message>(1);
+        data_tx
+            .try_send(Message::Text("full".into()))
+            .expect("fill data lane");
+        let sender =
+            WebSocketSender::new(control_tx, data_tx, Arc::new(tokio::sync::Notify::new()));
+
+        let close = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.close(1000, "done").await }
+        });
+
+        match control_rx.recv().await.expect("close command") {
+            WriterCommand::Close { code, reason, ack } => {
+                assert_eq!(code, 1000);
+                assert_eq!(reason, "done");
+                let _ = ack.send(());
+            }
+            other => panic!("expected close, got {other:?}"),
+        }
+
+        close.await.expect("close joined").expect("close succeeds");
     }
 }

@@ -416,12 +416,12 @@ fn release_response_lease(state: ResponseLeaseState) {
                 && bindings.release_http1(connection.id(), sender)
                 && exchange_finder.release(&connection)
             {
-                availability.notify();
+                availability.notify(connection.address());
                 ctx.listener().connection_released(&ctx, connection.id());
                 return;
             }
             teardown_pooled_connection(&exchange_finder, &bindings, &_tasks, connection.id());
-            availability.notify();
+            availability.notify(connection.address());
             ctx.listener().connection_released(&ctx, connection.id());
         }
         ResponseLeaseState::Http2 {
@@ -436,7 +436,7 @@ fn release_response_lease(state: ResponseLeaseState) {
             ..
         } => {
             let _ = exchange_finder.release(&connection);
-            availability.notify();
+            availability.notify(connection.address());
             ctx.listener().connection_released(&ctx, connection.id());
         }
     }
@@ -465,7 +465,7 @@ fn evict_response_lease_state(state: ResponseLeaseState, mark_unhealthy: bool) {
             ..
         } => {
             teardown_pooled_connection(&exchange_finder, &bindings, &_tasks, connection.id());
-            availability.notify();
+            availability.notify(connection.address());
             ctx.listener().connection_released(&ctx, connection.id());
         }
         ResponseLeaseState::Http2 {
@@ -483,7 +483,7 @@ fn evict_response_lease_state(state: ResponseLeaseState, mark_unhealthy: bool) {
                 connection.mark_unhealthy();
             }
             let _ = exchange_finder.release(&connection);
-            availability.notify();
+            availability.notify(connection.address());
             ctx.listener().connection_released(&ctx, connection.id());
         }
     }

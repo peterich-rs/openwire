@@ -41,7 +41,9 @@ use super::connect::{
 use super::protocol::connection_header_requests_close;
 use super::service::prepare_request_for_send;
 use crate::auth::{AuthAttemptState, SharedAuthenticator};
+use crate::client::EffectiveRequestConfig;
 use crate::connection::ConnectionPool;
+use crate::connection::RequestPriority;
 use crate::connection::{
     Address, AuthorityKey, ConnectionAvailability, ConnectionProtocol, DnsPolicy,
     FastFallbackOutcome, PoolSettings, ProtocolPolicy, RealConnection, Route, RouteKind, RoutePlan,
@@ -252,6 +254,70 @@ fn prepare_request_for_send_clears_proxy_authorization_when_selected_proxy_chang
     .expect("prepared request");
 
     assert!(request.headers().get(PROXY_AUTHORIZATION).is_none());
+}
+
+#[test]
+fn prepare_request_for_send_injects_rfc9218_priority_header() {
+    let mut request = Request::builder()
+        .uri("http://example.com/resource")
+        .body(RequestBody::empty())
+        .expect("request");
+    request.extensions_mut().insert(EffectiveRequestConfig {
+        call_timeout: None,
+        connect_timeout: None,
+        follow_redirects: true,
+        max_redirects: 20,
+        retry_on_connection_failure: true,
+        max_retries: 0,
+        retry_canceled_requests: false,
+        allow_insecure_redirects: false,
+        priority: RequestPriority::from_urgency(1),
+    });
+
+    let request = prepare_request_for_send(
+        request,
+        None,
+        ConnectionProtocol::Http1,
+        &RouteKind::Direct {
+            target: ([127, 0, 0, 1], 80).into(),
+        },
+    )
+    .expect("prepared request");
+
+    assert_eq!(
+        request
+            .headers()
+            .get("priority")
+            .map(|value| value.as_bytes()),
+        Some(&b"u=1"[..])
+    );
+}
+
+#[test]
+fn prepare_request_for_send_preserves_caller_priority_header() {
+    let request = Request::builder()
+        .uri("http://example.com/resource")
+        .header("priority", "u=5, i")
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let request = prepare_request_for_send(
+        request,
+        None,
+        ConnectionProtocol::Http1,
+        &RouteKind::Direct {
+            target: ([127, 0, 0, 1], 80).into(),
+        },
+    )
+    .expect("prepared request");
+
+    assert_eq!(
+        request
+            .headers()
+            .get("priority")
+            .map(|value| value.as_bytes()),
+        Some(&b"u=5, i"[..])
+    );
 }
 
 #[test]

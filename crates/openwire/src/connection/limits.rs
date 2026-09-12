@@ -1,41 +1,24 @@
-use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures_util::future::poll_fn;
 use tokio::sync::{Notify, OwnedSemaphorePermit as TokioOwnedSemaphorePermit, Semaphore};
 
 use openwire_core::WireError;
+use parking_lot::Mutex;
 
-use super::Address;
-use crate::sync_util::lock_mutex;
+use super::scheduler::{RequestPriority, RequestScheduler};
+use super::{address_shard, sip_hash_map, Address, SipHashMap, ADDRESS_SHARDS};
+
+pub(crate) use super::scheduler::RequestAdmissionPermit;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestAdmissionLimiter {
-    inner: Option<Arc<RequestAdmissionLimiterInner>>,
+    scheduler: Option<Arc<RequestScheduler>>,
 }
 
-#[derive(Debug)]
-struct RequestAdmissionLimiterInner {
-    global: Option<Arc<AsyncSemaphore>>,
-    per_address: Option<AddressSemaphoreSet>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RequestAdmissionPermit {
-    global: Option<RequestGlobalPermit>,
-    per_address: Option<AddressSemaphorePermit>,
-}
-
-#[derive(Debug)]
-struct RequestGlobalPermit {
-    permit: Option<OwnedSemaphorePermit>,
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConnectionLimiter {
-    inner: Option<Arc<ConnectionLimiterInner>>,
+    inner: Arc<ConnectionLimiterInner>,
 }
 
 #[derive(Debug)]
@@ -52,14 +35,23 @@ pub(crate) struct ConnectionPermit {
 
 #[derive(Debug)]
 struct ConnectionPermitInner {
+    address: Address,
     global: Option<OwnedSemaphorePermit>,
     per_address: Option<AddressSemaphorePermit>,
     availability: ConnectionAvailability,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConnectionAvailability {
-    notify: Arc<Notify>,
+    shards: Arc<[AddressNotifyShard]>,
+    /// Wakes waiters blocked on the global connection cap when any address
+    /// releases a connection permit.
+    global: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct AddressNotifyShard {
+    by_address: Mutex<SipHashMap<Address, Arc<Notify>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,7 +62,7 @@ struct AddressSemaphoreSet {
 #[derive(Debug)]
 struct AddressSemaphoreSetInner {
     limit: usize,
-    semaphores: Mutex<HashMap<Address, Arc<AsyncSemaphore>>>,
+    shards: Arc<[Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>>]>,
 }
 
 #[derive(Debug)]
@@ -85,103 +77,44 @@ struct AddressSemaphorePermit {
 struct AsyncSemaphore {
     limit: usize,
     semaphore: Arc<Semaphore>,
-    waiters: Mutex<Vec<Waker>>,
 }
 
 #[derive(Debug)]
 struct OwnedSemaphorePermit {
-    semaphore: Arc<AsyncSemaphore>,
     permit: Option<TokioOwnedSemaphorePermit>,
 }
 
 impl RequestAdmissionLimiter {
-    pub(crate) fn new(max_total: usize, max_per_address: usize) -> Self {
-        let global = limit_semaphore(max_total);
-        let per_address = AddressSemaphoreSet::new(max_per_address);
-        if global.is_none() && per_address.is_none() {
+    pub(crate) fn new(max_total: usize, max_per_address: usize, max_queued: usize) -> Self {
+        if max_total == usize::MAX && max_per_address == usize::MAX && max_queued == usize::MAX {
             return Self::default();
         }
 
         Self {
-            inner: Some(Arc::new(RequestAdmissionLimiterInner {
-                global,
-                per_address,
-            })),
+            scheduler: Some(RequestScheduler::new(
+                max_total,
+                max_per_address,
+                max_queued,
+            )),
         }
     }
 
     pub(crate) async fn acquire(
         &self,
         address: Address,
+        priority: RequestPriority,
     ) -> Result<RequestAdmissionPermit, WireError> {
-        let Some(inner) = &self.inner else {
-            return Ok(RequestAdmissionPermit {
-                global: None,
-                per_address: None,
-            });
+        let Some(scheduler) = &self.scheduler else {
+            return Ok(RequestAdmissionPermit::unlimited());
         };
-
-        match (&inner.global, &inner.per_address) {
-            (Some(global), Some(limiters)) => {
-                let address_semaphore = limiters.semaphore_for(&address);
-                let owner = limiters.clone();
-                let key = address;
-                poll_fn(move |cx| loop {
-                    if global.poll_ready(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    if address_semaphore.poll_ready(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-
-                    let Some(global_permit) = global.try_acquire_owned() else {
-                        continue;
-                    };
-                    let Some(per_address_permit) = address_semaphore.try_acquire_owned() else {
-                        drop(global_permit);
-                        continue;
-                    };
-
-                    return Poll::Ready(Ok(RequestAdmissionPermit {
-                        global: Some(RequestGlobalPermit {
-                            permit: Some(global_permit),
-                        }),
-                        per_address: Some(AddressSemaphorePermit {
-                            key: key.clone(),
-                            owner: owner.clone(),
-                            semaphore: address_semaphore.clone(),
-                            permit: Some(per_address_permit),
-                        }),
-                    }));
-                })
-                .await
-            }
-            (Some(global), None) => Ok(RequestAdmissionPermit {
-                global: Some(RequestGlobalPermit {
-                    permit: Some(global.acquire_owned().await?),
-                }),
-                per_address: None,
-            }),
-            (None, Some(limiters)) => Ok(RequestAdmissionPermit {
-                global: None,
-                per_address: Some(limiters.acquire(address).await?),
-            }),
-            (None, None) => Ok(RequestAdmissionPermit {
-                global: None,
-                per_address: None,
-            }),
-        }
+        scheduler.acquire(address, priority).await
     }
 
     pub(crate) fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), WireError>> {
-        let Some(inner) = &self.inner else {
+        let Some(scheduler) = &self.scheduler else {
             return Poll::Ready(Ok(()));
         };
-        let Some(global) = &inner.global else {
-            return Poll::Ready(Ok(()));
-        };
-
-        global.poll_ready(cx).map(Ok)
+        scheduler.poll_ready(cx).map(Ok)
     }
 }
 
@@ -191,97 +124,129 @@ impl ConnectionLimiter {
         max_per_address: usize,
         availability: ConnectionAvailability,
     ) -> Self {
-        let global = limit_semaphore(max_total);
-        let per_address = AddressSemaphoreSet::new(max_per_address);
-        if global.is_none() && per_address.is_none() {
-            return Self::default();
-        }
-
         Self {
-            inner: Some(Arc::new(ConnectionLimiterInner {
-                global,
-                per_address,
+            inner: Arc::new(ConnectionLimiterInner {
+                global: limit_semaphore(max_total),
+                per_address: AddressSemaphoreSet::new(max_per_address),
                 availability,
-            })),
+            }),
         }
     }
 
     pub(crate) fn try_acquire(&self, address: Address) -> Option<ConnectionPermit> {
-        let Some(inner) = &self.inner else {
-            return Some(ConnectionPermit {
-                inner: Arc::new(ConnectionPermitInner {
-                    global: None,
-                    per_address: None,
-                    availability: ConnectionAvailability::default(),
-                }),
-            });
-        };
-
-        let global = match &inner.global {
-            Some(semaphore) => Some(semaphore.try_acquire_owned()?),
+        // Take the per-address slot first so a host at its cap never consumes
+        // (and then silently drops) a global permit.
+        let per_address = match &self.inner.per_address {
+            Some(limiters) => Some(limiters.try_acquire(address.clone())?),
             None => None,
         };
 
-        let per_address = match &inner.per_address {
-            Some(limiters) => Some(limiters.try_acquire(address)?),
+        let global = match &self.inner.global {
+            Some(semaphore) => Some(semaphore.try_acquire_owned()?),
             None => None,
         };
 
         Some(ConnectionPermit {
             inner: Arc::new(ConnectionPermitInner {
+                address,
                 global,
                 per_address,
-                availability: inner.availability.clone(),
+                availability: self.inner.availability.clone(),
             }),
         })
     }
 
     /// Non-consuming heuristic; result may be stale by the time the caller acts on it.
     pub(crate) fn can_acquire(&self, address: &Address) -> bool {
-        let Some(inner) = &self.inner else {
-            return true;
-        };
-
-        inner
+        self.inner
             .global
             .as_ref()
             .map_or(true, |semaphore| semaphore.can_acquire())
-            && inner
+            && self
+                .inner
                 .per_address
                 .as_ref()
                 .map_or(true, |limiters| limiters.can_acquire(address))
     }
 }
 
+impl Default for ConnectionLimiter {
+    fn default() -> Self {
+        Self::new(usize::MAX, usize::MAX, ConnectionAvailability::default())
+    }
+}
+
 impl ConnectionAvailability {
-    pub(crate) fn notify(&self) {
-        self.notify.notify_waiters();
+    fn shard(&self, address: &Address) -> &AddressNotifyShard {
+        &self.shards[address_shard(address)]
     }
 
-    pub(crate) fn listen(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.notify.notified()
+    fn notify_for(&self, address: &Address) -> Arc<Notify> {
+        let mut map = self.shard(address).by_address.lock();
+        if let Some(existing) = map.get(address) {
+            return existing.clone();
+        }
+        let notify = Arc::new(Notify::new());
+        map.insert(address.clone(), notify.clone());
+        notify
+    }
+
+    pub(crate) fn notify(&self, address: &Address) {
+        self.notify_for(address).notify_one();
+    }
+
+    pub(crate) fn notify_global(&self) {
+        // Broadcast: a freed total-cap slot may be usable by any host that is
+        // under its per-address cap. `notify_one` would hand the token to an
+        // arbitrary waiter, including one still blocked on per-host.
+        self.global.notify_waiters();
+    }
+
+    /// Wait future is created after pool/binding mutexes are released. Do not
+    /// hold those mutexes across the wait. Per-address `notify_one` stores a
+    /// permit if no waiter has registered yet. The global channel is
+    /// `notify_waiters` so a connection closing on another host can free the
+    /// total cap without waking only the wrong host.
+    pub(crate) fn listen(&self, address: &Address) -> impl std::future::Future<Output = ()> {
+        let notify = self.notify_for(address);
+        let global = self.global.clone();
+        async move {
+            let local = std::pin::pin!(notify.notified());
+            let global = std::pin::pin!(global.notified());
+            let _ = futures_util::future::select(local, global).await;
+        }
+    }
+}
+
+impl Default for ConnectionAvailability {
+    fn default() -> Self {
+        let shards = (0..ADDRESS_SHARDS)
+            .map(|_| AddressNotifyShard::default())
+            .collect::<Vec<_>>();
+        Self {
+            shards: Arc::<[AddressNotifyShard]>::from(shards),
+            global: Arc::new(Notify::new()),
+        }
     }
 }
 
 impl AddressSemaphoreSet {
     fn new(limit: usize) -> Option<Self> {
-        limit_semaphore(limit).map(|_| Self {
-            inner: Arc::new(AddressSemaphoreSetInner {
-                limit,
-                semaphores: Mutex::new(HashMap::new()),
-            }),
+        (limit != usize::MAX).then(|| {
+            let shards = (0..ADDRESS_SHARDS)
+                .map(|_| Mutex::new(sip_hash_map()))
+                .collect::<Vec<_>>();
+            Self {
+                inner: Arc::new(AddressSemaphoreSetInner {
+                    limit,
+                    shards: Arc::<[Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>>]>::from(shards),
+                }),
+            }
         })
     }
 
-    async fn acquire(&self, key: Address) -> Result<AddressSemaphorePermit, WireError> {
-        let semaphore = self.semaphore_for(&key);
-        let permit = semaphore.acquire_owned().await?;
-        Ok(AddressSemaphorePermit {
-            key,
-            owner: self.clone(),
-            semaphore,
-            permit: Some(permit),
-        })
+    fn shard(&self, key: &Address) -> &Mutex<SipHashMap<Address, Arc<AsyncSemaphore>>> {
+        &self.inner.shards[address_shard(key)]
     }
 
     fn try_acquire(&self, key: Address) -> Option<AddressSemaphorePermit> {
@@ -297,23 +262,24 @@ impl AddressSemaphoreSet {
     }
 
     fn semaphore_for(&self, key: &Address) -> Arc<AsyncSemaphore> {
-        let mut semaphores = lock_mutex(&self.inner.semaphores);
-        semaphores
-            .entry(key.clone())
-            .or_insert_with(|| {
-                limit_semaphore(self.inner.limit).unwrap_or_else(|| {
-                    debug_assert!(
-                        false,
-                        "address semaphore sets are only created with finite limits"
-                    );
-                    Arc::new(AsyncSemaphore::new(self.inner.limit))
-                })
-            })
-            .clone()
+        let mut semaphores = self.shard(key).lock();
+        if let Some(existing) = semaphores.get(key) {
+            return existing.clone();
+        }
+        let semaphore = limit_semaphore(self.inner.limit).unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "address semaphore sets are only created with finite limits"
+            );
+            Arc::new(AsyncSemaphore::new(self.inner.limit))
+        });
+        semaphores.insert(key.clone(), semaphore.clone());
+        semaphore
     }
 
     fn can_acquire(&self, key: &Address) -> bool {
-        lock_mutex(&self.inner.semaphores)
+        self.shard(key)
+            .lock()
             .get(key)
             .map_or(true, |semaphore| semaphore.can_acquire())
     }
@@ -323,7 +289,8 @@ impl Drop for ConnectionPermitInner {
     fn drop(&mut self) {
         drop(self.per_address.take());
         drop(self.global.take());
-        self.availability.notify();
+        self.availability.notify(&self.address);
+        self.availability.notify_global();
     }
 }
 
@@ -337,7 +304,7 @@ impl Drop for AddressSemaphorePermit {
             return;
         }
 
-        let mut semaphores = lock_mutex(&self.owner.inner.semaphores);
+        let mut semaphores = self.owner.shard(&self.key).lock();
         let remove_entry = semaphores
             .get(&self.key)
             .is_some_and(|current| Arc::ptr_eq(current, &self.semaphore))
@@ -351,11 +318,9 @@ impl Drop for AddressSemaphorePermit {
 
 impl AsyncSemaphore {
     fn new(limit: usize) -> Self {
-        let semaphore = Arc::new(Semaphore::new(limit));
         Self {
             limit,
-            semaphore,
-            waiters: Mutex::new(Vec::new()),
+            semaphore: Arc::new(Semaphore::new(limit)),
         }
     }
 
@@ -367,77 +332,25 @@ impl AsyncSemaphore {
         self.available_permits() > 0
     }
 
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.can_acquire() {
-            return Poll::Ready(());
-        }
-
-        let mut waiters = lock_mutex(&self.waiters);
-        if self.can_acquire() {
-            return Poll::Ready(());
-        }
-
-        register_waker_locked(&mut waiters, cx.waker());
-        if self.can_acquire() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-
     fn try_acquire_owned(self: &Arc<Self>) -> Option<OwnedSemaphorePermit> {
         self.semaphore
             .clone()
             .try_acquire_owned()
             .ok()
             .map(|permit| OwnedSemaphorePermit {
-                semaphore: self.clone(),
                 permit: Some(permit),
             })
-    }
-
-    async fn acquire_owned(self: &Arc<Self>) -> Result<OwnedSemaphorePermit, WireError> {
-        let permit = self.semaphore.clone().acquire_owned().await.map_err(|_| {
-            WireError::internal(
-                "request semaphore closed unexpectedly",
-                io::Error::other("semaphore closed unexpectedly"),
-            )
-        })?;
-        Ok(OwnedSemaphorePermit {
-            semaphore: self.clone(),
-            permit: Some(permit),
-        })
-    }
-
-    fn wake_waiters(&self) {
-        let waiters = {
-            let mut waiters = lock_mutex(&self.waiters);
-            std::mem::take(&mut *waiters)
-        };
-        for waiter in waiters {
-            waiter.wake();
-        }
     }
 }
 
 impl Drop for OwnedSemaphorePermit {
     fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() {
-            drop(permit);
-            self.semaphore.wake_waiters();
-        }
+        drop(self.permit.take());
     }
 }
 
 fn limit_semaphore(limit: usize) -> Option<Arc<AsyncSemaphore>> {
     (limit != usize::MAX).then(|| Arc::new(AsyncSemaphore::new(limit)))
-}
-
-fn register_waker_locked(waiters: &mut Vec<Waker>, waker: &Waker) {
-    if waiters.iter().any(|existing| existing.will_wake(waker)) {
-        return;
-    }
-    waiters.push(waker.clone());
 }
 
 #[cfg(test)]
@@ -448,6 +361,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{ConnectionAvailability, ConnectionLimiter, RequestAdmissionLimiter};
+    use crate::connection::scheduler::RequestPriority;
     use crate::connection::{Address, AuthorityKey, DnsPolicy, ProtocolPolicy, UriScheme};
 
     fn make_address(host: &str) -> Address {
@@ -463,9 +377,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_admission_waiter_completes_after_permit_drop() {
-        let limiter = RequestAdmissionLimiter::new(1, 1);
+        let limiter = RequestAdmissionLimiter::new(1, 1, usize::MAX);
         let first = limiter
-            .acquire(make_address("example.com"))
+            .acquire(make_address("example.com"), RequestPriority::Normal)
             .await
             .expect("first permit");
 
@@ -473,7 +387,7 @@ mod tests {
             let limiter = limiter.clone();
             tokio::spawn(async move {
                 limiter
-                    .acquire(make_address("example.com"))
+                    .acquire(make_address("example.com"), RequestPriority::Normal)
                     .await
                     .expect("second permit")
             })
@@ -491,9 +405,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_admission_multiple_waiters_complete_after_permit_drop() {
-        let limiter = RequestAdmissionLimiter::new(1, 1);
+        let limiter = RequestAdmissionLimiter::new(1, 1, usize::MAX);
         let first = limiter
-            .acquire(make_address("example.com"))
+            .acquire(make_address("example.com"), RequestPriority::Normal)
             .await
             .expect("first permit");
 
@@ -502,7 +416,7 @@ mod tests {
                 let limiter = limiter.clone();
                 tokio::spawn(async move {
                     let permit = limiter
-                        .acquire(make_address("example.com"))
+                        .acquire(make_address("example.com"), RequestPriority::Normal)
                         .await
                         .expect("waiter permit");
                     tokio::task::yield_now().await;
@@ -523,49 +437,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_admission_poll_ready_wakes_all_waiters() {
-        let limiter = RequestAdmissionLimiter::new(1, usize::MAX);
-        let permit = limiter
-            .acquire(make_address("example.com"))
+    async fn request_admission_waiters_are_admitted_in_fifo_order() {
+        let limiter = RequestAdmissionLimiter::new(1, 1, usize::MAX);
+        let first = limiter
+            .acquire(make_address("example.com"), RequestPriority::Normal)
             .await
             .expect("held permit");
 
-        let waiters = (0..8)
-            .map(|_| {
-                let limiter = limiter.clone();
-                tokio::spawn(async move {
-                    poll_fn(|cx| limiter.poll_ready(cx))
-                        .await
-                        .expect("limiter ready");
-                })
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for index in 0..3 {
+            let limiter = limiter.clone();
+            let order = order.clone();
+            waiters.push(tokio::spawn(async move {
+                let permit = limiter
+                    .acquire(make_address("example.com"), RequestPriority::Normal)
+                    .await
+                    .expect("waiter permit");
+                order.lock().expect("order").push(index);
+                permit
+            }));
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        let first_waiter = timeout(Duration::from_secs(1), waiters.remove(0))
+            .await
+            .expect("first waiter completed")
+            .expect("first waiter join");
+        assert_eq!(&*order.lock().expect("order"), &[0]);
+
+        drop(first_waiter);
+        let second_waiter = timeout(Duration::from_secs(1), waiters.remove(0))
+            .await
+            .expect("second waiter completed")
+            .expect("second waiter join");
+        assert_eq!(&*order.lock().expect("order"), &[0, 1]);
+
+        drop(second_waiter);
+        let third_waiter = timeout(Duration::from_secs(1), waiters.remove(0))
+            .await
+            .expect("third waiter completed")
+            .expect("third waiter join");
+        assert_eq!(&*order.lock().expect("order"), &[0, 1, 2]);
+        drop(third_waiter);
+    }
+
+    #[tokio::test]
+    async fn request_admission_poll_ready_wakes_next_waiter() {
+        let limiter = RequestAdmissionLimiter::new(1, usize::MAX, usize::MAX);
+        let permit = limiter
+            .acquire(make_address("example.com"), RequestPriority::Normal)
+            .await
+            .expect("held permit");
+
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                poll_fn(|cx| limiter.poll_ready(cx))
+                    .await
+                    .expect("limiter ready");
             })
-            .collect::<Vec<_>>();
+        };
 
         tokio::task::yield_now().await;
         drop(permit);
 
-        for waiter in waiters {
-            timeout(Duration::from_secs(1), waiter)
-                .await
-                .expect("waiter completed")
-                .expect("waiter join");
-        }
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter completed")
+            .expect("waiter join");
     }
 
     #[tokio::test]
-    async fn connection_availability_broadcasts_to_all_waiters() {
+    async fn connection_availability_wakes_one_waiter_per_notify() {
         let availability = ConnectionAvailability::default();
-        let waiters = (0..8)
+        let address = make_address("example.com");
+        let waiters = (0..3)
             .map(|_| {
                 let availability = availability.clone();
+                let address = address.clone();
                 tokio::spawn(async move {
-                    availability.listen().await;
+                    availability.listen(&address).await;
                 })
             })
             .collect::<Vec<_>>();
 
         tokio::task::yield_now().await;
-        availability.notify();
+        availability.notify(&address);
+        availability.notify(&address);
+        availability.notify(&address);
 
         for waiter in waiters {
             timeout(Duration::from_secs(1), waiter)
@@ -578,9 +539,10 @@ mod tests {
     #[tokio::test]
     async fn connection_availability_listen_observes_notify_before_first_poll() {
         let availability = ConnectionAvailability::default();
-        let waiter = availability.listen();
+        let address = make_address("example.com");
+        let waiter = availability.listen(&address);
 
-        availability.notify();
+        availability.notify(&address);
 
         timeout(Duration::from_secs(1), waiter)
             .await
@@ -588,17 +550,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_waiter_for_host_a_does_not_complete_when_host_b_releases() {
+        let availability = ConnectionAvailability::default();
+        let host_a = make_address("a.example");
+        let host_b = make_address("b.example");
+        let waiter = {
+            let availability = availability.clone();
+            let host_a = host_a.clone();
+            tokio::spawn(async move {
+                availability.listen(&host_a).await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        availability.notify(&host_b);
+
+        timeout(Duration::from_millis(50), waiter)
+            .await
+            .expect_err("host A waiter should ignore host B notify");
+    }
+
+    #[tokio::test]
+    async fn global_connection_cap_wakes_a_host_that_can_use_the_slot() {
+        let availability = ConnectionAvailability::default();
+        let limiter = ConnectionLimiter::new(2, 1, availability.clone());
+        let host_a = make_address("a.example");
+        let host_b = make_address("b.example");
+        let host_c = make_address("c.example");
+        let permit_a = limiter.try_acquire(host_a.clone()).expect("host A permit");
+        let permit_c = limiter.try_acquire(host_c.clone()).expect("host C permit");
+        assert!(
+            limiter.try_acquire(host_a.clone()).is_none(),
+            "host A is at its per-host cap"
+        );
+        assert!(
+            limiter.try_acquire(host_b.clone()).is_none(),
+            "global cap is exhausted"
+        );
+
+        let waiter_b = {
+            let availability = availability.clone();
+            let host_b = host_b.clone();
+            tokio::spawn(async move {
+                availability.listen(&host_b).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(permit_c);
+
+        timeout(Duration::from_secs(1), waiter_b)
+            .await
+            .expect("host B waiter completed")
+            .expect("host B waiter join");
+        let permit_b = limiter
+            .try_acquire(host_b)
+            .expect("host B should take the freed global slot");
+        assert!(
+            limiter.try_acquire(host_a.clone()).is_none(),
+            "host A remains at its per-host cap"
+        );
+        drop(permit_a);
+        drop(permit_b);
+    }
+
+    #[test]
+    fn try_acquire_does_not_consume_global_when_per_host_is_full() {
+        let availability = ConnectionAvailability::default();
+        let limiter = ConnectionLimiter::new(1, 1, availability);
+        let host_a = make_address("a.example");
+        let host_b = make_address("b.example");
+        let permit_a = limiter.try_acquire(host_a.clone()).expect("host A permit");
+        assert!(limiter.try_acquire(host_a.clone()).is_none());
+        assert!(limiter.try_acquire(host_b.clone()).is_none());
+        drop(permit_a);
+        assert!(limiter.try_acquire(host_b).is_some());
+    }
+
+    #[tokio::test]
     async fn connection_permit_drop_notifies_availability_waiters() {
         let availability = ConnectionAvailability::default();
         let limiter = ConnectionLimiter::new(1, 1, availability.clone());
+        let address = make_address("example.com");
         let permit = limiter
-            .try_acquire(make_address("example.com"))
+            .try_acquire(address.clone())
             .expect("connection permit");
 
         let waiter = {
             let availability = availability.clone();
+            let address = address.clone();
             tokio::spawn(async move {
-                availability.listen().await;
+                availability.listen(&address).await;
             })
         };
 

@@ -19,8 +19,8 @@ pub mod websocket;
 pub use client::{Call, CallHandle, CallOptions, Client, ClientBuilder, QueuedCall};
 pub use connection::{
     Address, AuthorityKey, DefaultRoutePlanner, DnsPolicy, ProtocolPolicy, ProxyConfig,
-    ProxyEndpoint, ProxyMode, ProxyScheme, Route, RouteFamily, RoutePlan, RoutePlanner,
-    TlsIdentity, UriScheme,
+    ProxyEndpoint, ProxyMode, ProxyScheme, RequestPriority, Route, RouteFamily, RoutePlan,
+    RoutePlanner, TlsIdentity, UriScheme,
 };
 #[cfg(feature = "cookies")]
 pub use cookie::Jar;

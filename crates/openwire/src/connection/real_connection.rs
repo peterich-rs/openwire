@@ -164,23 +164,35 @@ impl RealConnection {
         }
     }
 
+    pub(crate) fn can_acquire(&self) -> bool {
+        let state = lock_mutex(&self.inner.state);
+        self.can_acquire_with(&state)
+    }
+
     pub(crate) fn try_acquire(&self) -> bool {
         let mut state = lock_mutex(&self.inner.state);
-        if state.health != ConnectionHealth::Healthy {
+        if !self.can_acquire_with(&state) {
             return false;
-        }
-
-        match self.inner.protocol {
-            ConnectionProtocol::Http1 if state.allocations > 0 => return false,
-            ConnectionProtocol::Http2 if state.allocations >= self.inner.max_http2_streams => {
-                return false;
-            }
-            ConnectionProtocol::Http1 | ConnectionProtocol::Http2 => {}
         }
 
         state.allocations += 1;
         state.idle_since = None;
         true
+    }
+
+    fn can_acquire_with(&self, state: &RealConnectionState) -> bool {
+        if state.health != ConnectionHealth::Healthy {
+            return false;
+        }
+
+        // Protocol gates, independent of Client request/connection quotas:
+        // HTTP/1 is one exchange per connection (no pipelining). HTTP/2 may
+        // multiplex up to the local stream budget (and peer SETTINGS).
+        match self.inner.protocol {
+            ConnectionProtocol::Http1 if state.allocations > 0 => false,
+            ConnectionProtocol::Http2 if state.allocations >= self.inner.max_http2_streams => false,
+            ConnectionProtocol::Http1 | ConnectionProtocol::Http2 => true,
+        }
     }
 
     pub(crate) fn release(&self) -> bool {
@@ -274,6 +286,7 @@ mod tests {
         assert_eq!(snapshot.allocation, ConnectionAllocationState::Idle);
         assert!(snapshot.idle_since.is_some());
 
+        assert!(connection.can_acquire());
         assert!(connection.try_acquire());
         let snapshot = connection.snapshot();
         assert_eq!(
@@ -281,12 +294,14 @@ mod tests {
             ConnectionAllocationState::InUse { allocations: 1 }
         );
         assert!(snapshot.idle_since.is_none());
+        assert!(!connection.can_acquire());
 
         assert!(connection.release());
         let snapshot = connection.snapshot();
         assert_eq!(snapshot.allocation, ConnectionAllocationState::Idle);
         assert_eq!(snapshot.completed_exchanges, 1);
         assert!(snapshot.idle_since.is_some());
+        assert!(connection.can_acquire());
 
         connection.mark_unhealthy();
         assert_eq!(connection.snapshot().health, ConnectionHealth::Unhealthy);
@@ -351,8 +366,10 @@ mod tests {
         );
 
         for _ in 0..4 {
+            assert!(connection.can_acquire());
             assert!(connection.try_acquire());
         }
+        assert!(!connection.can_acquire());
         assert!(!connection.try_acquire());
         assert_eq!(
             connection.snapshot().allocation,

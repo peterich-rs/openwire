@@ -433,8 +433,67 @@ where
     }
 }
 
+/// Socket options applied before `connect` so buffer sizes take effect on the
+/// handshake. Defaults: `TCP_NODELAY` on, linger/buffers unset (OS default).
+#[derive(Clone, Debug)]
+pub struct TcpSocketConfig {
+    pub nodelay: bool,
+    /// `None` leaves OS linger. `Some(None)` disables linger. `Some(Some(d))`
+    /// sets `SO_LINGER`.
+    pub linger: Option<Option<Duration>>,
+    pub recv_buffer_size: Option<u32>,
+    pub send_buffer_size: Option<u32>,
+}
+
+impl Default for TcpSocketConfig {
+    fn default() -> Self {
+        Self {
+            nodelay: true,
+            linger: None,
+            recv_buffer_size: None,
+            send_buffer_size: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct TokioTcpConnector;
+pub struct TokioTcpConnector {
+    config: TcpSocketConfig,
+}
+
+impl TokioTcpConnector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_config(config: TcpSocketConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn nodelay(mut self, enabled: bool) -> Self {
+        self.config.nodelay = enabled;
+        self
+    }
+
+    pub fn linger(mut self, linger: Option<Duration>) -> Self {
+        self.config.linger = Some(linger);
+        self
+    }
+
+    pub fn recv_buffer_size(mut self, size: u32) -> Self {
+        self.config.recv_buffer_size = Some(size);
+        self
+    }
+
+    pub fn send_buffer_size(mut self, size: u32) -> Self {
+        self.config.send_buffer_size = Some(size);
+        self
+    }
+
+    pub fn config(&self) -> &TcpSocketConfig {
+        &self.config
+    }
+}
 
 impl TcpConnector for TokioTcpConnector {
     fn connect(
@@ -443,14 +502,45 @@ impl TcpConnector for TokioTcpConnector {
         addr: SocketAddr,
         timeout: Option<Duration>,
     ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        let config = self.config.clone();
         Box::pin(async move {
             ctx.listener().connect_start(&ctx, addr);
-            let connect = tokio::net::TcpStream::connect(addr);
+            let connect = async {
+                let socket = if addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()
+                } else {
+                    tokio::net::TcpSocket::new_v6()
+                }
+                .map_err(|error| WireError::tcp_connect("failed to create TCP socket", error))?;
+                socket.set_nodelay(config.nodelay).map_err(|error| {
+                    WireError::tcp_connect("failed to configure TCP_NODELAY", error)
+                })?;
+                if let Some(linger) = config.linger {
+                    // Opt-in: Tokio deprecates linger because drop can block,
+                    // but the knob is still required for callers who need it.
+                    #[allow(deprecated)]
+                    socket.set_linger(linger).map_err(|error| {
+                        WireError::tcp_connect("failed to configure SO_LINGER", error)
+                    })?;
+                }
+                if let Some(size) = config.recv_buffer_size {
+                    socket.set_recv_buffer_size(size).map_err(|error| {
+                        WireError::tcp_connect("failed to configure SO_RCVBUF", error)
+                    })?;
+                }
+                if let Some(size) = config.send_buffer_size {
+                    socket.set_send_buffer_size(size).map_err(|error| {
+                        WireError::tcp_connect("failed to configure SO_SNDBUF", error)
+                    })?;
+                }
+                socket
+                    .connect(addr)
+                    .await
+                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error))
+            };
             let stream = match timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, connect).await {
-                    Ok(result) => {
-                        result.map_err(|error| WireError::tcp_connect("TCP connect failed", error))
-                    }
+                    Ok(result) => result,
                     Err(error) => Err(WireError::with_source(
                         WireErrorKind::Timeout,
                         format!("connection timed out after {timeout:?}"),
@@ -459,9 +549,7 @@ impl TcpConnector for TokioTcpConnector {
                     .with_establishment(EstablishmentStage::Tcp, true)
                     .with_connect_timeout()),
                 },
-                None => connect
-                    .await
-                    .map_err(|error| WireError::tcp_connect("TCP connect failed", error)),
+                None => connect.await,
             };
             let stream = match stream {
                 Ok(stream) => stream,
@@ -470,13 +558,6 @@ impl TcpConnector for TokioTcpConnector {
                     return Err(error);
                 }
             };
-
-            stream
-                .set_nodelay(true)
-                .map_err(|error| WireError::tcp_connect("failed to configure TCP_NODELAY", error))
-                .inspect_err(|error| {
-                    ctx.listener().connect_failed(&ctx, addr, error);
-                })?;
 
             let info = ConnectionInfo {
                 id: next_connection_id(),
@@ -556,6 +637,20 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{TokioExecutor, TokioTimer};
+
+    #[test]
+    fn tcp_connector_builder_stores_socket_config() {
+        let connector = super::TokioTcpConnector::new()
+            .nodelay(false)
+            .linger(Some(Duration::from_secs(2)))
+            .recv_buffer_size(32_768)
+            .send_buffer_size(16_384);
+        let config = connector.config();
+        assert!(!config.nodelay);
+        assert_eq!(config.linger, Some(Some(Duration::from_secs(2))));
+        assert_eq!(config.recv_buffer_size, Some(32_768));
+        assert_eq!(config.send_buffer_size, Some(16_384));
+    }
 
     #[tokio::test]
     async fn tokio_executor_spawns_background_future() {

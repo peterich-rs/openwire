@@ -19,7 +19,7 @@ use super::{RedirectPolicyConfig, RetryPolicyConfig};
 use crate::auth::{
     build_auth_context, AuthAttemptState, AuthRequestState, AuthResponseState, SharedAuthenticator,
 };
-use crate::client::{CallOptions, EffectiveRequestConfig};
+use crate::client::{CallOptions, DispatcherQueued, EffectiveRequestConfig};
 use crate::connection::CachedAddresses;
 pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 use crate::proxy::SelectedProxy;
@@ -729,6 +729,7 @@ fn reset_network_attempt_extensions(
 ) {
     let _ = extensions.remove::<CachedAddresses>();
     let _ = extensions.remove::<SelectedProxy>();
+    let _ = extensions.remove::<DispatcherQueued>();
     if let Some(selected_proxy) = selected_proxy {
         extensions.insert(selected_proxy);
     }

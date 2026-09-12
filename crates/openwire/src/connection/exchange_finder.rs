@@ -136,20 +136,18 @@ impl ExchangeFinder {
                 self.resolve_addresses(request.uri(), request.extensions().get::<SelectedProxy>())?,
             )
         };
-        let outcome = addresses
-            .iter()
-            .enumerate()
-            .find_map(|(index, resolved)| {
-                self.pool.acquire(resolved.address()).map(|connection| {
-                    PreparedExchangeOutcome::PoolHit {
-                        address_index: index,
-                        connection,
-                    }
-                })
-            })
-            .unwrap_or(PreparedExchangeOutcome::PoolMiss);
+        // Resolve only. Pool checkout happens after request admission so an
+        // HTTP/1 connection cannot be pinned by a call that is still queued.
+        Ok(PreparedExchange {
+            addresses,
+            outcome: PreparedExchangeOutcome::PoolMiss,
+        })
+    }
 
-        Ok(PreparedExchange { addresses, outcome })
+    pub(crate) fn first_acquirable_index(&self, addresses: &[ResolvedAddress]) -> Option<usize> {
+        addresses
+            .iter()
+            .position(|resolved| self.pool.has_acquirable_connection(resolved.address()))
     }
 
     pub(crate) fn observe_connection(
@@ -280,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn exchange_finder_reports_pool_hit_before_new_connection_work() {
+    fn prepare_does_not_pin_idle_http1_connection() {
         let pool = Arc::new(crate::connection::ConnectionPool::new(
             PoolSettings::default(),
         ));
@@ -296,15 +294,43 @@ mod tests {
             .expect("request");
         let prepared = finder.prepare(&request).expect("prepared exchange");
 
-        match prepared.outcome() {
-            PreparedExchangeOutcome::PoolHit {
-                address_index: _,
-                connection: pooled,
-            } => {
-                assert_eq!(pooled.id(), connection.id());
-            }
-            PreparedExchangeOutcome::PoolMiss => panic!("expected pool hit"),
-        }
+        assert!(matches!(
+            prepared.outcome(),
+            PreparedExchangeOutcome::PoolMiss
+        ));
+        assert_eq!(
+            connection.snapshot().allocation,
+            ConnectionAllocationState::Idle
+        );
+        assert_eq!(finder.first_acquirable_index(prepared.addresses()), Some(0));
+        assert!(finder.pool().has_acquirable_connection(&make_address()));
+    }
+
+    #[test]
+    fn checkout_after_prepare_can_reuse_idle_http1_connection() {
+        let pool = Arc::new(crate::connection::ConnectionPool::new(
+            PoolSettings::default(),
+        ));
+        let connection = connection_for_pool();
+        assert!(connection.try_acquire());
+        assert!(connection.release());
+        pool.insert(connection.clone());
+        let finder = ExchangeFinder::new(pool, Arc::new(ProxyRules::new()));
+
+        let request = Request::builder()
+            .uri("http://example.com/resource")
+            .body(RequestBody::empty())
+            .expect("request");
+        let prepared = finder.prepare(&request).expect("prepared exchange");
+        let pooled = finder
+            .pool()
+            .acquire(prepared.addresses()[0].address())
+            .expect("idle connection should still be acquirable after prepare");
+        assert_eq!(pooled.id(), connection.id());
+        assert_eq!(
+            connection.snapshot().allocation,
+            ConnectionAllocationState::InUse { allocations: 1 }
+        );
     }
 
     #[test]
@@ -323,6 +349,17 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
         let prepared = finder.prepare(&request).expect("prepared exchange");
+        let reserved = finder
+            .pool()
+            .acquire(prepared.addresses()[0].address())
+            .expect("idle connection");
+        let prepared = PreparedExchange {
+            addresses: prepared.addresses().to_vec().into(),
+            outcome: PreparedExchangeOutcome::PoolHit {
+                address_index: 0,
+                connection: reserved,
+            },
+        };
 
         let observed = finder.observe_connection(
             &prepared,
@@ -459,10 +496,23 @@ mod tests {
         let prepared = finder.prepare(&request).expect("prepared exchange");
 
         assert_eq!(
-            prepared.pooled_address().expect("pooled address").address(),
+            prepared
+                .addresses()
+                .first()
+                .expect("cached address")
+                .address(),
             &cached_address
         );
-        assert_eq!(prepared.pool_connection_id(), Some(connection.id()));
+        assert!(matches!(
+            prepared.outcome(),
+            PreparedExchangeOutcome::PoolMiss
+        ));
+        assert_eq!(finder.first_acquirable_index(prepared.addresses()), Some(0));
+        let pooled = finder
+            .pool()
+            .acquire(&cached_address)
+            .expect("cached idle connection");
+        assert_eq!(pooled.id(), connection.id());
     }
 
     #[test]
