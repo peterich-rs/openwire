@@ -446,29 +446,42 @@ After the 101 headers are parsed, the transport branch:
 
 ### 4.8 Writer task and queue
 
-The writer task owns the engine's `BoxSink<EngineFrame>` and consumes from a
-`tokio::sync::mpsc::Sender<WriterCommand>` whose receiver is held by the task.
-`WriterCommand` is one of:
+The writer task owns the engine's `BoxSink<EngineFrame>` and consumes **two**
+bounded mpsc lanes. There is still only one writer task; HTTP sockets are not
+split.
 
-- `Send(Message)` — user data
+- **Data lane** (`queue_size`, default 32): user `Send(Message)` / `send_text` /
+  `send_binary`. Data backpressure suspends `send_*` when this lane is full.
+- **Control lane** (capacity 8): `Ping`, `Pong`, `Close`, `CloseAck`,
+  `PingTimeout`, `Cancel`. Reader auto-pong and close-ack go here. Heartbeat
+  pings go here. `WebSocketSender::close` and Drop-cancel go here, so a full
+  data queue cannot block control.
+
+The writer prefers control (`select` biased to the control receiver) but still
+drains data. The control lane is bounded so a ping flood cannot livelock the
+writer onto control-only work.
+
+`WriterCommand` is the control-lane type:
+
 - `Pong(Bytes)` — auto-reply to received `Ping`
 - `Ping(Bytes)` — heartbeat
 - `Close { code, reason }` — explicit close from user `close()`
 - `CloseAck { code, reason }` — automatic acknowledgement for a remote close
   (`code == 1005 && reason.is_empty()` means "ack with an empty close payload")
+- `PingTimeout` — heartbeat gave up waiting for pong
 - `Cancel` — abort without sending close
 
-The writer task processes commands FIFO. `WebSocketSender::send_*` validates
-outbound control messages and returns `Ok(())` once the message is enqueued
-(engine-level write is asynchronous).
-`queue_size()` returns the number of pending `WriterCommand`s in the mpsc.
-This is approximate parity with OkHttp's `WebSocket.queueSize()` (which
-reports buffered bytes); we surface message count rather than bytes because
-the mpsc is message-shaped, not byte-shaped, and the precise "send queue
-depth" semantics most users want from `queueSize()` is "how far behind am I"
-— a unit that message count answers more directly. Because the mpsc is
-bounded (per `send_queue_size`), `send_*` is `async fn`: it suspends when the
-queue is full, providing natural backpressure.
+`WebSocketSender::send_*` validates outbound control messages and returns
+`Ok(())` once the message is enqueued on the data lane (engine-level write is
+asynchronous). `queue_size()` returns the number of pending data-lane
+messages. This is approximate parity with OkHttp's `WebSocket.queueSize()`
+(which reports buffered bytes); we surface message count rather than bytes
+because the mpsc is message-shaped, not byte-shaped, and the precise "send
+queue depth" semantics most users want from `queueSize()` is "how far behind
+am I" — a unit that message count answers more directly. Because the data
+lane is bounded (per `send_queue_size`), `send_*` is `async fn`: it suspends
+when the data queue is full, providing natural backpressure. Close and
+auto-pong do not wait behind that queue.
 
 When the writer task observes a `Close` command, it sends the close frame,
 then waits up to `close_timeout` for the receiver task to surface a remote

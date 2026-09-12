@@ -41,6 +41,7 @@ cookie_store = { version = "0.21.1", default-features = false, features = ["publ
 publicsuffix = { version = "2.3.0", default-features = false, features = ["punycode"], optional = true }
 futures-channel.workspace = true
 futures-util = { workspace = true, features = ["io"] }
+hashbrown.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
@@ -50,7 +51,11 @@ openwire-core.workspace = true
 openwire-tokio.workspace = true
 getrandom = { workspace = true, optional = true }
 openwire-rustls = { workspace = true, optional = true }
+parking_lot.workspace = true
 pin-project-lite.workspace = true
+rustc-hash.workspace = true
+slab.workspace = true
+smallvec.workspace = true
 serde_json = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync"] }

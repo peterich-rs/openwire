@@ -4,12 +4,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
+use http::header::{HeaderName, HeaderValue};
 use http::{Request, Response};
 use hyper::client::conn::{http1, http2, TrySendError};
 use hyper::rt::Timer;
 use openwire_core::{
-    BoxConnection, BoxFuture, CallContext, Connection, ConnectionInfo, Exchange, HyperExecutor,
-    RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
+    BoxConnection, BoxFuture, CallContext, Connection, ConnectionId, ConnectionInfo, Exchange,
+    HyperExecutor, RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
 };
 use tower::Service;
 use tracing::instrument::WithSubscriber;
@@ -19,10 +20,11 @@ use crate::auth::AuthAttemptState;
 use crate::client::EffectiveRequestConfig;
 use crate::client::{
     attach_request_admission, cache_request_addresses, clear_proxy_authorization_if_proxy_changed,
+    DispatcherQueued,
 };
 use crate::connection::{
     Address, ConnectionAvailability, ConnectionLimiter, ConnectionPermit, ConnectionProtocol,
-    ExchangeFinder, RealConnection, ResolvedAddress, Route, RoutePlan,
+    ExchangeFinder, RealConnection, RequestPriority, ResolvedAddress, Route, RoutePlan,
 };
 use crate::proxy::{SelectedProxy, SharedProxySelector};
 use crate::trace::PolicyTraceContext;
@@ -262,14 +264,11 @@ impl TransportService {
             .unwrap_or_default();
 
         let call_span = attempt_span(&ctx, &request, attempt, policy_trace);
-        record_pool_lookup_trace(&call_span, &prepared);
         async move {
-            ctx.listener()
-                .pool_lookup(&ctx, prepared.pool_hit(), prepared.pool_connection_id());
             let selected = self
                 .acquire_connection(
                     &prepared,
-                    &request,
+                    &mut request,
                     ctx.clone(),
                     tracing::Span::current(),
                     AuthAttemptState {
@@ -312,48 +311,49 @@ impl TransportService {
     async fn acquire_connection(
         &self,
         prepared: &crate::connection::PreparedExchange,
-        request: &Request<RequestBody>,
+        request: &mut Request<RequestBody>,
         ctx: CallContext,
         span: tracing::Span,
         auth_attempts: AuthAttemptState,
     ) -> Result<SelectedConnection, WireError> {
         let mut last_error = None;
-        let pooled_address = prepared.pooled_address().cloned();
-        let mut exact_candidate = prepared.reserved_connection().cloned();
+        let mut lookup_emitted = false;
+        let preferred = self
+            .exchange_finder
+            .first_acquirable_index(prepared.addresses());
 
-        if let Some(candidate) = pooled_address.as_ref() {
-            match self
-                .acquire_connection_for_candidate(
-                    candidate,
-                    exact_candidate.take(),
-                    request,
-                    ctx.clone(),
-                    span.clone(),
-                    auth_attempts,
-                )
-                .await
-            {
-                Ok(selected) => return Ok(selected),
-                Err(error) => last_error = Some(error),
+        if let Some(index) = preferred {
+            if let Some(candidate) = prepared.addresses().get(index) {
+                match self
+                    .acquire_connection_for_candidate(
+                        candidate,
+                        request,
+                        ctx.clone(),
+                        span.clone(),
+                        auth_attempts,
+                        &mut lookup_emitted,
+                    )
+                    .await
+                {
+                    Ok(selected) => return Ok(selected),
+                    Err(error) => last_error = Some(error),
+                }
             }
         }
 
-        for candidate in prepared.addresses() {
-            if pooled_address
-                .as_ref()
-                .is_some_and(|pooled| pooled.address() == candidate.address())
-            {
+        for (index, candidate) in prepared.addresses().iter().enumerate() {
+            if preferred == Some(index) {
                 continue;
             }
 
             match self
                 .acquire_connection_for_candidate(
                     candidate,
-                    None,
                     request,
                     ctx.clone(),
                     span.clone(),
                     auth_attempts,
+                    &mut lookup_emitted,
                 )
                 .await
             {
@@ -370,35 +370,48 @@ impl TransportService {
     async fn acquire_connection_for_candidate(
         &self,
         candidate: &ResolvedAddress,
-        mut exact_candidate: Option<RealConnection>,
-        request: &Request<RequestBody>,
+        request: &mut Request<RequestBody>,
         ctx: CallContext,
         span: tracing::Span,
         auth_attempts: AuthAttemptState,
+        lookup_emitted: &mut bool,
     ) -> Result<SelectedConnection, WireError> {
         let address = candidate.address();
-        let mut request_permit = Some(self.request_admission.acquire(address.clone()).await?);
+        let priority = request
+            .extensions()
+            .get::<EffectiveRequestConfig>()
+            .map(|config| config.priority)
+            .unwrap_or_default();
+        let mut request_permit = Some(
+            self.request_admission
+                .acquire(address.clone(), priority)
+                .await?,
+        );
+        if request
+            .extensions_mut()
+            .remove::<DispatcherQueued>()
+            .is_some()
+        {
+            ctx.listener().dispatcher_queue_end(&ctx);
+        }
         let mut route_plan = None;
 
         loop {
-            let wait_for_availability = self.connection_availability.listen();
+            // Subscribe before pool / coalesced / capacity probes so a
+            // `notify_waiters` or HTTP/2 stream release that lands after a
+            // failed check is not lost. Await only after mutexes are released.
+            let wait = self.connection_availability.listen(address);
             let mut waitable_pooled_connection = false;
-            let mut pooled_in_use_hint = None;
 
-            let connection = match exact_candidate.take() {
-                Some(connection) => Some(connection),
-                None => {
-                    let (connection, has_in_use) = self
-                        .exchange_finder
-                        .pool()
-                        .acquire_with_in_use_hint(address);
-                    pooled_in_use_hint = connection.is_none().then_some(has_in_use);
-                    connection
-                }
-            };
+            let (connection, has_in_use) = self
+                .exchange_finder
+                .pool()
+                .acquire_with_in_use_hint(address);
+            let pooled_in_use_hint = connection.is_none().then_some(has_in_use);
             if let Some(connection) = connection {
                 match self.bindings.acquire(connection.id()) {
                     BindingAcquireResult::Acquired(binding) => {
+                        emit_pool_lookup(&ctx, &span, lookup_emitted, true, Some(connection.id()));
                         return Ok(SelectedConnection::new(SelectedConnectionInit {
                             address: address.clone(),
                             selected_proxy: candidate.selected_proxy().cloned(),
@@ -424,7 +437,7 @@ impl TransportService {
                             &self.connection_tasks,
                             connection.id(),
                         );
-                        self.connection_availability.notify();
+                        self.connection_availability.notify(address);
                     }
                 }
             }
@@ -435,6 +448,7 @@ impl TransportService {
             }
 
             if route_plan.is_none() {
+                emit_pool_lookup(&ctx, &span, lookup_emitted, false, None);
                 match self.connector.route_plan(ctx.clone(), address).await {
                     Ok(plan) => route_plan = Some(plan),
                     Err(error)
@@ -450,7 +464,7 @@ impl TransportService {
                             error_message = %error.message(),
                             "DNS failure suppressed; waiting for in-use pooled connection",
                         );
-                        wait_for_availability.await;
+                        wait.await;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -462,12 +476,14 @@ impl TransportService {
             if let Some(selected) =
                 self.try_acquire_coalesced(candidate, route_plan_ref, request, &mut request_permit)
             {
+                // Exact-address lookup already reported a miss; coalescing is a
+                // later reuse of a different address's HTTP/2 connection.
                 return Ok(selected);
             }
 
             let Some(connection_permit) = self.connection_limiter.try_acquire(address.clone())
             else {
-                wait_for_availability.await;
+                wait.await;
                 continue;
             };
 
@@ -533,7 +549,7 @@ impl TransportService {
                 let (sender, task) = with_connect_stage_timeout(
                     self.timer.clone(),
                     connect_timeout,
-                    bind_http1(stream),
+                    bind_http1(stream, &self.config),
                 )
                 .await?;
                 self.bindings.insert_http1(info.id, info, sender);
@@ -557,7 +573,8 @@ impl TransportService {
                         &self.connection_tasks,
                         connection.id(),
                     );
-                    self.connection_availability.notify();
+                    self.connection_availability
+                        .notify(args.candidate.address());
                     return Err(error);
                 }
                 self.start_pool_reaper_if_needed();
@@ -596,7 +613,8 @@ impl TransportService {
                         &self.connection_tasks,
                         connection.id(),
                     );
-                    self.connection_availability.notify();
+                    self.connection_availability
+                        .notify(args.candidate.address());
                     return Err(error);
                 }
                 self.start_pool_reaper_if_needed();
@@ -664,7 +682,7 @@ impl TransportService {
                     &self.connection_tasks,
                     connection.id(),
                 );
-                self.connection_availability.notify();
+                self.connection_availability.notify(candidate.address());
             }
         }
 
@@ -684,6 +702,7 @@ impl TransportService {
         span: tracing::Span,
     ) -> Result<(), WireError> {
         let connection_id = connection.id();
+        let address = connection.address().clone();
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
         let availability = self.connection_availability.clone();
@@ -694,7 +713,7 @@ impl TransportService {
                 bindings.remove(connection_id);
                 let _ = pool.remove_without_hook(connection_id);
                 ConnectionTaskRegistry::complete_connection_weak(&registry, connection_id);
-                availability.notify();
+                availability.notify(&address);
                 if let Err(error) = result {
                     tracing::debug!(
                         connection_id = connection_id.as_u64(),
@@ -725,6 +744,7 @@ impl TransportService {
         span: tracing::Span,
     ) -> Result<(), WireError> {
         let connection_id = connection.id();
+        let address = connection.address().clone();
         let bindings = self.bindings.clone();
         let pool = self.exchange_finder.pool().clone();
         let availability = self.connection_availability.clone();
@@ -735,7 +755,7 @@ impl TransportService {
                 bindings.remove(connection_id);
                 let _ = pool.remove_without_hook(connection_id);
                 ConnectionTaskRegistry::complete_connection_weak(&registry, connection_id);
-                availability.notify();
+                availability.notify(&address);
                 if let Err(error) = result {
                     tracing::debug!(
                         connection_id = connection_id.as_u64(),
@@ -806,11 +826,22 @@ fn attempt_span(
     )
 }
 
-fn record_pool_lookup_trace(span: &tracing::Span, prepared: &crate::connection::PreparedExchange) {
-    span.record("pool_hit", prepared.pool_hit());
-    if let Some(connection_id) = prepared.pool_connection_id() {
+fn emit_pool_lookup(
+    ctx: &CallContext,
+    span: &tracing::Span,
+    emitted: &mut bool,
+    hit: bool,
+    connection_id: Option<ConnectionId>,
+) {
+    if *emitted {
+        return;
+    }
+    *emitted = true;
+    span.record("pool_hit", hit);
+    if let Some(connection_id) = connection_id {
         span.record("pool_connection_id", connection_id.as_u64());
     }
+    ctx.listener().pool_lookup(ctx, hit, connection_id);
 }
 
 async fn send_bound_request(
@@ -993,7 +1024,25 @@ pub(super) fn prepare_request_for_send(
 ) -> Result<Request<RequestBody>, WireError> {
     clear_proxy_authorization_if_proxy_changed(&mut request, selected_proxy);
     apply_forward_proxy_credentials(&mut request, route_kind)?;
+    apply_rfc9218_priority(&mut request);
     prepare_bound_request(request, protocol, route_kind)
+}
+
+fn apply_rfc9218_priority(request: &mut Request<RequestBody>) {
+    if request.headers().contains_key("priority") {
+        return;
+    }
+    let urgency = request
+        .extensions()
+        .get::<EffectiveRequestConfig>()
+        .map(|config| config.priority.urgency())
+        .unwrap_or_else(|| RequestPriority::DEFAULT.urgency());
+    let Ok(value) = HeaderValue::from_str(&format!("u={urgency}")) else {
+        return;
+    };
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static("priority"), value);
 }
 
 fn apply_forward_proxy_credentials(
@@ -1038,13 +1087,17 @@ fn cleanup_failed_request(
     match connection.protocol() {
         ConnectionProtocol::Http1 => {
             teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
+            availability.notify(connection.address());
         }
         ConnectionProtocol::Http2 => {
             connection.mark_unhealthy();
             let _ = exchange_finder.release(connection);
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
         }
     }
-    availability.notify();
     ctx.listener().connection_released(ctx, connection.id());
 }
 

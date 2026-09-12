@@ -16,7 +16,8 @@ blocks, and stable observability hooks.
 - `Client`, `ClientBuilder`, and single-execution `Call` over `http::Request<RequestBody>`
 - OkHttp-style `Call` handles for cancellation, execution state, replayable
   cloning, and executor-backed queued calls
-- request-scoped timeout, retry, and redirect overrides through `Call`
+- request-scoped timeout, retry, redirect, and RFC 9218 urgency (`0`–`7`)
+  overrides through `Call` (`Call::priority` / `Call::urgency`)
 - application and network interceptors
 - built-in `LoggerInterceptor` with `LogLevel::{Basic, Headers, Body}`
 - event listeners and stable request / connection observability
@@ -39,9 +40,9 @@ blocks, and stable observability hooks.
 - HTTP forward proxy, HTTPS CONNECT proxy, and SOCKS5 proxy support,
   including `http://user:pass@host:port` / `socks5://user:pass@host:port`
   credentials on the initial attempt and proxy-endpoint fast fallback
-- bounded connection defaults (`max_connections_total=256`,
-  `max_connections_per_host=8`, HTTP/2 local stream budget `100`, pool
-  max lifetime `600s`)
+- client-wide resource defaults (`max_requests_total=64`,
+  `max_connections_total=256`; per-host request/connection caps are unlimited
+  unless set). HTTP/2 local stream budget `100`, pool max lifetime `600s`
 - dynamic per-request proxy selection via `ProxySelector`, including ordered
   proxy candidate fallback and `DIRECT`, with `ProxyRules` as the built-in
   rule-based implementation
@@ -163,7 +164,9 @@ assert_eq!(error.kind(), openwire::WireErrorKind::Canceled);
 ```
 
 For OkHttp-style asynchronous dispatch through the client's configured
-executor, queue the call and await the returned handle:
+executor, queue the call and await the returned handle. `dispatcher_queue_start`
+fires at enqueue time; `dispatcher_queue_end` fires after interceptors, when
+the request scheduler admits the call:
 
 ```rust
 let queued = client.new_call(request).enqueue()?;

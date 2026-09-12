@@ -74,8 +74,9 @@ flowchart TD
     F --> G[BridgeInterceptor]
     G --> H[Network Interceptors]
     H --> I[TransportService]
-    I --> J[ExchangeFinder prepare]
-    J --> K[Reusable connection or fresh connection permit]
+    I --> J[ExchangeFinder prepare: resolve Address list]
+    J --> JA[Request scheduler: priority lanes + dual limits]
+    JA --> K[Pool checkout or fresh connection permit]
     K --> L[ConnectorStack]
     L --> M[RoutePlanner -> DNS -> TCP -> TLS]
     M --> N[hyper::client::conn HTTP/1.1 or HTTP/2 binding]
@@ -93,10 +94,39 @@ replayable `421` request on a non-coalesced connection before redirect handling.
 
 `Call::execute()` and `Call::enqueue()` both enter this same chain. Queued calls
 only move dispatch onto the client's configured `WireExecutor`; they do not get
-a separate transport path. `CallHandle::cancel()` races against the in-flight
-execution at the `Client::execute` boundary, and the response body wrapper keeps
-observing cancellation after response headers have been returned so `call_failed`
-still reflects body-phase cancellation.
+a separate transport path. There is no host-aware dispatcher at `Call::enqueue`
+because `Address` is unknown until after interceptors. Transport resolves
+candidate `Address` values first, then waits for the request scheduler, and only
+then checks out a pooled connection. Waiting for a request slot must not pin an
+HTTP/1 allocation. `pool_lookup` is emitted after that admission wait, when the
+exchange either reuses a pooled connection or decides to dial.
+
+Admission is a client-wide `RequestScheduler`. Waiters from every `Address`
+share one ordered set keyed by RFC 9218 urgency (`0` highest … `7` lowest,
+default `3`) then enqueue sequence. Per-`Address` caps only skip a waiter
+whose host is already at `max_requests_per_host` (optional origin protection;
+default unlimited). They do not give each host its own resource budget. Client
+sockets and in-flight calls are capped by `max_connections_total` and
+`max_requests_total`. So a `u=0` API call can beat a queued `u=7` telemetry
+call on a different host when a client slot frees. `Interactive` / `Normal` /
+`Bulk` are aliases for `0` / `3` / `7`. Same urgency is FIFO. Aging promotes
+the oldest eligible waiter after 8 high-urgency (`0..=2`) promotions, or
+~250ms wait. Spare global capacity still lets different hosts run in parallel
+when nobody higher-priority is waiting. A freed slot wakes exactly one
+promoted waiter. `Call::priority` / `Call::urgency` control both local
+admission and, unless the caller already set `Priority`, the outgoing RFC 9218
+`Priority: u=N` header. They do not implement HTTP/2 frame PRIORITY. Cache
+hits never consume scheduler slots because the scheduler lives in transport.
+Scheduler permits are not held across redirects: follow-up drains the
+intermediate body, then the next network attempt re-acquires. The permit that
+covers the caller-visible response is held until that body is dropped.
+
+`Call::enqueue` emits `dispatcher_queue_start` at enqueue time and inserts a
+marker so transport can emit `dispatcher_queue_end` after successful scheduler
+acquire. Direct `execute()` emits no dispatcher events. `CallHandle::cancel()`
+races against the in-flight execution at the `Client::execute` boundary, and
+the response body wrapper keeps observing cancellation after response headers
+have been returned so `call_failed` still reflects body-phase cancellation.
 
 `Call::try_clone()` is a request-template operation, not a transport shortcut.
 It creates a fresh unexecuted call only when the request body is replayable, and
@@ -193,7 +223,7 @@ Typical `EventListener` nesting (OkHttp-aligned). OpenWire extras are marked wit
 
 ```
 call_start / call_end / call_failed / canceled
-  dispatcher_queue_start / dispatcher_queue_end   (Call::enqueue only)
+  dispatcher_queue_start / dispatcher_queue_end   (enqueue only; end means admitted)
   proxy_select_start / proxy_select_end
   dns_start / dns_end / dns_failed*
   connect_start / connect_end / connect_failed
@@ -208,7 +238,7 @@ call_start / call_end / call_failed / canceled
   cache_hit / cache_miss / cache_conditional_hit / satisfaction_failure
 ```
 
-`EventListenerFactory::create` runs when `Client::new_call` (or `Call::try_clone`) builds the `Call`, not at execute time. Direct `execute()` does not emit dispatcher events.
+`EventListenerFactory::create` runs when `Client::new_call` (or `Call::try_clone`) builds the `Call`, not at execute time. Direct `execute()` does not emit dispatcher events. For `Call::enqueue`, `dispatcher_queue_end` means the scheduler admitted the call, not that the executor task started.
 
 ## 5b. Cargo features
 
@@ -300,10 +330,16 @@ follow-ups (pool reuse, interceptor chain integration).
   redirect response is returned to the caller.
 - The default `Jar` cookie store loads an embedded public suffix list so
   `Domain=.com`-style cookies are rejected (RFC 6265 §5.3) and honors `Secure`.
-- Connection pool defaults include idle timeout, max idle per host, absolute max
-  lifetime, global/per-host connection caps, and a local HTTP/2 concurrent-stream
-  budget. Dual-stack route planning prefers starting with IPv6 when both families
-  are present (staggered dial, not full Happy Eyeballs v2).
+- Client resource caps (`max_requests_total`, `max_connections_total`) are
+  independent of HTTP protocol rules. HTTP/1 remains one exchange per
+  connection (exclusive `SendRequest` checkout; overlapping calls to the same
+  host open additional connections rather than pipelining). HTTP/2 multiplexes
+  on a reused connection up to the local stream budget and peer SETTINGS.
+  Optional per-host caps default to unlimited and only constrain origin
+  stampede, not those protocol gates. Pool defaults still include idle timeout,
+  max idle per address (eviction hygiene), absolute max lifetime, and the HTTP/2
+  stream budget. Dual-stack route planning prefers starting with IPv6 when both
+  families are present (staggered dial, not full Happy Eyeballs v2).
 - Request validation rejects non-HTTP(S) schemes, missing authorities or hosts,
   and HTTP URI authorities that include userinfo before bridge normalization can
   derive `Host` or transport can route the request.
@@ -332,12 +368,15 @@ follow-ups (pool reuse, interceptor chain integration).
 - `Client::execute` owns call cancellation, final call completion, and wraps the
   returned response body so `call_end` / `call_failed` reflect the whole call.
 - `Call::enqueue` is executor-backed dispatch for the same `Call::execute`
-  behavior, not a separate policy or transport implementation.
+  behavior, not a separate policy or transport implementation. The scheduler
+  seam is after interceptors, inside `TransportService`.
 - `ResponseLease` and `ObservedIncomingBody` own final release bookkeeping.
 - HTTP/1.1 reuse is single-exchange and response-body-lifecycle-driven.
 - HTTP/2 multiplexing is governed by connection health, allocation tracking,
   a local concurrent-stream budget (default 100), and bound-sender readiness.
-- `hyper` owns protocol engines; OpenWire owns client semantics.
+- `hyper` owns protocol engines and HTTP I/O; OpenWire owns client semantics,
+  admission, pooling, and connection wait. OpenWire does not pipeline HTTP/1,
+  split HTTP sockets, or implement HTTP/2 frame PRIORITY.
 
 ## 7. Verification Strategy
 
@@ -377,9 +416,30 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 
 ## Performance notes
 
-- The connection pool is sharded by address hash (`32` shards) so concurrent
-  acquire/release for different hosts does not serialize on one global mutex.
+- The connection pool, request-scheduler per-address index, connection-wait
+  index, and connection-limiter maps are sharded by address (`32` shards) so
+  independent hosts do not share a mutex. Address keys keep SipHash;
+  `ConnectionId` and coalescing `SocketAddr` maps use FxHash. Per-address
+  connection lists are `SmallVec`. Short critical sections use `parking_lot`.
   HTTP/2 coalescing still uses a shared index keyed by direct route target.
+- Connection wait is per-`Address` with `Notify::notify_one` for HTTP/1 busy
+  and same-host reuse. A waiter for host A does not complete when only host B
+  is notified. A freed **global** connection slot uses `notify_waiters` so a
+  host that can actually use the total cap is not starved by a host still at
+  its per-address cap. `listen` constructs the `Notified` futures before the
+  caller probes capacity, so a `notify_waiters` that lands after `try_acquire`
+  fails is not lost. HTTP/2 stream release also `notify_one`s currently
+  listening authorities that can coalesce onto that connection (verified
+  server names, same port, direct HTTPS); the socket staying open means the
+  global channel would not run. Notification storage is inserted only by
+  `listen` and reclaimed when the last waiter for that address drops, so
+  sequential destinations do not retain an entry per historical host. The
+  wait future is created after pool/binding mutexes are released.
+- HTTP/2 `TransportConfig` knobs (window sizes, frame/header limits, keep-alive
+  timeout, reset-stream cap) and HTTP/1 `writev` / `title_case_headers` are
+  applied in `bind_http1` / `bind_http2`. TCP linger and buffer sizes are
+  optional on `TokioTcpConnector` and are set on `TcpSocket` before connect.
+  Defaults keep nodelay on and leave buffers/linger to the OS.
 - Dual-stack route plans share a single `Arc<Address>` across candidate routes
   instead of cloning the full address key per IP.
 - Follow-up `RequestSnapshot` stores headers and extensions behind `Arc` so
@@ -394,4 +454,20 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
   all disabled, so the common single-shot path skips header/extension cloning.
 - Request admission permits are held via response extensions into the call
   lifecycle body, avoiding an extra `BoxBody` layer on the returned response.
+- Pool checkout is a post-admission step. `ExchangeFinder::prepare` only
+  resolves addresses; an idle HTTP/1 connection is not reserved while the call
+  is still waiting for a request slot. A non-acquiring `has_acquirable_connection`
+  hint may reorder candidates so a host with an idle connection is tried first.
+- Request admission waiters sit in one client-wide ordered set: RFC 9218
+  urgency then FIFO seq, across hosts. Per-address caps are eligibility
+  filters, not separate queues. A freed slot wakes the next promoted waiter,
+  not every waiter. Client resource caps are `max_requests_total` and
+  `max_connections_total`. Optional per-address caps default to unlimited.
+  When a per-address cap is set, waiting on one host still does not consume a
+  client-wide request slot. Queue precedence ignores waiters that cannot run
+  because their per-address cap is full, so a different host with spare
+  global and per-host capacity is not rejected with `Capacity` while the
+  queue holds only ineligible waiters. `max_queued_requests` fails
+  with `WireErrorKind::Capacity` before taking a running slot. Dropping a
+  queued or already-promoted acquire future must not leak running counts.
 

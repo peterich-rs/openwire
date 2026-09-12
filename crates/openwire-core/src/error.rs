@@ -21,6 +21,7 @@ pub enum WireErrorKind {
     Redirect,
     Body,
     Interceptor,
+    Capacity,
     Internal,
 }
 
@@ -37,6 +38,7 @@ impl fmt::Display for WireErrorKind {
             Self::Redirect => "redirect",
             Self::Body => "body",
             Self::Interceptor => "interceptor",
+            Self::Capacity => "capacity",
             Self::Internal => "internal",
         };
 
@@ -353,6 +355,10 @@ impl WireError {
         Self::with_source(WireErrorKind::Interceptor, message, source)
     }
 
+    pub fn capacity(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(WireErrorKind::Capacity, message)
+    }
+
     pub fn internal<E>(message: impl Into<Cow<'static, str>>, source: E) -> Self
     where
         E: StdError + Send + Sync + 'static,
@@ -452,6 +458,7 @@ fn default_phase(kind: WireErrorKind) -> FailurePhase {
         WireErrorKind::Redirect => FailurePhase::Policy,
         WireErrorKind::Body => FailurePhase::ResponseBody,
         WireErrorKind::Interceptor => FailurePhase::Interceptor,
+        WireErrorKind::Capacity => FailurePhase::Admission,
         WireErrorKind::Internal => FailurePhase::Internal,
     }
 }
@@ -505,5 +512,13 @@ mod tests {
         assert_eq!(error.phase(), FailurePhase::ResponseBody);
         assert!(error.request_committed());
         assert_eq!(error.response_status(), Some(StatusCode::OK));
+    }
+
+    #[test]
+    fn capacity_errors_map_to_admission_phase() {
+        let error = WireError::capacity("request queue is full");
+        assert_eq!(error.kind(), super::WireErrorKind::Capacity);
+        assert_eq!(error.phase(), FailurePhase::Admission);
+        assert_eq!(error.to_string(), "capacity: request queue is full");
     }
 }

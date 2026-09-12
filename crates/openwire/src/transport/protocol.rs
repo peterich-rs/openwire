@@ -13,6 +13,7 @@ use crate::connection::{Address, ConnectionProtocol, RouteKind, UriScheme};
 
 pub(super) async fn bind_http1(
     stream: BoxConnection,
+    config: &crate::client::TransportConfig,
 ) -> Result<
     (
         http1::SendRequest<RequestBody>,
@@ -20,7 +21,14 @@ pub(super) async fn bind_http1(
     ),
     WireError,
 > {
-    http1::Builder::new()
+    let mut builder = http1::Builder::new();
+    if let Some(writev) = config.http1_writev {
+        builder.writev(writev);
+    }
+    if config.http1_title_case_headers {
+        builder.title_case_headers(true);
+    }
+    builder
         .handshake(stream)
         .await
         .map_err(|error| WireError::protocol_binding("HTTP/1.1 client handshake failed", error))
@@ -43,6 +51,33 @@ pub(super) async fn bind_http2(
     if let Some(interval) = config.http2_keep_alive_interval {
         builder.keep_alive_interval(interval);
         builder.keep_alive_while_idle(config.http2_keep_alive_while_idle);
+    }
+    if let Some(timeout) = config.http2_keep_alive_timeout {
+        builder.keep_alive_timeout(timeout);
+    }
+    if let Some(size) = config.http2_initial_stream_window_size {
+        builder.initial_stream_window_size(size);
+    }
+    if let Some(size) = config.http2_initial_connection_window_size {
+        builder.initial_connection_window_size(size);
+    }
+    if let Some(enabled) = config.http2_adaptive_window {
+        builder.adaptive_window(enabled);
+    }
+    if let Some(size) = config.http2_max_frame_size {
+        builder.max_frame_size(size);
+    }
+    if let Some(size) = config.http2_max_header_list_size {
+        builder.max_header_list_size(size);
+    }
+    if let Some(size) = config.http2_max_send_buf_size {
+        builder.max_send_buf_size(size);
+    }
+    if let Some(size) = config.http2_header_table_size {
+        builder.header_table_size(size);
+    }
+    if let Some(max) = config.http2_max_concurrent_reset_streams {
+        builder.max_concurrent_reset_streams(max);
     }
     builder
         .handshake(stream)

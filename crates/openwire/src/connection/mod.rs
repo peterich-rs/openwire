@@ -6,6 +6,12 @@ mod limits;
 mod planning;
 mod pool;
 mod real_connection;
+mod scheduler;
+
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 pub(crate) use exchange_finder::{
     CachedAddresses, ExchangeFinder, ObservedConnection, PreparedExchange, PreparedExchangeOutcome,
@@ -33,3 +39,53 @@ pub(crate) use real_connection::{
     ConnectionAllocationState, ConnectionHealth, ConnectionProtocol, RealConnection,
     RealConnectionSnapshot, DEFAULT_HTTP2_MAX_LOCAL_STREAMS,
 };
+pub use scheduler::RequestPriority;
+
+/// Number of address-keyed shards for the pool, limiter, and connection-wait
+/// indexes. Independent hosts should not share a mutex. The request scheduler
+/// is client-wide so priority can rank waiters across addresses.
+pub(crate) const ADDRESS_SHARDS: usize = 32;
+
+pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
+pub(crate) type SipHashMap<K, V> =
+    hashbrown::HashMap<K, V, std::collections::hash_map::RandomState>;
+
+pub(crate) fn fx_hash_map<K, V>() -> FxHashMap<K, V> {
+    hashbrown::HashMap::with_hasher(FxBuildHasher)
+}
+
+pub(crate) fn sip_hash_map<K, V>() -> SipHashMap<K, V> {
+    hashbrown::HashMap::with_hasher(std::collections::hash_map::RandomState::new())
+}
+
+/// Cheap address hash folded with a process-local seed. Address-keyed maps
+/// still use SipHash; this is only the shard selector.
+pub(crate) fn address_shard(address: &Address) -> usize {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    let seed = *SEED.get_or_init(|| {
+        let addr = std::ptr::from_ref(&SEED) as u64;
+        addr ^ 0x9E3779B97F4A7C15
+    });
+    let mut hasher = FxHasher::default();
+    hasher.write_u64(seed);
+    address.hash(&mut hasher);
+    (hasher.finish() as usize) % ADDRESS_SHARDS
+}
+
+/// RFC 6125-style DNS-ID match used by HTTP/2 coalescing: exact host or a
+/// single-label `*.suffix` wildcard. Shared by the pool index and connection
+/// wait so a freed HTTP/2 stream can wake coalescable authorities.
+pub(crate) fn verified_server_name_matches(pattern: &str, host: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
+
+    !prefix.is_empty() && prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+}

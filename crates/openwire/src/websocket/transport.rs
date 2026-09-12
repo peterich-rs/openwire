@@ -155,7 +155,7 @@ pub(crate) async fn execute(call: WebSocketCall<'_>) -> Result<WebSocket, WebSoc
             listener: Some(ctx.listener().clone()),
         },
     );
-    let sender = WebSocketSender::new(session.sender_tx);
+    let sender = WebSocketSender::new(session.control_tx, session.data_tx, session.shutdown);
     let receiver = WebSocketReceiver {
         rx: session.receiver_rx,
     };

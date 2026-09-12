@@ -1,17 +1,20 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use hyper::client::conn::{http1, http2};
 use openwire_core::{BoxTaskHandle, ConnectionId, ConnectionInfo, RequestBody};
+use parking_lot::Mutex;
 
-use crate::connection::{ConnectionAvailability, ExchangeFinder, RealConnection};
+use crate::connection::{
+    fx_hash_map, ConnectionAvailability, ExchangeFinder, FxHashMap, RealConnection,
+};
 use crate::sync_util::lock_mutex;
 
 const CONNECTION_BINDING_SHARDS: usize = 32;
 
 #[derive(Clone)]
 pub(super) struct ConnectionBindings {
-    shards: Arc<[Mutex<HashMap<ConnectionId, ConnectionBinding>>]>,
+    shards: Arc<[Mutex<FxHashMap<ConnectionId, ConnectionBinding>>]>,
 }
 
 enum ConnectionBinding {
@@ -50,7 +53,7 @@ impl ConnectionBindings {
     fn shard(
         &self,
         connection_id: ConnectionId,
-    ) -> &Mutex<HashMap<ConnectionId, ConnectionBinding>> {
+    ) -> &Mutex<FxHashMap<ConnectionId, ConnectionBinding>> {
         &self.shards[(connection_id.as_u64() as usize) % self.shards.len()]
     }
 
@@ -60,7 +63,7 @@ impl ConnectionBindings {
         info: ConnectionInfo,
         sender: http1::SendRequest<RequestBody>,
     ) {
-        lock_mutex(self.shard(connection_id)).insert(
+        self.shard(connection_id).lock().insert(
             connection_id,
             ConnectionBinding::Http1(Http1Binding {
                 info,
@@ -75,17 +78,20 @@ impl ConnectionBindings {
         info: ConnectionInfo,
         sender: http2::SendRequest<RequestBody>,
     ) {
-        lock_mutex(self.shard(connection_id)).insert(
+        self.shard(connection_id).lock().insert(
             connection_id,
             ConnectionBinding::Http2(Http2Binding { info, sender }),
         );
     }
 
     pub(super) fn acquire(&self, connection_id: ConnectionId) -> BindingAcquireResult {
-        let mut bindings = lock_mutex(self.shard(connection_id));
+        let mut bindings = self.shard(connection_id).lock();
         let mut remove_stale = false;
         let acquired = match bindings.get_mut(&connection_id) {
             Some(ConnectionBinding::Http1(binding)) => {
+                // Exclusive checkout: a second HTTP/1 exchange must wait or
+                // open another connection. This is the protocol lock, not a
+                // per-host quota.
                 let Some(sender) = binding.sender.take() else {
                     return BindingAcquireResult::Busy;
                 };
@@ -128,7 +134,7 @@ impl ConnectionBindings {
             return false;
         }
 
-        let mut bindings = lock_mutex(self.shard(connection_id));
+        let mut bindings = self.shard(connection_id).lock();
         let Some(ConnectionBinding::Http1(binding)) = bindings.get_mut(&connection_id) else {
             return false;
         };
@@ -141,17 +147,17 @@ impl ConnectionBindings {
     }
 
     pub(super) fn remove(&self, connection_id: ConnectionId) {
-        lock_mutex(self.shard(connection_id)).remove(&connection_id);
+        self.shard(connection_id).lock().remove(&connection_id);
     }
 }
 
 impl Default for ConnectionBindings {
     fn default() -> Self {
         let shards = (0..CONNECTION_BINDING_SHARDS)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| Mutex::new(fx_hash_map()))
             .collect::<Vec<_>>();
         Self {
-            shards: Arc::<[Mutex<HashMap<ConnectionId, ConnectionBinding>>]>::from(shards),
+            shards: Arc::<[Mutex<FxHashMap<ConnectionId, ConnectionBinding>>]>::from(shards),
         }
     }
 }
@@ -163,7 +169,7 @@ pub(super) struct ConnectionTaskRegistry {
 
 #[derive(Default)]
 pub(super) struct ConnectionTaskRegistryInner {
-    handles_by_connection: Mutex<HashMap<ConnectionId, Option<BoxTaskHandle>>>,
+    handles_by_connection: StdMutex<HashMap<ConnectionId, Option<BoxTaskHandle>>>,
 }
 
 impl ConnectionTaskRegistry {
@@ -238,19 +244,25 @@ pub(super) fn release_acquired_connection(
             if bindings.release_http1(connection.id(), sender)
                 && exchange_finder.release(&connection)
             {
-                availability.notify();
+                availability.notify(connection.address());
                 return;
             }
             teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
-            availability.notify();
+            availability.notify(connection.address());
         }
         AcquiredBinding::Http2 { .. } => {
             if exchange_finder.release(&connection) {
-                availability.notify();
+                availability.notify_http2(
+                    connection.address(),
+                    &connection.coalescing().verified_server_names,
+                );
                 return;
             }
             teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
-            availability.notify();
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
         }
     }
 }
