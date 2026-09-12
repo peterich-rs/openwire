@@ -71,3 +71,21 @@ pub(crate) fn address_shard(address: &Address) -> usize {
     address.hash(&mut hasher);
     (hasher.finish() as usize) % ADDRESS_SHARDS
 }
+
+/// RFC 6125-style DNS-ID match used by HTTP/2 coalescing: exact host or a
+/// single-label `*.suffix` wildcard. Shared by the pool index and connection
+/// wait so a freed HTTP/2 stream can wake coalescable authorities.
+pub(crate) fn verified_server_name_matches(pattern: &str, host: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
+
+    !prefix.is_empty() && prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+}

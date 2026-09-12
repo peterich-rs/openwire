@@ -544,7 +544,7 @@ fn can_coalesce(connection: &RealConnection, request: &Address, route_plan: &Rou
         .coalescing()
         .verified_server_names
         .iter()
-        .any(|name| verified_server_name_matches(name, request.authority().host()));
+        .any(|name| super::verified_server_name_matches(name, request.authority().host()));
     if !host_matches {
         return false;
     }
@@ -577,21 +577,6 @@ fn route_overlap(connection_route: &Route, route_plan: &RoutePlan) -> bool {
             RouteKind::Direct { target } if target == existing_target
         )
     })
-}
-
-fn verified_server_name_matches(pattern: &str, host: &str) -> bool {
-    if pattern == host {
-        return true;
-    }
-
-    let Some(suffix) = pattern.strip_prefix("*.") else {
-        return false;
-    };
-    let Some(prefix) = host.strip_suffix(suffix) else {
-        return false;
-    };
-
-    !prefix.is_empty() && prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
 }
 
 fn enforce_max_idle_connections(

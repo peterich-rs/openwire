@@ -426,8 +426,15 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
   and same-host reuse. A waiter for host A does not complete when only host B
   is notified. A freed **global** connection slot uses `notify_waiters` so a
   host that can actually use the total cap is not starved by a host still at
-  its per-address cap. The wait future is created after pool/binding mutexes
-  are released.
+  its per-address cap. `listen` constructs the `Notified` futures before the
+  caller probes capacity, so a `notify_waiters` that lands after `try_acquire`
+  fails is not lost. HTTP/2 stream release also `notify_one`s currently
+  listening authorities that can coalesce onto that connection (verified
+  server names, same port, direct HTTPS); the socket staying open means the
+  global channel would not run. Notification storage is inserted only by
+  `listen` and reclaimed when the last waiter for that address drops, so
+  sequential destinations do not retain an entry per historical host. The
+  wait future is created after pool/binding mutexes are released.
 - HTTP/2 `TransportConfig` knobs (window sizes, frame/header limits, keep-alive
   timeout, reset-stream cap) and HTTP/1 `writev` / `title_case_headers` are
   applied in `bind_http1` / `bind_http2`. TCP linger and buffer sizes are
@@ -457,7 +464,10 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
   not every waiter. Client resource caps are `max_requests_total` and
   `max_connections_total`. Optional per-address caps default to unlimited.
   When a per-address cap is set, waiting on one host still does not consume a
-  client-wide request slot. `max_queued_requests` fails
+  client-wide request slot. Queue precedence ignores waiters that cannot run
+  because their per-address cap is full, so a different host with spare
+  global and per-host capacity is not rejected with `Capacity` while the
+  queue holds only ineligible waiters. `max_queued_requests` fails
   with `WireErrorKind::Capacity` before taking a running slot. Dropping a
   queued or already-promoted acquire future must not leak running counts.
 

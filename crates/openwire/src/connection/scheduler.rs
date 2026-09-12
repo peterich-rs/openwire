@@ -234,11 +234,7 @@ impl RequestScheduler {
 
         let can_run = self.has_global_capacity(global.global_running)
             && self.has_address_capacity(global.address_running(address));
-        let blocked_by_queue = global
-            .ordered
-            .iter()
-            .next()
-            .is_some_and(|(urgency, _, _)| *urgency <= priority.urgency());
+        let blocked_by_queue = queue_blocks_priority(&global, priority, self.max_per_address);
 
         if can_run && !blocked_by_queue {
             global.bump_address_running(address);
@@ -387,19 +383,37 @@ fn address_has_capacity(global: &GlobalState, address: &Address, max_per_address
     global.address_running(address) < max_per_address
 }
 
+fn waiter_is_eligible(global: &GlobalState, id: usize, max_per_address: usize) -> bool {
+    global
+        .waiters
+        .get(id)
+        .is_some_and(|waiter| address_has_capacity(global, &waiter.address, max_per_address))
+}
+
+/// Only eligible queued requests (those that could take a slot now) block
+/// immediate admission. A waiter stuck on its per-address cap must not cause a
+/// different host with spare capacity to take the queue-full `Capacity` path.
+fn queue_blocks_priority(
+    global: &GlobalState,
+    priority: RequestPriority,
+    max_per_address: usize,
+) -> bool {
+    global.ordered.iter().any(|(urgency, _, id)| {
+        *urgency <= priority.urgency() && waiter_is_eligible(global, *id, max_per_address)
+    })
+}
+
 fn select_waiter(global: &GlobalState, max_per_address: usize) -> Option<usize> {
-    let eligible = |id: usize| {
-        global
-            .waiters
-            .get(id)
-            .is_some_and(|waiter| address_has_capacity(global, &waiter.address, max_per_address))
-    };
     let best = global
         .ordered
         .iter()
         .map(|(_, _, id)| *id)
-        .find(|id| eligible(*id))?;
-    let oldest = global.fifo.iter().copied().find(|id| eligible(*id))?;
+        .find(|id| waiter_is_eligible(global, *id, max_per_address))?;
+    let oldest = global
+        .fifo
+        .iter()
+        .copied()
+        .find(|id| waiter_is_eligible(global, *id, max_per_address))?;
     if oldest == best {
         return Some(best);
     }
@@ -874,6 +888,31 @@ mod tests {
         )
         .await
         .expect("host b should not wait on host a")
+        .expect("host b permit");
+        drop(other);
+        drop(first);
+        drop(queued);
+    }
+
+    #[tokio::test]
+    async fn ineligible_waiter_does_not_block_other_host_when_queue_is_full() {
+        let scheduler = RequestScheduler::new(2, 1, 1);
+        let host_a = make_address("a.example");
+        let host_b = make_address("b.example");
+        let first = scheduler
+            .acquire(host_a.clone(), RequestPriority::Normal)
+            .await
+            .expect("host a permit");
+
+        let mut queued = Box::pin(scheduler.acquire(host_a.clone(), RequestPriority::Normal));
+        poll_pending(&mut queued).await;
+
+        let other = timeout(
+            Duration::from_secs(1),
+            scheduler.acquire(host_b, RequestPriority::Normal),
+        )
+        .await
+        .expect("host b should not wait on an ineligible host a waiter")
         .expect("host b permit");
         drop(other);
         drop(first);

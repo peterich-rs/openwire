@@ -397,6 +397,10 @@ impl TransportService {
         let mut route_plan = None;
 
         loop {
+            // Subscribe before pool / coalesced / capacity probes so a
+            // `notify_waiters` or HTTP/2 stream release that lands after a
+            // failed check is not lost. Await only after mutexes are released.
+            let wait = self.connection_availability.listen(address);
             let mut waitable_pooled_connection = false;
 
             let (connection, has_in_use) = self
@@ -460,8 +464,7 @@ impl TransportService {
                             error_message = %error.message(),
                             "DNS failure suppressed; waiting for in-use pooled connection",
                         );
-                        // Wait after pool/binding mutexes are released.
-                        self.connection_availability.listen(address).await;
+                        wait.await;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -480,8 +483,7 @@ impl TransportService {
 
             let Some(connection_permit) = self.connection_limiter.try_acquire(address.clone())
             else {
-                // Wait after pool/binding mutexes are released.
-                self.connection_availability.listen(address).await;
+                wait.await;
                 continue;
             };
 
@@ -1085,13 +1087,17 @@ fn cleanup_failed_request(
     match connection.protocol() {
         ConnectionProtocol::Http1 => {
             teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
+            availability.notify(connection.address());
         }
         ConnectionProtocol::Http2 => {
             connection.mark_unhealthy();
             let _ = exchange_finder.release(connection);
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
         }
     }
-    availability.notify(connection.address());
     ctx.listener().connection_released(ctx, connection.id());
 }
 

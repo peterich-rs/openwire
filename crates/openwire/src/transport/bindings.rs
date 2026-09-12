@@ -252,11 +252,17 @@ pub(super) fn release_acquired_connection(
         }
         AcquiredBinding::Http2 { .. } => {
             if exchange_finder.release(&connection) {
-                availability.notify(connection.address());
+                availability.notify_http2(
+                    connection.address(),
+                    &connection.coalescing().verified_server_names,
+                );
                 return;
             }
             teardown_pooled_connection(exchange_finder, bindings, tasks, connection.id());
-            availability.notify(connection.address());
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
         }
     }
 }

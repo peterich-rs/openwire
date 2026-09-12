@@ -3749,6 +3749,92 @@ async fn shared_client_coalesces_https_http2_connections_across_verified_authori
 }
 
 #[tokio::test]
+async fn http2_stream_release_wakes_coalesced_waiter_when_connection_cap_is_one() {
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], |_request| async move {
+        ok_text("coalesced h2")
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .max_connections_total(1)
+        .max_http2_streams(1)
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("first response");
+    assert_eq!(response_one.version(), Version::HTTP_2);
+    let connection_one = response_one
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second = {
+        let client = client.clone();
+        let second_done = second_done.clone();
+        let port = server.addr().port();
+        tokio::spawn(async move {
+            let response = client
+                .execute(empty_request(format!("https://b.test:{port}/second")))
+                .await
+                .expect("second response");
+            second_done.store(true, Ordering::Relaxed);
+            response
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second_done.load(Ordering::Relaxed),
+        "host B should wait while the only HTTP/2 stream on the shared connection is held"
+    );
+
+    let body = response_one.into_body().text().await.expect("first body");
+    assert_eq!(body, "coalesced h2");
+
+    let response_two = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("host B should proceed after the HTTP/2 stream is released")
+        .expect("second task");
+    assert_eq!(response_two.version(), Version::HTTP_2);
+    let connection_two = response_two
+        .extensions()
+        .get::<openwire::ConnectionInfo>()
+        .expect("connection info")
+        .id;
+    let body = response_two.into_body().text().await.expect("second body");
+    assert_eq!(body, "coalesced h2");
+    assert_eq!(connection_one, connection_two);
+    assert_eq!(
+        events
+            .events()
+            .into_iter()
+            .filter(|event| event.starts_with("connect_end "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn coalesced_http2_421_retries_without_coalescing() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let handler_attempts = attempts.clone();

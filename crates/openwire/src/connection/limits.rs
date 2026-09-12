@@ -1,13 +1,20 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Notify, OwnedSemaphorePermit as TokioOwnedSemaphorePermit, Semaphore};
 
 use openwire_core::WireError;
 use parking_lot::Mutex;
 
 use super::scheduler::{RequestPriority, RequestScheduler};
-use super::{address_shard, sip_hash_map, Address, SipHashMap, ADDRESS_SHARDS};
+use super::{
+    address_shard, sip_hash_map, verified_server_name_matches, Address, ProtocolPolicy, SipHashMap,
+    UriScheme, ADDRESS_SHARDS,
+};
 
 pub(crate) use super::scheduler::RequestAdmissionPermit;
 
@@ -193,8 +200,40 @@ impl ConnectionAvailability {
         notify
     }
 
+    fn existing_notify(&self, address: &Address) -> Option<Arc<Notify>> {
+        self.shard(address).by_address.lock().get(address).cloned()
+    }
+
     pub(crate) fn notify(&self, address: &Address) {
-        self.notify_for(address).notify_one();
+        if let Some(notify) = self.existing_notify(address) {
+            notify.notify_one();
+        }
+    }
+
+    /// Wake same-host stream waiters and any currently listening authority that
+    /// can coalesce onto this HTTP/2 connection. Does not insert map entries:
+    /// only live `listen` waiters are visible.
+    pub(crate) fn notify_http2(&self, address: &Address, verified_server_names: &[String]) {
+        self.notify(address);
+        if verified_server_names.is_empty() {
+            return;
+        }
+
+        let mut waiters = Vec::new();
+        for shard in self.shards.iter() {
+            let map = shard.by_address.lock();
+            for (waiting, notify) in map.iter() {
+                if waiting == address {
+                    continue;
+                }
+                if coalescing_wait_eligible(address, waiting, verified_server_names) {
+                    waiters.push(Arc::clone(notify));
+                }
+            }
+        }
+        for notify in waiters {
+            notify.notify_one();
+        }
     }
 
     pub(crate) fn notify_global(&self) {
@@ -204,20 +243,99 @@ impl ConnectionAvailability {
         self.global.notify_waiters();
     }
 
-    /// Wait future is created after pool/binding mutexes are released. Do not
-    /// hold those mutexes across the wait. Per-address `notify_one` stores a
-    /// permit if no waiter has registered yet. The global channel is
-    /// `notify_waiters` so a connection closing on another host can free the
-    /// total cap without waking only the wrong host.
-    pub(crate) fn listen(&self, address: &Address) -> impl std::future::Future<Output = ()> {
+    /// Subscribe before the caller probes capacity. `Notified` snapshots the
+    /// `notify_waiters` generation at construction; creating it only when the
+    /// future is first polled drops a global wake that arrives in between.
+    /// Wait after pool/binding mutexes are released. Do not hold those mutexes
+    /// across the wait. Per-address `notify_one` stores a permit if no waiter
+    /// has registered yet. The global channel is `notify_waiters` so a
+    /// connection closing on another host can free the total cap without
+    /// waking only the wrong host.
+    pub(crate) fn listen(&self, address: &Address) -> impl Future<Output = ()> {
         let notify = self.notify_for(address);
-        let global = self.global.clone();
-        async move {
-            let local = std::pin::pin!(notify.notified());
-            let global = std::pin::pin!(global.notified());
-            let _ = futures_util::future::select(local, global).await;
+        ConnectionWait {
+            local: notify.clone().notified_owned(),
+            global: Arc::clone(&self.global).notified_owned(),
+            _reclaim: NotifyReclaim {
+                address: address.clone(),
+                notify,
+                availability: self.clone(),
+            },
         }
     }
+
+    #[cfg(test)]
+    fn notify_entry_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.by_address.lock().len())
+            .sum()
+    }
+}
+
+pin_project! {
+    /// `OwnedNotified` fields drop before `_reclaim` so the map can observe
+    /// `strong_count == 2` (reclaim + map) and remove an unused entry.
+    struct ConnectionWait {
+        #[pin]
+        local: OwnedNotified,
+        #[pin]
+        global: OwnedNotified,
+        _reclaim: NotifyReclaim,
+    }
+}
+
+impl Future for ConnectionWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut this = self.project();
+        if this.local.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        this.global.poll(cx)
+    }
+}
+
+/// Drops the per-address `Notify` once no `listen` future holds it. Connection
+/// releases must not retain an entry for every historical destination.
+struct NotifyReclaim {
+    address: Address,
+    notify: Arc<Notify>,
+    availability: ConnectionAvailability,
+}
+
+impl Drop for NotifyReclaim {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.notify) != 2 {
+            return;
+        }
+
+        let mut map = self.availability.shard(&self.address).by_address.lock();
+        let remove_entry = map
+            .get(&self.address)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.notify))
+            && Arc::strong_count(&self.notify) == 2;
+        if remove_entry {
+            map.remove(&self.address);
+        }
+    }
+}
+
+fn coalescing_wait_eligible(
+    origin: &Address,
+    waiting: &Address,
+    verified_server_names: &[String],
+) -> bool {
+    origin.scheme() == UriScheme::Https
+        && waiting.scheme() == UriScheme::Https
+        && origin.proxy().is_none()
+        && waiting.proxy().is_none()
+        && origin.authority().port() == waiting.authority().port()
+        && !matches!(waiting.protocol_policy(), ProtocolPolicy::Http1Only)
+        && verified_server_names
+            .iter()
+            .any(|name| verified_server_name_matches(name, waiting.authority().host()))
 }
 
 impl Default for ConnectionAvailability {
@@ -669,5 +787,89 @@ mod tests {
 
         drop(permit);
         assert!(limiter.can_acquire(&address));
+    }
+
+    #[tokio::test]
+    async fn connection_availability_listen_observes_global_notify_waiters_before_first_poll() {
+        let availability = ConnectionAvailability::default();
+        let address = make_address("example.com");
+        let waiter = availability.listen(&address);
+
+        availability.notify_global();
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("global notify_waiters must complete a listen created before the notify");
+    }
+
+    #[tokio::test]
+    async fn http2_release_wakes_coalescable_waiter_on_another_host() {
+        let availability = ConnectionAvailability::default();
+        let host_a = make_address("a.test");
+        let host_b = make_address("b.test");
+        let waiter = {
+            let availability = availability.clone();
+            let host_b = host_b.clone();
+            tokio::spawn(async move {
+                availability.listen(&host_b).await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        availability.notify_http2(&host_a, &["a.test".to_owned(), "b.test".to_owned()]);
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("coalescable host B waiter completed")
+            .expect("host B waiter join");
+    }
+
+    #[tokio::test]
+    async fn http2_release_does_not_wake_unrelated_host() {
+        let availability = ConnectionAvailability::default();
+        let host_a = make_address("a.test");
+        let host_c = make_address("c.test");
+        let waiter = {
+            let availability = availability.clone();
+            let host_c = host_c.clone();
+            tokio::spawn(async move {
+                availability.listen(&host_c).await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        availability.notify_http2(&host_a, &["a.test".to_owned(), "b.test".to_owned()]);
+
+        timeout(Duration::from_millis(50), waiter).await.expect_err(
+            "host C waiter should ignore an HTTP/2 release that cannot coalesce onto it",
+        );
+    }
+
+    #[test]
+    fn connection_release_does_not_retain_notify_entries_without_waiters() {
+        let availability = ConnectionAvailability::default();
+        let limiter = ConnectionLimiter::new(1, 1, availability.clone());
+        for index in 0..1_000 {
+            let address = make_address(&format!("host-{index}.test"));
+            let permit = limiter
+                .try_acquire(address)
+                .expect("connection permit under cap 1");
+            drop(permit);
+        }
+        assert_eq!(
+            availability.notify_entry_count(),
+            0,
+            "releases must not retain a Notify per historical destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_reclaims_notify_entry_when_no_waiters_remain() {
+        let availability = ConnectionAvailability::default();
+        let address = make_address("example.com");
+        let waiter = availability.listen(&address);
+        assert_eq!(availability.notify_entry_count(), 1);
+        drop(waiter);
+        assert_eq!(availability.notify_entry_count(), 0);
     }
 }

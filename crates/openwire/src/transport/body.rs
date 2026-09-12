@@ -436,7 +436,10 @@ fn release_response_lease(state: ResponseLeaseState) {
             ..
         } => {
             let _ = exchange_finder.release(&connection);
-            availability.notify(connection.address());
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
             ctx.listener().connection_released(&ctx, connection.id());
         }
     }
@@ -483,7 +486,10 @@ fn evict_response_lease_state(state: ResponseLeaseState, mark_unhealthy: bool) {
                 connection.mark_unhealthy();
             }
             let _ = exchange_finder.release(&connection);
-            availability.notify(connection.address());
+            availability.notify_http2(
+                connection.address(),
+                &connection.coalescing().verified_server_names,
+            );
             ctx.listener().connection_released(&ctx, connection.id());
         }
     }
