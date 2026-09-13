@@ -5,7 +5,7 @@ use cookie as cookie_crate;
 use cookie_store::CookieStore;
 use http::header::HeaderValue;
 use openwire_core::CookieJar;
-use publicsuffix::List;
+use publicsuffix::{List, Psl};
 
 use crate::sync_util::{read_rwlock, write_rwlock};
 
@@ -57,7 +57,7 @@ impl Jar {
                 None.into_iter()
             }
         };
-        write_rwlock(&self.0).store_response_cookies(cookies, url);
+        store_response_cookies(&self.0, cookies, url);
     }
 }
 
@@ -84,7 +84,7 @@ impl CookieJar for Jar {
                 }
             }
         });
-        write_rwlock(&self.0).store_response_cookies(cookies, url);
+        store_response_cookies(&self.0, cookies, url);
     }
 
     fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
@@ -106,6 +106,69 @@ impl CookieJar for Jar {
 
         HeaderValue::from_maybe_shared(Bytes::from(cookies)).ok()
     }
+}
+
+fn store_response_cookies<I>(store: &RwLock<CookieStore>, cookies: I, url: &url::Url)
+where
+    I: Iterator<Item = cookie_crate::Cookie<'static>>,
+{
+    let cookies = cookies.filter_map(|cookie| apply_rfc6265_public_suffix(cookie, url));
+    write_rwlock(store).store_response_cookies(cookies, url);
+}
+
+/// RFC 6265 §5.3 step 5: reject a Domain attribute that is a public suffix
+/// unless it is identical to the request-host (then it becomes host-only).
+///
+/// Public suffix here is the PSL algorithm, including the implicit `*` rule
+/// for names that are not explicitly listed (https://publicsuffix.org/list/).
+fn apply_rfc6265_public_suffix(
+    cookie: cookie_crate::Cookie<'static>,
+    url: &url::Url,
+) -> Option<cookie_crate::Cookie<'static>> {
+    let Some(domain) = cookie.domain() else {
+        return Some(cookie);
+    };
+    let domain = domain.trim_start_matches('.').to_owned();
+    if domain.is_empty() || !is_public_suffix(&domain) {
+        return Some(cookie);
+    }
+    if url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+    {
+        // cookie_store only host-only-promotes *known* suffixes. Force host-only
+        // for PSL implicit `*` names too by dropping the Domain attribute.
+        return Some(host_only_cookie(cookie));
+    }
+    tracing::debug!(
+        cookie_name = cookie.name(),
+        cookie_domain = domain,
+        request_host = url.host_str().unwrap_or("-"),
+        "dropping public-suffix Domain cookie (RFC 6265 §5.3)"
+    );
+    None
+}
+
+fn host_only_cookie(cookie: cookie_crate::Cookie<'static>) -> cookie_crate::Cookie<'static> {
+    let mut stripped =
+        cookie_crate::Cookie::new(cookie.name().to_owned(), cookie.value().to_owned());
+    if let Some(path) = cookie.path() {
+        stripped.set_path(path.to_owned());
+    }
+    if cookie.secure() == Some(true) {
+        stripped.set_secure(true);
+    }
+    if cookie.http_only() == Some(true) {
+        stripped.set_http_only(true);
+    }
+    if let Some(max_age) = cookie.max_age() {
+        stripped.set_max_age(max_age);
+    }
+    stripped
+}
+
+fn is_public_suffix(domain: &str) -> bool {
+    PUBLIC_SUFFIX_LIST.domain(domain.as_bytes()).is_none()
 }
 
 fn cookie_name_hint(value: &str) -> Option<&str> {
@@ -207,5 +270,82 @@ mod tests {
                 .and_then(|value| value.to_str().ok().map(str::to_owned)),
             Some("session=secret".to_owned())
         );
+    }
+
+    // RFC 6265 §5.1.4 default-path is the request path up to the rightmost `/`.
+    #[test]
+    fn default_path_is_the_request_directory() {
+        let jar = Jar::new();
+        let set = url::Url::parse("https://example.com/dir/page").expect("url");
+        jar.add_cookie_str("a=1", &set);
+
+        let in_dir = url::Url::parse("https://example.com/dir/").expect("url");
+        let in_child = url::Url::parse("https://example.com/dir/other").expect("url");
+        let sibling = url::Url::parse("https://example.com/other").expect("url");
+        assert!(jar.cookies(&in_dir).is_some());
+        assert!(jar.cookies(&in_child).is_some());
+        assert!(jar.cookies(&sibling).is_none());
+    }
+
+    // RFC 6265 §5.1.4: Path=/foo matches /foo and /foo/bar, not /foobar.
+    #[test]
+    fn path_prefix_requires_slash_boundary() {
+        let jar = Jar::new();
+        let set = url::Url::parse("https://example.com/").expect("url");
+        jar.add_cookie_str("a=1; Path=/foo", &set);
+
+        let exact = url::Url::parse("https://example.com/foo").expect("url");
+        let child = url::Url::parse("https://example.com/foo/bar").expect("url");
+        let prefix_trap = url::Url::parse("https://example.com/foobar").expect("url");
+        assert!(jar.cookies(&exact).is_some());
+        assert!(jar.cookies(&child).is_some());
+        assert!(jar.cookies(&prefix_trap).is_none());
+    }
+
+    // RFC 6265 §5.3: no Domain attribute → host-only cookie.
+    #[test]
+    fn host_only_cookie_is_not_sent_to_subdomains() {
+        let jar = Jar::new();
+        let host = url::Url::parse("https://example.com/").expect("url");
+        jar.add_cookie_str("a=1; Path=/", &host);
+
+        let sub = url::Url::parse("https://www.example.com/").expect("url");
+        assert!(jar.cookies(&host).is_some());
+        assert!(jar.cookies(&sub).is_none());
+    }
+
+    // RFC 6265 §5.2.3 leading dot on Domain is ignored.
+    #[test]
+    fn domain_attribute_ignores_leading_dot() {
+        let jar = Jar::new();
+        let set = url::Url::parse("https://www.example.com/").expect("url");
+        jar.add_cookie_str("a=1; Domain=.example.com; Path=/", &set);
+
+        let sibling = url::Url::parse("https://other.example.com/").expect("url");
+        assert!(jar.cookies(&sibling).is_some());
+    }
+
+    // RFC 6265 §5.2.2 Max-Age=0 expires the cookie immediately.
+    #[test]
+    fn max_age_zero_expires_the_cookie() {
+        let jar = Jar::new();
+        let url = url::Url::parse("https://example.com/").expect("url");
+        jar.add_cookie_str("a=1; Path=/", &url);
+        jar.add_cookie_str("a=1; Max-Age=0; Path=/", &url);
+        assert!(jar.cookies(&url).is_none());
+    }
+
+    #[test]
+    fn multiple_cookies_are_returned_together() {
+        let jar = Jar::new();
+        let url = url::Url::parse("https://example.com/").expect("url");
+        jar.add_cookie_str("a=1; Path=/", &url);
+        jar.add_cookie_str("b=2; Path=/", &url);
+        let header = jar
+            .cookies(&url)
+            .and_then(|value| value.to_str().ok().map(str::to_owned))
+            .expect("cookies");
+        assert!(header.contains("a=1"), "{header}");
+        assert!(header.contains("b=2"), "{header}");
     }
 }

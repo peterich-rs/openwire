@@ -4,10 +4,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::Method;
-use openwire::{Client, RequestBody, WireErrorKind};
-use openwire_core::websocket::{HandshakeFailure, Message, WebSocketEngineError, WebSocketError};
-use openwire_test::{spawn_websocket_echo, spawn_websocket_handler, RecordingEventListenerFactory};
+use http::{Method, Request, StatusCode};
+use openwire::{Client, RequestBody, RustlsTlsConnector, WireErrorKind};
+use openwire_core::websocket::{
+    HandshakeFailure, Message, Message as WebSocketMessage, WebSocketEngineError, WebSocketError,
+};
+use openwire_test::{
+    spawn_websocket_echo, spawn_websocket_handler, spawn_wss_echo_with_alpn,
+    RecordingEventListenerFactory,
+};
 
 fn ws_request(uri: &str) -> http::Request<RequestBody> {
     http::Request::builder()
@@ -625,4 +630,46 @@ fn websocket_accept(client_key: &str) -> String {
     hasher.update(client_key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn websocket_tls_uses_http11_alpn_when_server_prefers_h2() {
+    let server = spawn_wss_echo_with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]).await;
+    let tls = RustlsTlsConnector::builder()
+        .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+        .expect("root cert")
+        .build()
+        .expect("tls connector");
+
+    let client = Client::builder()
+        .tls_connector(tls)
+        .build()
+        .expect("client");
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("wss://localhost:{}/echo", server.addr().port()))
+        .body(RequestBody::empty())
+        .expect("request");
+
+    let websocket = client
+        .new_websocket(request)
+        .execute()
+        .await
+        .expect("websocket handshake");
+    assert_eq!(
+        websocket.handshake().status(),
+        StatusCode::SWITCHING_PROTOCOLS
+    );
+
+    let (sender, mut receiver) = websocket.split();
+    sender.send_text("hello over wss").await.expect("send text");
+
+    let message = receiver.next().await.expect("echo frame").expect("echo ok");
+    match message {
+        WebSocketMessage::Text(text) => assert_eq!(text, "hello over wss"),
+        other => panic!("expected text echo, got {other:?}"),
+    }
+
+    sender.close(1000, "done").await.expect("close websocket");
 }

@@ -346,7 +346,7 @@ fn is_redirect_status(status: StatusCode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use http::Method;
+    use http::{Method, StatusCode};
 
     use super::{DefaultRedirectPolicy, DefaultRetryPolicy};
     use openwire_core::{
@@ -488,6 +488,183 @@ mod tests {
             RedirectDecision::Follow => "follow",
             RedirectDecision::Stop => "stop",
             RedirectDecision::Error(_) => "error",
+        }
+    }
+
+    /// RFC 9110 §15.4 + Fetch/OkHttp client policy encoded as a table.
+    ///
+    /// 300 is not auto-followed (RFC 9110 §15.4.1: the user agent should let
+    /// the user choose). 301–303/307/308 are followable. HTTPS→HTTP is refused
+    /// unless `allow_insecure_redirects` is set (OpenWire security policy).
+    #[test]
+    fn default_redirect_policy_status_and_scheme_matrix() {
+        struct Case {
+            status: StatusCode,
+            follow: bool,
+            allow_insecure: bool,
+            count: u32,
+            max: usize,
+            from: &'static str,
+            to: &'static str,
+            expect: &'static str,
+        }
+
+        let cases = [
+            Case {
+                status: StatusCode::MOVED_PERMANENTLY,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::SEE_OTHER,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::PERMANENT_REDIRECT,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::MULTIPLE_CHOICES,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "stop",
+            },
+            Case {
+                status: StatusCode::NOT_MODIFIED,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "stop",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: false,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "stop",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: false,
+                count: 10,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "error",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: false,
+                count: 9,
+                max: 10,
+                from: "http://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "https://a.test/x",
+                to: "http://a.test/y",
+                expect: "error",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: true,
+                count: 0,
+                max: 10,
+                from: "https://a.test/x",
+                to: "http://a.test/y",
+                expect: "follow",
+            },
+            Case {
+                status: StatusCode::FOUND,
+                follow: true,
+                allow_insecure: false,
+                count: 0,
+                max: 10,
+                from: "http://a.test/x",
+                to: "https://a.test/y",
+                expect: "follow",
+            },
+        ];
+
+        for case in cases {
+            let mut policy = DefaultRedirectPolicy::default();
+            policy.set_follow_redirects(case.follow);
+            policy.set_max_redirects(case.max);
+            policy.set_allow_insecure_redirects(case.allow_insecure);
+            let method = Method::GET;
+            let current = case.from.parse().expect("from");
+            let location = case.to.parse().expect("to");
+            let ctx =
+                RedirectContext::new(&method, &current, case.status, &location, case.count, true);
+            let got = describe_decision(policy.should_redirect(&ctx));
+            assert_eq!(
+                got,
+                case.expect,
+                "status={} follow={} insecure={} count={}/{} {} -> {}",
+                case.status,
+                case.follow,
+                case.allow_insecure,
+                case.count,
+                case.max,
+                case.from,
+                case.to
+            );
         }
     }
 }

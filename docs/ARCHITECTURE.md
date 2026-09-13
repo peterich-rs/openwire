@@ -13,6 +13,7 @@ docs are intentionally removed once their behavior is absorbed into the code.
 Related roadmap docs:
 
 - `docs/error-handling-roadmap.md`
+- `docs/testing.md`
 
 ## 1. Design Priorities
 
@@ -380,10 +381,15 @@ follow-ups (pool reuse, interceptor chain integration).
 
 ## 7. Verification Strategy
 
+Testing layers, harness rules, and how to add cases are in
+[testing.md](testing.md). In short:
+
 - unit tests guard protocol parsing, pooling, route planning, timeout, and
   response-lease behavior
-- integration tests guard retry/redirect/auth/cookie flow, proxy behavior, and
-  connection lifecycle
+- local integration tests (split by topic under `crates/openwire/tests/`)
+  guard retry/redirect/auth/cookie flow, proxy behavior, and connection
+  lifecycle
+- `--all-features` covers optional `websocket` and `json` paths
 - the live-network suite is opt-in and not part of the required CI gate
 
 Primary verification commands:
@@ -391,6 +397,7 @@ Primary verification commands:
 ```bash
 cargo check --workspace --all-targets
 cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 ```
 
 Optional live-network smoke suite:
