@@ -79,6 +79,29 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+  test-all-features:
+    name: Test all features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests (all features)
+        run: cargo test --workspace --all-targets --all-features
+
   package:
     name: Crates.io Package Preflight
     runs-on: ubuntu-latest
@@ -103,6 +126,7 @@ jobs:
       - fmt
       - clippy
       - test-and-build
+      - test-all-features
       - package
     steps:
       - name: Verify required CI jobs passed
@@ -110,9 +134,11 @@ jobs:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           TEST_AND_BUILD_RESULT: ${{ needs.test-and-build.result }}
+          TEST_ALL_FEATURES_RESULT: ${{ needs.test-all-features.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
           test "$FMT_RESULT" = "success"
           test "$CLIPPY_RESULT" = "success"
           test "$TEST_AND_BUILD_RESULT" = "success"
+          test "$TEST_ALL_FEATURES_RESULT" = "success"
           test "$PACKAGE_RESULT" = "success"

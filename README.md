@@ -361,8 +361,13 @@ Today the project includes:
 ```bash
 cargo check --workspace --all-targets
 cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 cargo bench -p openwire --bench perf_baseline -- --noplot
 ```
+
+Default-feature tests cover the published install shape. `--all-features` also
+runs `websocket` and `json` paths, including
+`crates/openwire/tests/websocket.rs`. Required CI runs both.
 
 Optional live-network smoke suite:
 
@@ -382,6 +387,9 @@ when they require external credentials, temporary remote resources, untrusted
 public proxies, or timing-sensitive assertions that public networks cannot make
 credible. Those follow-ons are tracked in
 [docs/live-network-follow-ups.md](docs/live-network-follow-ups.md).
+
+The testing layers, harness, and how to add cases are in
+[docs/testing.md](docs/testing.md).
 
 ## Architecture
 

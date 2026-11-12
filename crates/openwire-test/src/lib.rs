@@ -19,6 +19,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+mod mock;
+
+pub use mock::{MockResponse, MockWebServer, RecordedRequest};
+
 pub type TestResponse = Response<Full<Bytes>>;
 
 pub struct TestServer {
@@ -115,6 +119,23 @@ impl RecordingEventListenerFactory {
     pub fn events(&self) -> Vec<String> {
         self.events.lock().expect("event lock").clone()
     }
+
+    /// Assert that `expected_prefixes` appear in order. Extra events are
+    /// allowed. Prefixes are matched with `starts_with`.
+    pub fn assert_contains_in_order(&self, expected_prefixes: &[&str]) {
+        let events = self.events();
+        let mut cursor = 0usize;
+        for expected in expected_prefixes {
+            while cursor < events.len() && !events[cursor].starts_with(expected) {
+                cursor += 1;
+            }
+            assert!(
+                cursor < events.len(),
+                "missing event starting with {expected:?} in {events:?}"
+            );
+            cursor += 1;
+        }
+    }
 }
 
 impl EventListenerFactory for RecordingEventListenerFactory {
@@ -180,12 +201,32 @@ impl EventListener for RecordingEventListener {
         self.push(format!("dns_end {host} {}", addrs.len()));
     }
 
+    fn dns_failed(&self, _ctx: &CallContext, host: &str, error: &WireError) {
+        self.push(format!("dns_failed {host} {}", error.kind()));
+    }
+
+    fn connect_start(&self, _ctx: &CallContext, addr: SocketAddr) {
+        self.push(format!("connect_start {addr}"));
+    }
+
     fn connect_failed(&self, _ctx: &CallContext, addr: SocketAddr, error: &WireError) {
         self.push(format!("connect_failed {addr} {}", error.kind()));
     }
 
     fn connect_end(&self, _ctx: &CallContext, connection_id: ConnectionId, addr: SocketAddr) {
         self.push(format!("connect_end {} {}", connection_id.as_u64(), addr));
+    }
+
+    fn tls_start(&self, _ctx: &CallContext, server_name: &str) {
+        self.push(format!("tls_start {server_name}"));
+    }
+
+    fn tls_end(&self, _ctx: &CallContext, server_name: &str) {
+        self.push(format!("tls_end {server_name}"));
+    }
+
+    fn tls_failed(&self, _ctx: &CallContext, server_name: &str, error: &WireError) {
+        self.push(format!("tls_failed {server_name} {}", error.kind()));
     }
 
     fn tls_handshake(&self, _ctx: &CallContext, server_name: &str, handshake: &TlsHandshake) {

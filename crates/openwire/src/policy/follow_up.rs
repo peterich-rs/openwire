@@ -1076,6 +1076,285 @@ mod tests {
         assert!(next.headers().get(CONTENT_LENGTH).is_none());
     }
 
+    /// Method/body rewrite table from RFC 9110 §15.4 and Fetch.
+    ///
+    /// 301/302/303 rewrite non-GET/HEAD to GET and drop the body (historical
+    /// user-agent behavior that Fetch still requires for 303, and that 301/302
+    /// still do in browsers/OkHttp). 307/308 preserve method and body.
+    #[test]
+    fn redirect_method_and_body_matrix_matches_rfc9110() {
+        use http::header::{AUTHORIZATION, HOST};
+        use http::Method;
+
+        #[derive(Clone, Copy)]
+        enum BodyKind {
+            Static,
+            Absent,
+            Stream,
+        }
+        enum Expect {
+            Follow { method: Method, has_body: bool },
+            Stop,
+        }
+
+        struct Case {
+            name: &'static str,
+            method: Method,
+            status: StatusCode,
+            body: BodyKind,
+            next: &'static str,
+            extra: &'static [(&'static str, &'static str)],
+            expect: Expect,
+            keep_authorization: bool,
+            keep_api_key: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "post_302_becomes_get",
+                method: Method::POST,
+                status: StatusCode::FOUND,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[("content-type", "application/json")],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "put_301_becomes_get",
+                method: Method::PUT,
+                status: StatusCode::MOVED_PERMANENTLY,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "post_303_becomes_get",
+                method: Method::POST,
+                status: StatusCode::SEE_OTHER,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "head_302_stays_head",
+                method: Method::HEAD,
+                status: StatusCode::FOUND,
+                body: BodyKind::Absent,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::HEAD,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "get_302_stays_get",
+                method: Method::GET,
+                status: StatusCode::FOUND,
+                body: BodyKind::Absent,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "post_307_preserves",
+                method: Method::POST,
+                status: StatusCode::TEMPORARY_REDIRECT,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[("content-type", "application/json")],
+                expect: Expect::Follow {
+                    method: Method::POST,
+                    has_body: true,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "put_308_preserves",
+                method: Method::PUT,
+                status: StatusCode::PERMANENT_REDIRECT,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::PUT,
+                    has_body: true,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "post_307_stream_stops",
+                method: Method::POST,
+                status: StatusCode::TEMPORARY_REDIRECT,
+                body: BodyKind::Stream,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Stop,
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "post_308_stream_stops",
+                method: Method::POST,
+                status: StatusCode::PERMANENT_REDIRECT,
+                body: BodyKind::Stream,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Stop,
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "cross_origin_drops_credentials",
+                method: Method::GET,
+                status: StatusCode::FOUND,
+                body: BodyKind::Absent,
+                next: "http://target.test/next",
+                extra: &[
+                    ("authorization", "Bearer secret"),
+                    ("cookie", "a=1"),
+                    ("x-api-key", "k"),
+                ],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: false,
+                keep_api_key: false,
+            },
+            Case {
+                name: "same_origin_keeps_authorization",
+                method: Method::GET,
+                status: StatusCode::FOUND,
+                body: BodyKind::Absent,
+                next: "http://source.test/next",
+                extra: &[("authorization", "Bearer secret")],
+                expect: Expect::Follow {
+                    method: Method::GET,
+                    has_body: false,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+        ];
+
+        for case in cases {
+            let body = match case.body {
+                BodyKind::Static => RequestBody::from_static(b"{}"),
+                BodyKind::Absent => RequestBody::absent(),
+                BodyKind::Stream => RequestBody::from_stream(futures_util::stream::empty::<
+                    Result<bytes::Bytes, WireError>,
+                >()),
+            };
+            let mut request = Request::builder()
+                .method(case.method.clone())
+                .uri("http://source.test/start")
+                .body(body)
+                .expect("request");
+            request
+                .headers_mut()
+                .insert(HOST, HeaderValue::from_static("source.test"));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+            for (name, value) in case.extra {
+                request.headers_mut().insert(
+                    http::HeaderName::from_bytes(name.as_bytes()).expect("name"),
+                    HeaderValue::from_static(value),
+                );
+            }
+            let snapshot =
+                RequestSnapshot::capture(&request, super::SnapshotCaptureMode::Rebuildable);
+            let next = snapshot
+                .into_redirect_request(
+                    case.status,
+                    case.next.parse().expect("next uri"),
+                    PolicyTraceContext::default(),
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            match (case.expect, next) {
+                (Expect::Stop, None) => {}
+                (Expect::Stop, Some(request)) => {
+                    panic!(
+                        "{}: expected stop, got {} {}",
+                        case.name,
+                        request.method(),
+                        request.uri()
+                    )
+                }
+                (Expect::Follow { method, has_body }, Some(request)) => {
+                    assert_eq!(request.method(), method, "{}", case.name);
+                    if has_body {
+                        assert!(
+                            request.body().try_clone().is_some(),
+                            "{}: expected replayable body",
+                            case.name
+                        );
+                    }
+                    assert!(
+                        request.headers().get(HOST).is_none(),
+                        "{}: Host must be stripped so bridge can resynthesize it",
+                        case.name
+                    );
+                    let auth = request.headers().get(AUTHORIZATION);
+                    if case.keep_authorization {
+                        assert!(
+                            auth.is_some(),
+                            "{}: Authorization should be kept",
+                            case.name
+                        );
+                    } else {
+                        assert!(
+                            auth.is_none(),
+                            "{}: Authorization must be dropped",
+                            case.name
+                        );
+                    }
+                    let api_key = request.headers().get("x-api-key");
+                    if case.keep_api_key {
+                        // only asserted when the extra header was present
+                    } else {
+                        assert!(
+                            api_key.is_none(),
+                            "{}: x-api-key must be dropped",
+                            case.name
+                        );
+                    }
+                }
+                (Expect::Follow { method, .. }, None) => {
+                    panic!("{}: expected follow as {method}, got stop", case.name)
+                }
+            }
+        }
+    }
+
     struct ReadinessTrackingService {
         was_polled: bool,
         is_clone: bool,

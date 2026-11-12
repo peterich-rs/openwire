@@ -379,7 +379,7 @@ fn pretty_json(bytes: &[u8]) -> Option<String> {
         let mut rendered = Vec::new();
         serde_json::to_writer_pretty(&mut rendered, &value).ok()?;
         rendered.write_all(b"\n").ok()?;
-        return String::from_utf8(rendered).ok();
+        String::from_utf8(rendered).ok()
     }
     #[cfg(not(feature = "json"))]
     {
