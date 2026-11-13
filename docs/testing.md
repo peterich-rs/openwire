@@ -17,13 +17,46 @@ to freeze whatever the current code does.
   Suffix List `tests.txt`, `EventListener` rustdoc, and `ARCHITECTURE.md`.
 - If a test fails, the implementation is wrong or the spec citation in the
   test is wrong. Do not “fix” the test by copying the implementation.
-- Intentional deviations must be named, cited, and tiny. There is currently
-  no cookie-store implicit-`*` carve-out: OpenWire applies RFC 6265 §5.3 with
-  the PSL algorithm, including unknown TLDs.
+- Applicable mandatory RFC requirements cannot be waived as compatibility
+  exceptions. There is currently no cookie-store implicit-`*` carve-out:
+  OpenWire applies RFC 6265 §5.3 with the PSL algorithm, including unknown TLDs.
 - Do not mock `Client`. Use table-driven unit tests for policy and
   `MockWebServer` / `spawn_http1` for the wire. Mockall-style trait mocks are
   unnecessary for this crate: `StaticDnsResolver`, handler servers, and
   in-module `RequestSnapshot` tests already isolate seams.
+
+## Protocol conformance evidence
+
+Strict RFC conformance is required throughout the supported protocol surface.
+Use the applicable RFC version, its updates, and verified errata. Interpret
+normative language using [BCP 14](https://www.rfc-editor.org/rfc/rfc8174.html);
+do not silently promote optional behavior to a mandatory requirement.
+
+For each protocol change, keep a requirement matrix in its design or topic
+documentation. Every row records:
+
+- RFC and section, sender/recipient role, applicability, and requirement level.
+- Observable invariant and the implementation owner responsible for it.
+- Independently derived positive, negative, wire, and failure-path cases.
+- Explicit status: planned, implemented but unverified, or verified with the
+  relevant test names and command results.
+
+Applicable MUST/MUST NOT violations block delivery. Follow SHOULD/SHOULD NOT
+by default; an RFC-permitted exception requires its specific rationale and
+tests. Record MAY choices and deliberate feature limits separately from
+protocol violations. Existing behavior, OkHttp/Fetch compatibility, and a
+dependency accepting bytes do not replace RFC-derived expected results.
+
+Test library-owned integration boundaries as well as pure encoders: framing,
+actual negotiated protocol, redirects/retries, error propagation, and connection
+reuse after incomplete exchanges. Dependency-owned parsers and codecs need
+boundary/interop evidence, rather than a duplicate implementation of their
+internal test suite. A feature's passing suite does not establish conformance
+for the entire library. Discovered mandatory violations must be fixed or block
+delivery of the affected work; do not relabel them as verified behavior.
+
+The multipart encoder tracks its requirement-to-evidence matrix in
+[multipart-design.md](multipart-design.md#rfc-conformance-contract).
 
 ## Layers
 
@@ -52,11 +85,12 @@ cargo check --workspace --all-targets
 cargo test --workspace --all-targets
 ```
 
-Optional features, including `websocket` and `json`:
+Optional features, including `websocket`, `json`, and `multipart`:
 
 ```bash
 cargo test --workspace --all-targets --all-features
 cargo test -p openwire --features websocket --test websocket
+cargo test -p openwire --features multipart --test multipart --test redirect --test auth --test compression_bridge --test pool_http2
 ```
 
 Required CI runs both default-feature tests and `--all-features`. Default
@@ -107,7 +141,7 @@ Concurrent or dispatcher-style peers still use `spawn_http1` closures. A custom
 - New integration cases go in the matching topic file under
   `crates/openwire/tests/` (`redirect.rs`, `cookie.rs`, `proxy.rs`,
   `pool_http2.rs`, `timeout_cancel.rs`, `auth.rs`, `events.rs`,
-  `compression_bridge.rs`, `scheduler_limits.rs`). Shared helpers live in
+  `compression_bridge.rs`, `scheduler_limits.rs`, `multipart.rs`). Shared helpers live in
   `tests/support/`. `integration.rs` is smoke only.
 - New public-internet tests must be `#[ignore]` and documented as smoke.
 
@@ -117,7 +151,7 @@ Concurrent or dispatcher-style peers still use `spawn_http1` closures. A custom
 | --- | --- | --- |
 | `crates/openwire/data/public_suffix_list.dat` | Runtime public suffix list for the cookie jar | vendored |
 | `crates/openwire/data/psl_tests.txt` | Cookie Domain / eTLD+1 vectors from publicsuffix.org | vendored; `tests/psl_corpus.rs` asserts official expected values |
-| RFC 9110 redirect method matrix | Follow vs rewrite vs stop | partial in unit + integration tests |
+| RFC 9110 redirect method matrix | Follow vs rewrite vs stop | unit matrix plus `tests/redirect.rs` |
 | Autobahn Testsuite | RFC 6455 WebSocket | planned, nightly |
 | http-tests/cache-tests | RFC 9111 behavior oracle | planned, not a 100% gate |
 

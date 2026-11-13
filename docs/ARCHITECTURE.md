@@ -17,11 +17,22 @@ Related roadmap docs:
 
 ## 1. Design Priorities
 
+- conform strictly to applicable network protocol RFCs across supported features
 - keep policy and transport clearly separated
 - keep platform integrations swappable through trait boundaries
 - keep connection ownership and release semantics explicit
 - keep the request execution path observable and predictable
 - keep the implementation mobile-friendly and cross-platform
+
+RFC requirements constrain protocol behavior; code remains the reference for
+what is currently implemented. Protocol changes must identify applicable
+sections, endpoint roles, specification updates, and verification evidence.
+Existing behavior and dependency acceptance are not proof of conformance.
+Applicable mandatory requirements block delivery when violated; optional
+choices and supported scope must be explicit. The requirement-to-test workflow
+is documented in [testing.md](testing.md#protocol-conformance-evidence).
+This is an architectural requirement, not a claim that all existing behavior
+has already passed a complete RFC audit.
 
 ## 2. Crate Boundaries
 
@@ -132,6 +143,27 @@ have been returned so `call_failed` still reflects body-phase cancellation.
 `Call::try_clone()` is a request-template operation, not a transport shortcut.
 It creates a fresh unexecuted call only when the request body is replayable, and
 the cloned call re-enters the canonical flow when executed.
+
+Multipart form construction (`openwire::multipart::{Form, Part}`, feature
+`multipart`) happens above `Client::execute`. The encoder concatenates DATA-only
+`RequestBody` segments and returns the existing request type; it does not add an
+interceptor or transport branch. `RequestBody::content_length()` is the
+construction-time DATA length and is independent of `try_clone()` /
+`replayable_len()`. Known-length one-shot streams use Content-Length without
+becoming replayable. Arbitrary `from_body` inputs keep unknown framing length so
+trailers are not suppressed.
+
+Strict-length bodies retain source EOF validation at every composition level.
+Outgoing transport bookkeeping uses the final negotiated protocol and request
+headers: HTTP/1 fixed-length requests complete when all declared bytes have
+been submitted, even if hyper stops polling before source EOF. HTTP/2 continues
+to require EOF/END_STREAM. Zero-length HTTP/1 bodies use the same framing rule;
+read errors and incomplete sends do not emit a successful body-end event.
+
+Multipart boundary guards retain unresolved prefixes across any number of
+chunks or Pending polls. Safe data stays in shared Bytes slices; only the
+bounded unresolved prefix is copied. MIME parameters are parsed independently
+of the type/subtype validator so escaped quotes and backslashes round-trip.
 
 `BridgeInterceptor` owns HTTP request/response normalization that is above the
 transport byte stream but below user-facing application interceptors. That
@@ -247,7 +279,7 @@ Default: `tls-rustls`, `platform-verifier`, `compression`, `cookies`.
 
 Codec features `gzip`, `deflate`, `brotli`, and `zstd` can be enabled independently. `compression` is the umbrella of all four. `compression-core` is the internal module gate pulled in by any codec; enabling it with no codec compiles and injects no `Accept-Encoding`. Workspace pins follow a minimum-feature policy: `tokio` and `hyper` no longer enable `full`; `tower` is `util` only; `rustls` / `tokio-rustls` keep `std` + `tls12` + `aws_lc_rs` and drop `logging`; `futures-util` keeps `std` + `async-await` and adds `io`/`sink` only where used. Production crates request Tokio `rt`/`net`/`time`/`io-util`/`sync` and hyper `client`/`http1`/`http2`. `openwire-test` additionally enables `hyper/server`. `openwire-cache` depends on `openwire` with `default-features = false`.
 
-The built-in `Jar` is behind `cookies`. Custom `CookieJar` implementations do not need that feature. `json` gates JSON body helpers and `LoggerInterceptor` pretty-print.
+The built-in `Jar` is behind `cookies`. Custom `CookieJar` implementations do not need that feature. `json` gates JSON body helpers and `LoggerInterceptor` pretty-print. `multipart` gates the `Form` / `Part` encoder; form construction stays above `Client::execute`.
 
 `openwire-cache` is intentionally an application interceptor rather than a
 transport feature. Fresh cache hits short-circuit before the follow-up
@@ -324,11 +356,16 @@ follow-ups (pool reuse, interceptor chain integration).
   remain caller-visible responses. Default redirect handling follows `301`,
   `302`, `303`, `307`, and `308` when a valid `Location` is present and policy
   permits it; `300 Multiple Choices` is returned to the caller without automatic
-  following. Cross-origin redirects strip `Authorization`, `Cookie`, and common
+  following. `301` / `302` rewrite POST to GET and drop the body; other methods
+  keep method and body when replayable. `303` becomes GET retrieval except HEAD,
+  which stays HEAD. Cross-origin redirects strip `Authorization`, `Cookie`, and common
   API-token headers (`X-Api-Key`, `X-Auth-Token`, and related) while preserving
   `Proxy-Authorization` for sticky proxy routing. Preserve-method redirects
-  (`307` / `308`) require a replayable request body; otherwise the original
-  redirect response is returned to the caller.
+  (`307` / `308`, and non-POST `301` / `302`) require a replayable request body;
+  otherwise the original redirect response is returned to the caller. Retrieval
+  rewrites strip content-specific fields including `Content-Language`,
+  `Content-Location`, `Digest`, `Last-Modified`, `Content-Digest`, and
+  `Repr-Digest`.
 - The default `Jar` cookie store loads an embedded public suffix list so
   `Domain=.com`-style cookies are rejected (RFC 6265 §5.3) and honors `Secure`.
 - Client resource caps (`max_requests_total`, `max_connections_total`) are
@@ -389,7 +426,7 @@ Testing layers, harness rules, and how to add cases are in
 - local integration tests (split by topic under `crates/openwire/tests/`)
   guard retry/redirect/auth/cookie flow, proxy behavior, and connection
   lifecycle
-- `--all-features` covers optional `websocket` and `json` paths
+- `--all-features` covers optional `websocket`, `json`, and `multipart` paths
 - the live-network suite is opt-in and not part of the required CI gate
 
 Primary verification commands:

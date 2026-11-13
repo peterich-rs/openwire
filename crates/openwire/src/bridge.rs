@@ -77,7 +77,7 @@ pub(crate) fn normalize_request(
     }
     normalize_host_header(request, strict_host_header)?;
     normalize_user_agent_header(request);
-    normalize_body_headers(request);
+    normalize_body_headers(request)?;
     #[cfg(feature = "compression-core")]
     let transparent_compression = crate::compression::normalize_request(request);
     #[cfg(not(feature = "compression-core"))]
@@ -145,32 +145,39 @@ fn normalize_user_agent_header(request: &mut Request<RequestBody>) {
     }
 }
 
-fn normalize_body_headers(request: &mut Request<RequestBody>) {
+fn normalize_body_headers(request: &mut Request<RequestBody>) -> Result<(), WireError> {
     let version = request.version();
     let body_is_absent = request.body().is_absent();
-    let replayable_len = request.body().replayable_len();
+    let content_length = request.body().content_length();
     let headers = request.headers_mut();
 
     if body_is_absent {
         headers.remove(CONTENT_LENGTH);
         headers.remove(TRANSFER_ENCODING);
-        return;
+        return Ok(());
     }
 
-    match replayable_len {
+    match content_length {
         Some(len) => {
             let value = HeaderValue::from_str(&len.to_string())
                 .expect("numeric content-length is always a valid header value");
             headers.insert(CONTENT_LENGTH, value);
             headers.remove(TRANSFER_ENCODING);
+            Ok(())
         }
         None => {
+            if version == Version::HTTP_10 {
+                return Err(WireError::invalid_request(
+                    "HTTP/1.0 request cannot send a body of unknown length",
+                ));
+            }
             headers.remove(CONTENT_LENGTH);
             if uses_chunked_transfer_encoding(version) {
                 headers.insert(TRANSFER_ENCODING, CHUNKED.clone());
             } else {
                 headers.remove(TRANSFER_ENCODING);
             }
+            Ok(())
         }
     }
 }
@@ -185,7 +192,7 @@ mod tests {
     use http::{Method, Request, Version};
 
     use super::{normalize_body_headers, normalize_request};
-    use crate::RequestBody;
+    use crate::{RequestBody, WireErrorKind};
 
     #[test]
     fn synthesized_host_omits_default_http_port() {
@@ -291,7 +298,7 @@ mod tests {
             .body(RequestBody::empty())
             .expect("request");
 
-        normalize_body_headers(&mut request);
+        normalize_body_headers(&mut request).expect("normalize");
 
         assert!(request.headers().get(CONTENT_LENGTH).is_none());
         assert!(request.headers().get(TRANSFER_ENCODING).is_none());
@@ -305,7 +312,7 @@ mod tests {
             .body(RequestBody::explicit_empty())
             .expect("request");
 
-        normalize_body_headers(&mut request);
+        normalize_body_headers(&mut request).expect("normalize");
 
         assert_eq!(
             request
@@ -390,7 +397,99 @@ mod tests {
             >()))
             .expect("request");
 
-        normalize_body_headers(&mut request);
+        normalize_body_headers(&mut request).expect("normalize");
+
+        assert!(request.headers().get(CONTENT_LENGTH).is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get(TRANSFER_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("chunked")
+        );
+    }
+
+    #[test]
+    fn known_length_one_shot_body_sets_content_length() {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/")
+            .version(Version::HTTP_11)
+            .body(RequestBody::from_stream_with_length(
+                futures_util::stream::iter(vec![Ok::<bytes::Bytes, crate::WireError>(
+                    bytes::Bytes::from_static(b"abc"),
+                )]),
+                3,
+            ))
+            .expect("request");
+
+        normalize_body_headers(&mut request).expect("normalize");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
+        );
+        assert!(request.headers().get(TRANSFER_ENCODING).is_none());
+        assert!(request.body().try_clone().is_none());
+    }
+
+    #[test]
+    fn http10_unknown_length_body_is_rejected() {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/")
+            .version(Version::HTTP_10)
+            .body(RequestBody::from_stream(futures_util::stream::empty::<
+                Result<bytes::Bytes, crate::WireError>,
+            >()))
+            .expect("request");
+
+        let error = normalize_body_headers(&mut request).expect_err("http/1.0 unknown length");
+        assert_eq!(error.kind(), WireErrorKind::InvalidRequest);
+        assert!(error.message().contains("HTTP/1.0"), "error = {error}");
+        assert!(request.headers().get(CONTENT_LENGTH).is_none());
+        assert!(request.headers().get(TRANSFER_ENCODING).is_none());
+    }
+
+    #[test]
+    fn from_body_with_exact_size_hint_stays_chunked_on_http11() {
+        use http::HeaderMap;
+        use http_body::{Body, Frame, SizeHint};
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct ExactThenTrailers;
+
+        impl Body for ExactThenTrailers {
+            type Data = bytes::Bytes;
+            type Error = crate::WireError;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(Some(Ok(Frame::trailers(HeaderMap::new()))))
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(0)
+            }
+        }
+
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/")
+            .version(Version::HTTP_11)
+            .body(RequestBody::from_body(ExactThenTrailers))
+            .expect("request");
+
+        assert_eq!(request.body().size_hint().exact(), None);
+        assert_eq!(request.body().content_length(), None);
+
+        normalize_body_headers(&mut request).expect("normalize");
 
         assert!(request.headers().get(CONTENT_LENGTH).is_none());
         assert_eq!(

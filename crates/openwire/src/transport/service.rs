@@ -870,7 +870,8 @@ async fn send_bound_request(
         connection.route().kind(),
     )?;
     ctx.reset_request_exchange_observation();
-    let request = instrument_outgoing_body(request, &ctx);
+    let protocol = connection.protocol();
+    let request = instrument_outgoing_body(request, &ctx, protocol);
 
     match binding {
         AcquiredBinding::Http1 { info, mut sender } => {
@@ -887,7 +888,7 @@ async fn send_bound_request(
                 map_hyper_error(error)
             })?;
             let request_requests_close = connection_header_requests_close(request.headers());
-            let response = dispatch_try_send_request(&ctx, request, |request| {
+            let response = dispatch_try_send_request(&ctx, request, protocol, |request| {
                 sender.try_send_request(request)
             });
             let response = response.await;
@@ -934,7 +935,7 @@ async fn send_bound_request(
                 );
                 map_hyper_error(error)
             })?;
-            let response = dispatch_try_send_request(&ctx, request, |request| {
+            let response = dispatch_try_send_request(&ctx, request, protocol, |request| {
                 sender.try_send_request(request)
             });
             let response = response.await;
@@ -972,11 +973,16 @@ async fn send_bound_request(
     }
 }
 
-fn dispatch_try_send_request<F, T>(ctx: &CallContext, request: Request<RequestBody>, send: F) -> T
+fn dispatch_try_send_request<F, T>(
+    ctx: &CallContext,
+    request: Request<RequestBody>,
+    protocol: ConnectionProtocol,
+    send: F,
+) -> T
 where
     F: FnOnce(Request<RequestBody>) -> T,
 {
-    let present_empty = present_empty_outgoing_body(request.body());
+    let present_empty = present_empty_outgoing_body(&request, protocol);
     ctx.listener().request_headers_start(ctx);
     let pending = send(request);
     ctx.listener().request_headers_end(ctx);

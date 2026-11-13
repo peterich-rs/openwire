@@ -13,6 +13,9 @@ mod sync_util;
 mod trace;
 mod transport;
 
+#[cfg(feature = "multipart")]
+pub mod multipart;
+
 #[cfg(feature = "websocket")]
 pub mod websocket;
 

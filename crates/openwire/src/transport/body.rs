@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::task::AtomicWaker;
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -16,7 +17,9 @@ use openwire_core::{
     CallContext, FailurePhase, RequestBody, ResponseBody, SharedTimer, WireError, WireExecutor,
 };
 
-use crate::connection::{ConnectionAvailability, ExchangeFinder, RealConnection};
+use crate::connection::{
+    ConnectionAvailability, ConnectionProtocol, ExchangeFinder, RealConnection,
+};
 
 use super::bindings::{teardown_pooled_connection, ConnectionBindings, ConnectionTaskRegistry};
 
@@ -121,16 +124,18 @@ pub(super) struct ObservedOutgoingBody {
     inner: RequestBody,
     ctx: CallContext,
     bytes_sent: u64,
+    fixed_length: Option<u64>,
     started: bool,
     finished: bool,
 }
 
 impl ObservedOutgoingBody {
-    pub(super) fn wrap(body: RequestBody, ctx: CallContext) -> RequestBody {
+    fn wrap(body: RequestBody, ctx: CallContext, fixed_length: Option<u64>) -> RequestBody {
         RequestBody::from_body(Self {
             inner: body,
             ctx,
             bytes_sent: 0,
+            fixed_length,
             started: false,
             finished: false,
         })
@@ -172,9 +177,12 @@ impl Drop for ObservedOutgoingBody {
         if self.finished {
             return;
         }
-        if self.started && self.inner.is_end_stream() {
+        if self.started
+            && (self.inner.is_end_stream() || self.fixed_length == Some(self.bytes_sent))
+        {
             // Hyper may stop polling after the exact Content-Length payload
-            // without a trailing `None` frame.
+            // on HTTP/1 without a trailing `None` frame. This is wire framing
+            // completion, independent of the source body's EOF validation.
             self.finish_successfully();
         } else {
             self.finished = true;
@@ -220,8 +228,25 @@ impl Body for ObservedOutgoingBody {
     }
 }
 
-pub(super) fn present_empty_outgoing_body(body: &RequestBody) -> bool {
-    !body.is_absent() && body.is_end_stream()
+fn http1_fixed_length(request: &Request<RequestBody>, protocol: ConnectionProtocol) -> Option<u64> {
+    if protocol != ConnectionProtocol::Http1 || request.headers().contains_key(TRANSFER_ENCODING) {
+        return None;
+    }
+    request
+        .headers()
+        .get(CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+pub(super) fn present_empty_outgoing_body(
+    request: &Request<RequestBody>,
+    protocol: ConnectionProtocol,
+) -> bool {
+    !request.body().is_absent()
+        && (request.body().is_end_stream() || http1_fixed_length(request, protocol) == Some(0))
 }
 
 pub(super) fn emit_present_empty_body_events(ctx: &CallContext) {
@@ -233,16 +258,23 @@ pub(super) fn emit_present_empty_body_events(ctx: &CallContext) {
 pub(super) fn instrument_outgoing_body(
     request: Request<RequestBody>,
     ctx: &CallContext,
+    protocol: ConnectionProtocol,
 ) -> Request<RequestBody> {
     if request.body().is_absent() {
         ctx.mark_request_write_complete();
         return request;
     }
-    if request.body().is_end_stream() {
+    if present_empty_outgoing_body(&request, protocol) {
         return request;
     }
+    // Read final framing headers after protocol binding and network
+    // interceptors. HTTP/2 completion always depends on EOF/END_STREAM.
+    let fixed_length = http1_fixed_length(&request, protocol);
     let (parts, body) = request.into_parts();
-    Request::from_parts(parts, ObservedOutgoingBody::wrap(body, ctx.clone()))
+    Request::from_parts(
+        parts,
+        ObservedOutgoingBody::wrap(body, ctx.clone(), fixed_length),
+    )
 }
 
 pub(super) struct ObservedIncomingBody {
@@ -574,5 +606,137 @@ impl Body for ObservedIncomingBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+    use futures_util::{stream, StreamExt};
+    use openwire_core::NoopEventListener;
+
+    fn instrument(
+        body: RequestBody,
+        length: u64,
+        protocol: ConnectionProtocol,
+    ) -> (RequestBody, CallContext) {
+        let ctx = CallContext::new(Arc::new(NoopEventListener), None);
+        // Deliberately leave the request version at its default. Negotiated
+        // protocol, rather than this version, controls framing completion.
+        let request = Request::builder()
+            .header(CONTENT_LENGTH, length)
+            .body(body)
+            .expect("request");
+        (
+            instrument_outgoing_body(request, &ctx, protocol).into_body(),
+            ctx,
+        )
+    }
+
+    #[tokio::test]
+    async fn http1_fixed_length_completes_when_sender_stops_polling() {
+        let source =
+            stream::iter([Ok::<_, WireError>(Bytes::from_static(b"abc"))]).chain(stream::pending());
+        let composite = RequestBody::concat(vec![RequestBody::from_stream_with_length(source, 3)])
+            .expect("concat");
+        let (mut body, ctx) = instrument(composite, 3, ConnectionProtocol::Http1);
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "abc"
+        );
+        assert!(!ctx.request_write_complete());
+        drop(body);
+        assert!(ctx.request_write_complete());
+    }
+
+    #[tokio::test]
+    async fn http2_waits_for_eof_even_after_declared_data_is_read() {
+        let source =
+            stream::iter([Ok::<_, WireError>(Bytes::from_static(b"abc"))]).chain(stream::pending());
+        let (mut body, ctx) = instrument(
+            RequestBody::from_stream_with_length(source, 3),
+            3,
+            ConnectionProtocol::Http2,
+        );
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "abc"
+        );
+        assert!(!body.is_end_stream());
+        drop(body);
+        assert!(
+            !ctx.request_write_complete(),
+            "reset/cancel before EOF is incomplete on H2"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_length_does_not_turn_source_errors_into_success() {
+        let source = stream::iter([
+            Ok(Bytes::from_static(b"abc")),
+            Err(WireError::body(
+                "source failed",
+                std::io::Error::other("read failed"),
+            )),
+        ]);
+        let (mut body, ctx) = instrument(
+            RequestBody::from_stream_with_length(source, 3),
+            3,
+            ConnectionProtocol::Http1,
+        );
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_err());
+        drop(body);
+        assert!(!ctx.request_write_complete());
+        assert!(ctx.request_failed_emitted());
+    }
+
+    #[tokio::test]
+    async fn incomplete_fixed_length_does_not_complete_when_dropped() {
+        let source =
+            stream::iter([Ok::<_, WireError>(Bytes::from_static(b"a"))]).chain(stream::pending());
+        let (mut body, ctx) = instrument(
+            RequestBody::from_stream_with_length(source, 3),
+            3,
+            ConnectionProtocol::Http1,
+        );
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        assert!(!ctx.request_write_complete());
+    }
+
+    #[tokio::test]
+    async fn transfer_encoding_and_arbitrary_trailers_require_eof() {
+        let source =
+            stream::iter([Ok::<_, WireError>(Bytes::from_static(b"abc"))]).chain(stream::pending());
+        let arbitrary = RequestBody::from_body(RequestBody::from_stream_with_length(source, 3));
+        let ctx = CallContext::new(Arc::new(NoopEventListener), None);
+        let request = Request::builder()
+            .header(CONTENT_LENGTH, 3)
+            .header(TRANSFER_ENCODING, "chunked")
+            .body(arbitrary)
+            .unwrap();
+        let mut body =
+            instrument_outgoing_body(request, &ctx, ConnectionProtocol::Http1).into_body();
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        assert!(!ctx.request_write_complete());
+    }
+
+    #[test]
+    fn zero_length_is_empty_framing_only_for_http1() {
+        for protocol in [ConnectionProtocol::Http1, ConnectionProtocol::Http2] {
+            let request = Request::builder()
+                .header(CONTENT_LENGTH, 0)
+                .body(RequestBody::from_stream_with_length(
+                    stream::pending::<Result<Bytes, WireError>>(),
+                    0,
+                ))
+                .unwrap();
+            assert_eq!(
+                present_empty_outgoing_body(&request, protocol),
+                protocol == ConnectionProtocol::Http1
+            );
+        }
     }
 }

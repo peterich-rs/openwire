@@ -25,6 +25,67 @@ fn get(uri: impl AsRef<str>) -> Request<RequestBody> {
 }
 
 #[tokio::test]
+async fn known_length_composites_emit_body_completion_once() {
+    use bytes::Bytes;
+    use futures_util::stream;
+    use openwire::WireError;
+    use openwire_test::collect_request_body;
+
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        ok_text(collect_request_body(request).await)
+    })
+    .await;
+    for (prefix, payload, nested) in [
+        ("", "abc", false),
+        ("prefix", "abc", false),
+        ("", "", false),
+        ("", "abc", true),
+    ] {
+        let expected = format!("{prefix}{payload}");
+        let stream_body = RequestBody::from_stream_with_length(
+            stream::iter([Ok::<Bytes, WireError>(Bytes::copy_from_slice(
+                payload.as_bytes(),
+            ))]),
+            payload.len() as u64,
+        );
+        let mut body = RequestBody::concat(vec![RequestBody::from(prefix.to_owned()), stream_body])
+            .expect("concat");
+        if nested {
+            body = RequestBody::concat(vec![body]).expect("nested concat");
+        }
+        let events = RecordingEventListenerFactory::default();
+        let client = Client::builder()
+            .event_listener_factory(events.clone())
+            .build()
+            .expect("client");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{}/upload", server.addr()))
+            .body(body)
+            .expect("request");
+        let response = client.execute(request).await.expect("response");
+        assert_eq!(response.into_body().text().await.expect("body"), expected);
+        let recorded = events.events();
+        for event in [
+            "request_body_start".to_owned(),
+            format!("request_body_end {}", expected.len()),
+        ] {
+            assert_eq!(
+                recorded.iter().filter(|actual| *actual == &event).count(),
+                1,
+                "{recorded:?}"
+            );
+        }
+        events.assert_contains_in_order(&[
+            "request_headers_end",
+            "request_body_start",
+            "request_body_end",
+            "call_end",
+        ]);
+    }
+}
+
+#[tokio::test]
 async fn successful_http1_get_emits_architecture_lifecycle() {
     let server = MockWebServer::http1().await;
     server.enqueue(MockResponse::new().body("ordered"));

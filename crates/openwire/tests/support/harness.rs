@@ -1404,6 +1404,65 @@ pub async fn spawn_raw_http1_headers_then_stall_body(delay: Duration) -> RawHttp
     }
 }
 
+fn raw_http1_request_looks_complete(request: &[u8]) -> bool {
+    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &request[header_end + 4..];
+    body.windows(3).any(|window| window == b"0\r\n") && body.ends_with(b"\r\n\r\n")
+}
+
+pub async fn spawn_raw_http1_capture_request(
+    observed_request: Arc<Mutex<Option<Vec<u8>>>>,
+) -> RawHttpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw http listener");
+    let addr = listener.local_addr().expect("raw http listener addr");
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut shutdown_rx => {}
+            accepted = listener.accept() => {
+                if let Ok((mut stream, _)) = accepted {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 512];
+                    let deadline = tokio::time::sleep(Duration::from_millis(500));
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            _ = &mut deadline => break,
+                            read = stream.read(&mut buffer) => {
+                                let Ok(bytes_read) = read else {
+                                    break;
+                                };
+                                if bytes_read == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..bytes_read]);
+                                if raw_http1_request_looks_complete(&request) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    *observed_request.lock().expect("observed request") = Some(request);
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+
+    RawHttpServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
 pub async fn spawn_raw_http1_host_guard(
     observed_request: Arc<Mutex<Option<String>>>,
 ) -> RawHttpServer {

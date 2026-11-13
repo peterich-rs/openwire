@@ -51,6 +51,10 @@ blocks, and stable observability hooks.
   HTTP/2 protocol binding
 - `RequestBody::absent()` for typical no-body requests and
   `RequestBody::explicit_empty()` when zero-length framing must be explicit
+- `RequestBody::content_length()` independent of replayability, plus DATA-only
+  `concat` and `from_stream_with_length` for known-length one-shot bodies
+- optional `multipart` form encoder (`Form` / `Part`) that produces an ordinary
+  `RequestBody` and owns `Content-Type` before `Client::execute`
 - optional JSON helpers behind the `json` feature
 - optional WebSocket (RFC 6455) client behind the `websocket` feature, with a
   pluggable `WebSocketEngine` trait and a built-in native codec
@@ -104,6 +108,7 @@ Optional features:
 | `cookies` | yes | Built-in `Jar` (`cookie_store` + public suffix list) |
 | `json` | no | `RequestBody::from_json` / `ResponseBody::json`, JSON pretty-print in `LoggerInterceptor` |
 | `websocket` | no | RFC 6455 WebSocket client |
+| `multipart` | no | `multipart/form-data` encoder (`Form` / `Part`) |
 
 Optional companion crates are published with the same workspace version, for
 example `openwire-cache = "0.1.2"` or `openwire-tungstenite = "0.1.2"`.
@@ -175,6 +180,35 @@ let response = queued.await_response().await?;
 
 Dropping `QueuedCall` does not request cancellation; call `cancel()` on the
 queued call or its `CallHandle` when the in-flight work should stop.
+
+## Multipart Uploads
+
+Enable the `multipart` feature and build the form before `Client::execute`.
+`Form::into_request` replaces any existing `Content-Type` with the generated
+`multipart/form-data` value and clears stale framing headers. A known length
+does not make a stream replayable:
+
+```rust
+use bytes::Bytes;
+use http::Request;
+use openwire::{multipart::{Form, Part}, Client};
+
+let client = Client::builder().build()?;
+let request = Form::new()
+    .text("description", "upload from OpenWire")
+    .part(
+        "file",
+        Part::bytes(Bytes::from_static(b"hello\n"))
+            .file_name("hello.txt")
+            .mime_str("text/plain; charset=utf-8")?,
+    )
+    .into_request(
+        Request::builder()
+            .method("POST")
+            .uri("https://example.com/upload"),
+    )?;
+let response = client.execute(request).await?;
+```
 
 ## Authentication Challenges
 

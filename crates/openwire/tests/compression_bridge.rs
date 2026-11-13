@@ -422,3 +422,237 @@ async fn bridge_interceptor_preserves_explicit_accept_encoding_and_wire_body() {
     let body = response.into_body().bytes().await.expect("body");
     assert_eq!(body.as_ref(), expected_wire_body.as_slice());
 }
+
+#[tokio::test]
+async fn known_length_one_shot_stream_uses_content_length() {
+    let observed_server_request = Arc::new(Mutex::new(None));
+    let observed_server_request_clone = observed_server_request.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let observed_server_request = observed_server_request_clone.clone();
+        async move {
+            let headers = ObservedHeaders::capture(request.headers());
+            let body = collect_request_body(request).await;
+            *observed_server_request
+                .lock()
+                .expect("observed server request") = Some(ObservedServerRequest {
+                headers,
+                body: String::from_utf8(body.to_vec()).expect("utf-8"),
+            });
+            ok_text("one-shot")
+        }
+    })
+    .await;
+
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/one-shot-length",
+            server.addr().port()
+        ))
+        .header(CONTENT_LENGTH, "999")
+        .header(TRANSFER_ENCODING, "identity")
+        .body(RequestBody::from_stream_with_length(
+            stream::iter(vec![Ok::<Bytes, WireError>(Bytes::from_static(b"abc"))]),
+            3,
+        ))
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.into_body().text().await.expect("body"), "one-shot");
+
+    let expected = ObservedHeaders {
+        host: Some(format!("openwire.test:{}", server.addr().port())),
+        user_agent: Some(default_user_agent().to_owned()),
+        accept_encoding: Some(default_accept_encoding().to_owned()),
+        content_length: Some("3".to_owned()),
+        transfer_encoding: None,
+    };
+    assert_eq!(interceptor.take_single(), expected);
+    assert_eq!(
+        take_observed_server_request(&observed_server_request),
+        ObservedServerRequest {
+            headers: expected,
+            body: "abc".to_owned(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn from_body_exact_size_hint_keeps_chunked_http11_and_trailers() {
+    use http::HeaderMap;
+    use http_body::{Body, Frame, SizeHint};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct DataThenTrailers {
+        data: Option<Bytes>,
+        trailers: Option<HeaderMap>,
+    }
+
+    impl Body for DataThenTrailers {
+        type Data = Bytes;
+        type Error = WireError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.data.take() {
+                if !data.is_empty() {
+                    return Poll::Ready(Some(Ok(Frame::data(data))));
+                }
+            }
+            if let Some(trailers) = this.trailers.take() {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
+            Poll::Ready(None)
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(
+                self.data
+                    .as_ref()
+                    .map(|data| data.len() as u64)
+                    .unwrap_or(0),
+            )
+        }
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let server = spawn_raw_http1_capture_request(observed.clone()).await;
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let mut trailer_map = HeaderMap::new();
+    trailer_map.insert("x-test-trailer", "1".parse().expect("trailer"));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/trailers",
+            server.addr().port()
+        ))
+        .header(http::header::TRAILER, "x-test-trailer")
+        .body(RequestBody::from_body(DataThenTrailers {
+            data: Some(Bytes::from_static(b"xyz")),
+            trailers: Some(trailer_map),
+        }))
+        .expect("request");
+    assert_eq!(request.body().size_hint().exact(), None);
+    assert_eq!(request.body().content_length(), None);
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.into_body().text().await.expect("body"), "ok");
+    let captured = interceptor.take_single();
+    assert!(captured.content_length.is_none());
+    assert_eq!(captured.transfer_encoding.as_deref(), Some("chunked"));
+
+    let wire = observed
+        .lock()
+        .expect("observed")
+        .clone()
+        .expect("captured request");
+    let text = String::from_utf8_lossy(&wire);
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("content-length:"),
+        "{text}"
+    );
+    assert!(text.contains("3\r\nxyz\r\n"), "{text:?}");
+    assert!(
+        text.to_ascii_lowercase().contains("x-test-trailer: 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn from_body_zero_data_with_trailers_stays_chunked() {
+    use http::HeaderMap;
+    use http_body::{Body, Frame, SizeHint};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct TrailersOnly(HeaderMap);
+
+    impl Body for TrailersOnly {
+        type Data = Bytes;
+        type Error = WireError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.0.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(Ok(Frame::trailers(std::mem::take(&mut this.0)))))
+            }
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(0)
+        }
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let server = spawn_raw_http1_capture_request(observed.clone()).await;
+    let interceptor = HeaderCaptureInterceptor::default();
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .network_interceptor(interceptor.clone())
+        .build()
+        .expect("client");
+
+    let mut trailer_map = HeaderMap::new();
+    trailer_map.insert("x-empty-trailer", "yes".parse().expect("trailer"));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://openwire.test:{}/zero-trailers",
+            server.addr().port()
+        ))
+        .header(http::header::TRAILER, "x-empty-trailer")
+        .body(RequestBody::from_body(TrailersOnly(trailer_map)))
+        .expect("request");
+
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.into_body().text().await.expect("body"), "ok");
+    let captured = interceptor.take_single();
+    assert!(captured.content_length.is_none());
+    assert_eq!(captured.transfer_encoding.as_deref(), Some("chunked"));
+    let wire = observed
+        .lock()
+        .expect("observed")
+        .clone()
+        .expect("captured request");
+    let text = String::from_utf8_lossy(&wire);
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("content-length:"),
+        "{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("x-empty-trailer: yes"),
+        "{text}"
+    );
+}

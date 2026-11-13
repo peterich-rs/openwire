@@ -4,6 +4,15 @@ The design target is extensible, cross-platform, and mobile-friendly networking
 Preserve clear layering and strong architectural boundaries; do not introduce shortcut designs that make the system harder to evolve
 Treat code as the source of truth and keep documentation aligned with actual behavior
 
+## RFC Conformance
+
+- Strict conformance to applicable network protocol RFCs is a design and release requirement for every supported feature. Code records actual behavior; applicable RFCs define required protocol behavior. Resolve conflicts by fixing implementation and tests.
+- Identify the RFC sections, endpoint role, applicable conditions, updates, and verified errata before changing protocol behavior. Record the mapping from requirements to implementation owners, independent expected values, tests, and verification status.
+- Applicable MUST/MUST NOT requirements are release blockers. Follow SHOULD/SHOULD NOT by default; any RFC-permitted exception needs its specific rationale and tests. Explicitly record MAY choices and supported scope without claiming optional features are mandatory.
+- Do not substitute existing behavior, OkHttp compatibility, or a dependency accepting input for protocol evidence. Compatibility choices must remain within the applicable RFC's permitted behavior.
+- Derive positive, negative, wire, and failure-path tests from the specification. Probability arguments alone do not establish a protocol invariant when deterministic validation is possible.
+- Do not claim conformance for unimplemented or unverified behavior. Fix or explicitly block affected work on discovered violations; this requirement does not imply that the existing library has completed a full conformance audit.
+
 Treat the following as the canonical execution chain of the project:
 ```
 User API

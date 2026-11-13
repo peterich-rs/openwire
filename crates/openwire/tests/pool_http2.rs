@@ -1651,6 +1651,115 @@ async fn streaming_request_bodies_are_not_retried_on_connection_failure() {
     assert_eq!(connector.attempts(), 1);
 }
 
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn known_length_one_shot_form_is_not_retried_on_connection_failure() {
+    use openwire::multipart::{Form, Part};
+
+    let server = spawn_http1(|_request| async move { ok_text("never reached") }).await;
+    let connector = FailingTcpConnector::new(1);
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .tcp_connector(connector.clone())
+        .max_retries(1)
+        .build()
+        .expect("client");
+
+    let request = Form::new()
+        .part(
+            "file",
+            Part::stream_with_length(
+                stream::iter(vec![Ok::<Bytes, WireError>(Bytes::from_static(b"xyz"))]),
+                3,
+            ),
+        )
+        .into_request(Request::builder().method("POST").uri(format!(
+            "http://openwire.test:{}/form-no-retry",
+            server.addr().port()
+        )))
+        .expect("request");
+    assert!(request.body().content_length().is_some());
+    assert!(request.body().try_clone().is_none());
+
+    let error = client.execute(request).await.expect_err("should fail");
+    assert_eq!(error.kind(), WireErrorKind::Connect);
+    assert_eq!(connector.attempts(), 1);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn coalesced_http2_421_does_not_retry_one_shot_form() {
+    use openwire::multipart::{Form, Part};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let server = spawn_https_http2_with_hosts(&["a.test", "b.test"], move |request| {
+        let handler_attempts = handler_attempts.clone();
+        async move {
+            match request.uri().path() {
+                "/first" => ok_text("first h2"),
+                "/form" => {
+                    let _ = collect_request_body(request).await;
+                    handler_attempts.fetch_add(1, Ordering::SeqCst);
+                    text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected")
+                }
+                _ => text_response(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+    })
+    .await;
+    let events = RecordingEventListenerFactory::default();
+    let client = Client::builder()
+        .dns_resolver(HostMapResolver::new([
+            ("a.test".to_owned(), server.addr()),
+            ("b.test".to_owned(), server.addr()),
+        ]))
+        .event_listener_factory(events.clone())
+        .tls_connector(
+            RustlsTlsConnector::builder()
+                .add_root_certificates_pem(server.tls_root_pem().expect("root pem"))
+                .expect("root cert")
+                .build()
+                .expect("tls connector"),
+        )
+        .build()
+        .expect("client");
+
+    let response_one = client
+        .execute(empty_request(format!(
+            "https://a.test:{}/first",
+            server.addr().port()
+        )))
+        .await
+        .expect("response");
+    let _ = response_one.into_body().text().await.expect("body");
+
+    let request = Form::new()
+        .part(
+            "file",
+            Part::stream_with_length(
+                stream::iter(vec![Ok::<Bytes, WireError>(Bytes::from_static(b"xyz"))]),
+                3,
+            ),
+        )
+        .into_request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("https://b.test:{}/form", server.addr().port())),
+        )
+        .expect("request");
+    let response_two = client.execute(request).await.expect("response");
+    assert_eq!(response_two.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let events = events.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.contains("misdirected_request")),
+        "events = {events:?}",
+    );
+}
+
 #[tokio::test]
 async fn post_send_failure_marks_request_committed_for_retry_policy() {
     let accepted_connections = Arc::new(AtomicUsize::new(0));

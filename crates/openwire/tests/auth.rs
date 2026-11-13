@@ -164,6 +164,90 @@ async fn streaming_request_bodies_are_not_authenticated_on_401() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn replayable_multipart_form_is_authenticated_on_401() {
+    use openwire::multipart::{Form, Part};
+
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let auth = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let _ = collect_request_body(request).await;
+        if auth.as_deref() == Some("Bearer good") {
+            ok_text("authorized")
+        } else {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"openwire\"")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .expect("unauthorized response")
+        }
+    })
+    .await;
+
+    let authenticator = StaticAuthorizationAuthenticator::new("Bearer good");
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+    let request = Form::new()
+        .text("a", "b")
+        .part("file", Part::bytes(Bytes::from_static(b"hello")))
+        .into_request(Request::builder().method("POST").uri(format!(
+            "http://openwire.test:{}/form-auth",
+            server.addr().port()
+        )))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(authenticator.calls(), 1);
+    assert_eq!(
+        response.into_body().text().await.expect("body"),
+        "authorized"
+    );
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn one_shot_multipart_form_is_not_authenticated_on_401() {
+    use openwire::multipart::{Form, Part};
+
+    let server = spawn_http1(|request: Request<Incoming>| async move {
+        let _ = collect_request_body(request).await;
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer realm=\"openwire\"")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .expect("unauthorized response")
+    })
+    .await;
+
+    let authenticator = StaticAuthorizationAuthenticator::new("Bearer good");
+    let client = Client::builder()
+        .dns_resolver(StaticDnsResolver::new(server.addr()))
+        .authenticator(authenticator.clone())
+        .build()
+        .expect("client");
+    let request = Form::new()
+        .part(
+            "file",
+            Part::stream(stream::iter(vec![Ok::<Bytes, WireError>(
+                Bytes::from_static(b"one-shot"),
+            )])),
+        )
+        .into_request(Request::builder().method("POST").uri(format!(
+            "http://openwire.test:{}/form-stream-auth",
+            server.addr().port()
+        )))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(authenticator.calls(), 0);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn auth_attempts_are_limited_and_counted_independently() {
     let server = spawn_http1(|_request: Request<Incoming>| async move {
