@@ -622,3 +622,250 @@ async fn redirect_count_remains_independent_from_retry_count() {
         "events = {events:?}",
     );
 }
+
+#[tokio::test]
+async fn put_301_second_hop_preserves_method_and_body() {
+    let server = MockWebServer::http1().await;
+    server.enqueue(
+        MockResponse::new()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("Location", "/next")
+            .body("redirect"),
+    );
+    server.enqueue(MockResponse::new().body("ok"));
+
+    let client = Client::builder().build().expect("client");
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(server.url("/start"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(RequestBody::from_static(b"payload"))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().text().await.expect("body");
+
+    let first = server.take_request().await;
+    assert_eq!(first.method, Method::PUT);
+    assert_eq!(first.body.as_ref(), b"payload");
+
+    let second = server.take_request().await;
+    assert_eq!(second.method, Method::PUT);
+    assert_eq!(second.body.as_ref(), b"payload");
+    assert_eq!(
+        second
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+}
+
+#[tokio::test]
+async fn patch_302_second_hop_preserves_method_and_body() {
+    let server = MockWebServer::http1().await;
+    server.enqueue(
+        MockResponse::new()
+            .status(StatusCode::FOUND)
+            .header("Location", "/next")
+            .body("redirect"),
+    );
+    server.enqueue(MockResponse::new().body("ok"));
+
+    let client = Client::builder().build().expect("client");
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri(server.url("/start"))
+        .body(RequestBody::from_static(b"patch-body"))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().text().await.expect("body");
+
+    let second = {
+        let _first = server.take_request().await;
+        server.take_request().await
+    };
+    assert_eq!(second.method, Method::PATCH);
+    assert_eq!(second.body.as_ref(), b"patch-body");
+}
+
+#[tokio::test]
+async fn put_301_streaming_body_is_returned() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = collect_request_body(request).await;
+            Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(Bytes::from_static(
+                    b"cannot replay",
+                )))
+                .expect("redirect response")
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(server.http_url("/streaming-put"))
+        .body(RequestBody::from_stream(stream::iter(vec![Ok::<
+            Bytes,
+            WireError,
+        >(
+            Bytes::from_static(b"streaming"),
+        )])))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn post_302_strips_content_language_and_digest_headers() {
+    let server = MockWebServer::http1().await;
+    server.enqueue(
+        MockResponse::new()
+            .status(StatusCode::FOUND)
+            .header("Location", "/next")
+            .body("redirect"),
+    );
+    server.enqueue(MockResponse::new().body("ok"));
+
+    let client = Client::builder().build().expect("client");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(server.url("/start"))
+        .header(http::header::CONTENT_TYPE, "text/plain")
+        .header(http::header::CONTENT_LANGUAGE, "en")
+        .header(http::header::CONTENT_LOCATION, "/item")
+        .header(http::header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+        .header("digest", "sha-256=abc")
+        .header("content-digest", "sha-256=:abc:")
+        .header("repr-digest", "sha-256=:abc:")
+        .body(RequestBody::from_static(b"payload"))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().text().await.expect("body");
+    let _first = server.take_request().await;
+    let second = server.take_request().await;
+    assert_eq!(second.method, Method::GET);
+    assert!(second.headers.get(http::header::CONTENT_TYPE).is_none());
+    assert!(second.headers.get(http::header::CONTENT_LANGUAGE).is_none());
+    assert!(second.headers.get(http::header::CONTENT_LOCATION).is_none());
+    assert!(second.headers.get(http::header::LAST_MODIFIED).is_none());
+    assert!(second.headers.get("digest").is_none());
+    assert!(second.headers.get("content-digest").is_none());
+    assert!(second.headers.get("repr-digest").is_none());
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_307_replays_identical_boundary_and_payload() {
+    use openwire::multipart::{Form, Part};
+
+    let server = MockWebServer::http1().await;
+    server.enqueue(
+        MockResponse::new()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("Location", "/next")
+            .body("redirect"),
+    );
+    server.enqueue(MockResponse::new().body("ok"));
+
+    let client = Client::builder().build().expect("client");
+    let request = Form::new()
+        .text("description", "upload from OpenWire")
+        .part(
+            "file",
+            Part::bytes(Bytes::from_static(b"hello\n")).file_name("hello.txt"),
+        )
+        .into_request(Request::builder().method("POST").uri(server.url("/start")))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().text().await.expect("body");
+
+    let first = server.take_request().await;
+    let second = server.take_request().await;
+    assert_eq!(second.method, Method::POST);
+    assert_eq!(first.body, second.body);
+    assert_eq!(
+        first.headers.get(http::header::CONTENT_TYPE),
+        second.headers.get(http::header::CONTENT_TYPE)
+    );
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_one_shot_308_is_returned() {
+    use openwire::multipart::{Form, Part};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = spawn_http1(move |request: Request<Incoming>| {
+        let server_attempts = server_attempts.clone();
+        async move {
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = collect_request_body(request).await;
+            Response::builder()
+                .status(StatusCode::PERMANENT_REDIRECT)
+                .header("location", "/final")
+                .body(http_body_util::Full::new(Bytes::from_static(b"stop")))
+                .expect("redirect")
+        }
+    })
+    .await;
+    let client = Client::builder().build().expect("client");
+    let request = Form::new()
+        .part(
+            "file",
+            Part::stream(stream::iter(vec![Ok::<Bytes, WireError>(
+                Bytes::from_static(b"one-shot"),
+            )])),
+        )
+        .into_request(
+            Request::builder()
+                .method("POST")
+                .uri(server.http_url("/one-shot-308")),
+        )
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_302_get_rewrite_strips_content_type() {
+    use openwire::multipart::{Form, Part};
+
+    let server = MockWebServer::http1().await;
+    server.enqueue(
+        MockResponse::new()
+            .status(StatusCode::FOUND)
+            .header("Location", "/next")
+            .body("redirect"),
+    );
+    server.enqueue(MockResponse::new().body("ok"));
+    let client = Client::builder().build().expect("client");
+    let request = Form::new()
+        .text("a", "b")
+        .part("file", Part::bytes(Bytes::from_static(b"x")))
+        .into_request(Request::builder().method("POST").uri(server.url("/start")))
+        .expect("request");
+    let response = client.execute(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().text().await.expect("body");
+    let _first = server.take_request().await;
+    let second = server.take_request().await;
+    assert_eq!(second.method, Method::GET);
+    assert!(second.body.is_empty());
+    assert!(second.headers.get(http::header::CONTENT_TYPE).is_none());
+    assert!(second.headers.get(http::header::CONTENT_LENGTH).is_none());
+}

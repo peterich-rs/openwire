@@ -3,8 +3,9 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use http::header::{
-    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST, LOCATION,
-    RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING,
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION,
+    CONTENT_TYPE, COOKIE, EXPECT, HOST, LAST_MODIFIED, LOCATION, RETRY_AFTER, SET_COOKIE,
+    TRANSFER_ENCODING,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use openwire_core::{
@@ -653,34 +654,42 @@ impl RequestSnapshot {
         selected_proxy: Option<SelectedProxy>,
     ) -> Result<Option<Request<RequestBody>>, WireError> {
         let same_origin = same_origin(&self.uri, &next_uri)?;
-        let should_switch_to_get = matches!(
-            status,
-            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
-        ) && self.method != Method::GET
-            && self.method != Method::HEAD;
-
-        let preserve_body = matches!(
-            status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-        );
-
-        let body = if preserve_body {
-            let Some(body) = self.body else {
-                return Ok(None);
-            };
-            body
-        } else if should_switch_to_get {
-            RequestBody::absent()
-        } else {
-            self.body.unwrap_or_else(RequestBody::absent)
-        };
-
-        let method = if preserve_body {
-            self.method
-        } else if should_switch_to_get {
-            Method::GET
-        } else {
-            self.method
+        let (method, body, switch_to_get) = match status {
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {
+                let Some(body) = self.body else {
+                    return Ok(None);
+                };
+                (self.method, body, false)
+            }
+            StatusCode::SEE_OTHER if self.method == Method::HEAD => (
+                Method::HEAD,
+                self.body.unwrap_or_else(RequestBody::absent),
+                false,
+            ),
+            StatusCode::SEE_OTHER => (Method::GET, RequestBody::absent(), true),
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if self.method == Method::POST => {
+                (Method::GET, RequestBody::absent(), true)
+            }
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+                if self.method == Method::GET || self.method == Method::HEAD =>
+            {
+                (
+                    self.method,
+                    self.body.unwrap_or_else(RequestBody::absent),
+                    false,
+                )
+            }
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
+                let Some(body) = self.body else {
+                    return Ok(None);
+                };
+                (self.method, body, false)
+            }
+            _ => (
+                self.method,
+                self.body.unwrap_or_else(RequestBody::absent),
+                false,
+            ),
         };
 
         let headers = self.headers.ok_or_else(|| {
@@ -694,12 +703,8 @@ impl RequestSnapshot {
         if !same_origin {
             strip_sensitive_cross_origin_headers(&mut headers);
         }
-        if should_switch_to_get {
-            headers.remove(CONTENT_LENGTH);
-            headers.remove(CONTENT_TYPE);
-            headers.remove(CONTENT_ENCODING);
-            headers.remove(TRANSFER_ENCODING);
-            headers.remove(EXPECT);
+        if switch_to_get {
+            strip_content_headers(&mut headers);
         }
 
         let extensions = self.extensions.ok_or_else(|| {
@@ -839,6 +844,20 @@ fn same_origin(left: &Uri, right: &Uri) -> Result<bool, WireError> {
 /// `Proxy-Authorization` is intentionally preserved so sticky HTTP forward
 /// proxies can continue to authenticate after a redirect; transport clears it
 /// when the selected proxy endpoint changes.
+fn strip_content_headers(headers: &mut HeaderMap) {
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(CONTENT_TYPE);
+    headers.remove(CONTENT_ENCODING);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(EXPECT);
+    headers.remove(CONTENT_LANGUAGE);
+    headers.remove(CONTENT_LOCATION);
+    headers.remove(LAST_MODIFIED);
+    headers.remove(http::HeaderName::from_static("digest"));
+    headers.remove(http::HeaderName::from_static("content-digest"));
+    headers.remove(http::HeaderName::from_static("repr-digest"));
+}
+
 fn strip_sensitive_cross_origin_headers(headers: &mut HeaderMap) {
     headers.remove(AUTHORIZATION);
     headers.remove(COOKIE);
@@ -1047,7 +1066,8 @@ mod tests {
     #[test]
     fn redirect_to_get_strips_body_describing_headers() {
         use http::header::{
-            CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, TRANSFER_ENCODING,
+            CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION, CONTENT_TYPE,
+            EXPECT, LAST_MODIFIED, TRANSFER_ENCODING,
         };
         let request = Request::builder()
             .method("POST")
@@ -1056,6 +1076,12 @@ mod tests {
             .header(CONTENT_ENCODING, "gzip")
             .header(TRANSFER_ENCODING, "chunked")
             .header(EXPECT, "100-continue")
+            .header(CONTENT_LANGUAGE, "en")
+            .header(CONTENT_LOCATION, "/item")
+            .header(LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header("digest", "sha-256=abc")
+            .header("content-digest", "sha-256=:abc:")
+            .header("repr-digest", "sha-256=:abc:")
             .body(RequestBody::from_static(b"{}"))
             .expect("request");
         let snapshot = RequestSnapshot::capture(&request, super::SnapshotCaptureMode::Rebuildable);
@@ -1074,13 +1100,21 @@ mod tests {
         assert!(next.headers().get(TRANSFER_ENCODING).is_none());
         assert!(next.headers().get(EXPECT).is_none());
         assert!(next.headers().get(CONTENT_LENGTH).is_none());
+        assert!(next.headers().get(CONTENT_LANGUAGE).is_none());
+        assert!(next.headers().get(CONTENT_LOCATION).is_none());
+        assert!(next.headers().get(LAST_MODIFIED).is_none());
+        assert!(next.headers().get("digest").is_none());
+        assert!(next.headers().get("content-digest").is_none());
+        assert!(next.headers().get("repr-digest").is_none());
     }
 
-    /// Method/body rewrite table from RFC 9110 §15.4 and Fetch.
+    /// Method/body rewrite table from RFC 9110 §9.2.2 / §15.4.
     ///
-    /// 301/302/303 rewrite non-GET/HEAD to GET and drop the body (historical
-    /// user-agent behavior that Fetch still requires for 303, and that 301/302
-    /// still do in browsers/OkHttp). 307/308 preserve method and body.
+    /// 301/302 rewrite POST to GET and drop the body (the selected historical
+    /// user-agent behavior). Other methods keep method and body when replayable.
+    /// 303 becomes GET retrieval except HEAD, which stays HEAD. 307/308 preserve
+    /// method and body; one-shot preserved bodies stop instead of substituting
+    /// an absent body.
     #[test]
     fn redirect_method_and_body_matrix_matches_rfc9110() {
         use http::header::{AUTHORIZATION, HOST};
@@ -1125,14 +1159,53 @@ mod tests {
                 keep_api_key: true,
             },
             Case {
-                name: "put_301_becomes_get",
+                name: "put_301_preserves",
                 method: Method::PUT,
                 status: StatusCode::MOVED_PERMANENTLY,
                 body: BodyKind::Static,
                 next: "http://source.test/next",
                 extra: &[],
                 expect: Expect::Follow {
-                    method: Method::GET,
+                    method: Method::PUT,
+                    has_body: true,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "patch_302_preserves",
+                method: Method::PATCH,
+                status: StatusCode::FOUND,
+                body: BodyKind::Static,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::PATCH,
+                    has_body: true,
+                },
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "put_301_stream_stops",
+                method: Method::PUT,
+                status: StatusCode::MOVED_PERMANENTLY,
+                body: BodyKind::Stream,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Stop,
+                keep_authorization: true,
+                keep_api_key: true,
+            },
+            Case {
+                name: "head_303_stays_head",
+                method: Method::HEAD,
+                status: StatusCode::SEE_OTHER,
+                body: BodyKind::Absent,
+                next: "http://source.test/next",
+                extra: &[],
+                expect: Expect::Follow {
+                    method: Method::HEAD,
                     has_body: false,
                 },
                 keep_authorization: true,
