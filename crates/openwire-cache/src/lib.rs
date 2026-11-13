@@ -12,7 +12,9 @@ use http::header::{
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
-use openwire::{BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody, WireError};
+use openwire::{
+    BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody, ResponseTiming, WireError,
+};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -97,6 +99,7 @@ where
             }
 
             let response = next.run(exchange).await?;
+            let timing = response.extensions().get::<ResponseTiming>().copied();
             if let Some(invalidation_target) = invalidation_target.as_ref() {
                 if response_status_invalidates_cache(response.status()) {
                     for key in invalidation_keys(invalidation_target, response.headers()) {
@@ -113,8 +116,24 @@ where
                 if response.status() == StatusCode::NOT_MODIFIED {
                     let (parts, body) = response.into_parts();
                     let _ = body.bytes().await?;
+                    let Some(timing) = timing else {
+                        // The conditional request was ours, so still reconstruct
+                        // its response. Without exchange timing, do not publish
+                        // a refreshed entry with an underestimated age.
+                        store.remove_candidate(&cache_key, entry).await;
+                        let mut validation_headers = parts.headers;
+                        ensure_response_date(&mut validation_headers, SystemTime::now());
+                        let response = build_response(
+                            entry.status,
+                            entry.version,
+                            merge_304_headers(&entry.headers, &validation_headers),
+                            entry.body.clone(),
+                        );
+                        ctx.listener().cache_hit(&ctx, &response);
+                        return Ok(response);
+                    };
                     let (freshened, store_response) =
-                        entry.freshen_from_not_modified(&parts.headers, &request_headers);
+                        entry.freshen_from_not_modified(&parts.headers, &request_headers, timing);
                     if store_response {
                         store.put_candidate(cache_key, freshened.clone()).await;
                     } else {
@@ -130,7 +149,22 @@ where
                 return Ok(response);
             }
 
-            let (parts, body) = response.into_parts();
+            let Some(timing) = timing else {
+                if response.status() == StatusCode::OK {
+                    remove_unusable_candidate(
+                        store.as_ref(),
+                        &cache_key,
+                        validation_entry.as_ref(),
+                        &request_policy,
+                        &request_headers,
+                    )
+                    .await;
+                }
+                return Ok(response);
+            };
+
+            let (mut parts, body) = response.into_parts();
+            ensure_response_date(&mut parts.headers, timing.received_at_wall());
             let response_directives = CacheDirectives::from_headers(&parts.headers);
             if response_directives.no_store {
                 remove_unusable_candidate(
@@ -145,9 +179,12 @@ where
             }
 
             let validators = CacheValidators::from_headers(&parts.headers);
-            let freshness_lifetime =
-                response_freshness_lifetime(&parts.headers, &response_directives)
-                    .unwrap_or_default();
+            let freshness_lifetime = response_freshness_lifetime(
+                &parts.headers,
+                &response_directives,
+                timing.received_at_wall(),
+            )
+            .unwrap_or_default();
             if !response_is_storable(
                 &parts.headers,
                 parts.status,
@@ -199,17 +236,13 @@ where
                             vary,
                             must_validate: response_directives.no_cache,
                             must_revalidate: response_directives.must_revalidate,
+                            timing: Some(timing),
                         },
                     ),
                 )
                 .await;
 
-            Ok(build_response(
-                parts.status,
-                parts.version,
-                parts.headers,
-                body,
-            ))
+            Ok(Response::from_parts(parts, ResponseBody::from_bytes(body)))
         })
     }
 }
@@ -602,7 +635,7 @@ pub struct CachedResponse {
     version: Version,
     headers: HeaderMap,
     body: Bytes,
-    stored_at: Instant,
+    received_at: Instant,
     initial_age: Duration,
     freshness_lifetime: Duration,
     vary: CapturedVary,
@@ -615,9 +648,14 @@ struct CachedResponseOptions {
     vary: CapturedVary,
     must_validate: bool,
     must_revalidate: bool,
+    timing: Option<ResponseTiming>,
 }
 
 impl CachedResponse {
+    /// Creates a manually supplied entry received at the current time.
+    ///
+    /// No request timing is available here, so transfer delay is assumed zero.
+    /// Automatic interceptor storage instead uses the response's `ResponseTiming`.
     pub fn new(
         status: StatusCode,
         version: Version,
@@ -638,19 +676,23 @@ impl CachedResponse {
     fn new_with_vary(
         status: StatusCode,
         version: Version,
-        headers: HeaderMap,
+        mut headers: HeaderMap,
         body: Bytes,
         freshness_lifetime: Duration,
         options: CachedResponseOptions,
     ) -> Self {
-        let stored_at = Instant::now();
-        let initial_age = response_current_age(&headers, SystemTime::now());
+        let timing = options.timing.unwrap_or_else(|| {
+            let now = Instant::now();
+            ResponseTiming::new(now, now, SystemTime::now())
+        });
+        ensure_response_date(&mut headers, timing.received_at_wall());
+        let initial_age = response_current_age(&headers, timing);
         Self {
             status,
             version,
             headers,
             body,
-            stored_at,
+            received_at: timing.received_at(),
             initial_age,
             freshness_lifetime,
             vary: options.vary,
@@ -753,12 +795,16 @@ impl CachedResponse {
         &self,
         validation_headers: &HeaderMap,
         request_headers: &HeaderMap,
+        timing: ResponseTiming,
     ) -> (Self, bool) {
-        let headers = merge_304_headers(&self.headers, validation_headers);
+        let mut validation_headers = validation_headers.clone();
+        ensure_response_date(&mut validation_headers, timing.received_at_wall());
+        let headers = merge_304_headers(&self.headers, &validation_headers);
         let directives = CacheDirectives::from_headers(&headers);
         let validators = CacheValidators::from_headers(&headers);
         let freshness_lifetime =
-            response_freshness_lifetime(&headers, &directives).unwrap_or_default();
+            response_freshness_lifetime(&headers, &directives, timing.received_at_wall())
+                .unwrap_or_default();
         let mut vary = CapturedVary::capture(&headers, request_headers);
         if let Some(vary) = vary.as_mut() {
             if self.vary.tracks_request_header(AUTHORIZATION) {
@@ -784,17 +830,27 @@ impl CachedResponse {
                 vary: vary.unwrap_or_default(),
                 must_validate: directives.no_cache,
                 must_revalidate: directives.must_revalidate,
+                timing: Some(timing),
             },
         );
         (response, store_response)
     }
 
     fn current_age(&self) -> Duration {
-        self.initial_age.saturating_add(self.stored_at.elapsed())
+        self.current_age_at(Instant::now())
+    }
+
+    fn current_age_at(&self, now: Instant) -> Duration {
+        self.initial_age
+            .saturating_add(now.saturating_duration_since(self.received_at))
     }
 
     fn into_response(self) -> Response<ResponseBody> {
-        let age = self.current_age().as_secs().min(MAX_DELTA_SECONDS);
+        self.into_response_at(Instant::now())
+    }
+
+    fn into_response_at(self, now: Instant) -> Response<ResponseBody> {
+        let age = self.current_age_at(now).as_secs().min(MAX_DELTA_SECONDS);
         let mut headers = self.headers;
         if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
             headers.insert(AGE, value);
@@ -895,8 +951,8 @@ fn same_host(left: &Url, right: &Url) -> bool {
 fn response_freshness_lifetime(
     headers: &HeaderMap,
     directives: &CacheDirectives,
+    now: SystemTime,
 ) -> Option<Duration> {
-    let now = SystemTime::now();
     if cache_control_directive_count(headers, "max-age") > 1 {
         return Some(Duration::ZERO);
     }
@@ -954,11 +1010,26 @@ fn parse_http_date_header(headers: &HeaderMap, name: HeaderName) -> Option<Syste
         .and_then(|value| httpdate::parse_http_date(value).ok())
 }
 
-fn response_current_age(headers: &HeaderMap, now: SystemTime) -> Duration {
+fn ensure_response_date(headers: &mut HeaderMap, received_at: SystemTime) {
+    // RFC 9110 §6.6.1: a recipient with a clock records a missing Date at
+    // receipt when caching. A 304's missing Date must not inherit the old Date.
+    if !headers.contains_key(DATE) {
+        headers.insert(
+            DATE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(received_at))
+                .expect("formatted HTTP date is a valid header value"),
+        );
+    }
+}
+
+fn response_current_age(headers: &HeaderMap, timing: ResponseTiming) -> Duration {
+    // RFC 9111 §4.2.3: preserve fractional durations, then choose the
+    // conservative maximum before adding residence since header receipt.
     let apparent_age = parse_http_date_header(headers, DATE)
-        .and_then(|date| now.duration_since(date).ok())
+        .and_then(|date| timing.received_at_wall().duration_since(date).ok())
         .unwrap_or_default();
-    apparent_age.max(response_age(headers))
+    let corrected_age_value = response_age(headers).saturating_add(timing.response_delay());
+    apparent_age.max(corrected_age_value)
 }
 
 fn merge_304_headers(stored: &HeaderMap, validation: &HeaderMap) -> HeaderMap {
@@ -986,7 +1057,16 @@ fn response_age(headers: &HeaderMap) -> Duration {
         .get(AGE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|value| {
+            value.bytes().fold(0u64, |seconds, digit| {
+                seconds
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(digit - b'0'))
+                    .min(MAX_DELTA_SECONDS)
+            })
+        })
         .map(Duration::from_secs)
         .unwrap_or_default()
 }
@@ -1043,12 +1123,244 @@ fn gateway_timeout_response() -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime};
 
-    use http::header::{CONTENT_LOCATION, LOCATION};
-    use http::{HeaderMap, Uri};
+    use bytes::Bytes;
+    use http::header::{AGE, CONTENT_LOCATION, DATE, LOCATION};
+    use http::{HeaderMap, StatusCode, Uri, Version};
+    use openwire::ResponseTiming;
 
-    use super::{invalidation_keys, parse_delta_seconds, MAX_DELTA_SECONDS};
+    use super::{
+        invalidation_keys, parse_delta_seconds, response_age, response_current_age, CachedResponse,
+        CachedResponseOptions, RequestCachePolicy, MAX_DELTA_SECONDS,
+    };
+
+    #[test]
+    fn response_age_includes_request_delay_and_residence() {
+        // RFC 9111 §4.2.3: request=1000, response=1002, Date=900,
+        // Age=200, now=1005. Corrected initial age is 202, residence is 3.
+        let mut headers = HeaderMap::new();
+        headers.insert(AGE, "200".parse().unwrap());
+        headers.insert(
+            DATE,
+            httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(900))
+                .parse()
+                .unwrap(),
+        );
+        let request_sent_at = Instant::now();
+        let timing = ResponseTiming::new(
+            request_sent_at,
+            request_sent_at + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1002),
+        );
+        let initial_age = response_current_age(&headers, timing);
+        assert_eq!(
+            initial_age + Duration::from_secs(3),
+            Duration::from_secs(205)
+        );
+        let entry = timed_entry(headers, timing, Duration::from_secs(205));
+        let now = request_sent_at + Duration::from_secs(5);
+        assert_eq!(entry.current_age_at(now), Duration::from_secs(205));
+        assert!(!entry.is_fresh_for(
+            entry.current_age_at(now),
+            Duration::from_secs(205),
+            &RequestCachePolicy::default(),
+        ));
+        assert_eq!(entry.into_response_at(now).headers()[AGE], "205");
+    }
+
+    fn timed_entry(
+        headers: HeaderMap,
+        timing: ResponseTiming,
+        freshness_lifetime: Duration,
+    ) -> CachedResponse {
+        CachedResponse::new_with_vary(
+            StatusCode::OK,
+            Version::HTTP_11,
+            headers,
+            Bytes::from_static(b"stored body"),
+            freshness_lifetime,
+            CachedResponseOptions {
+                timing: Some(timing),
+                ..CachedResponseOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn response_age_vectors_choose_corrected_or_apparent_age() {
+        // RFC 9111 §4.2.3. Request=100, response=105, now=112.
+        // Expected values are literal applications of the RFC formula.
+        for (name, date, age, expected) in [
+            ("corrected_age", Some(103), Some("10"), 22),
+            ("apparent_age", Some(50), Some("10"), 62),
+            ("future_date", Some(120), None, 12),
+            ("absent_fields", None, None, 12),
+            ("invalid_date", None, Some("10"), 22),
+        ] {
+            let request = Instant::now();
+            let received = request + Duration::from_secs(5);
+            let timing = ResponseTiming::new(
+                request,
+                received,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(105),
+            );
+            let mut headers = HeaderMap::new();
+            if let Some(date) = date {
+                headers.insert(
+                    DATE,
+                    httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(date))
+                        .parse()
+                        .unwrap(),
+                );
+            } else if name == "invalid_date" {
+                headers.insert(DATE, "not a date".parse().unwrap());
+            }
+            if let Some(age) = age {
+                headers.insert(AGE, age.parse().unwrap());
+            }
+            let entry = timed_entry(headers, timing, Duration::from_secs(1000));
+            assert_eq!(
+                entry.current_age_at(request + Duration::from_secs(12)),
+                Duration::from_secs(expected),
+                "{name}",
+            );
+            if name == "absent_fields" {
+                assert_eq!(
+                    entry.headers[DATE],
+                    httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(105)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn response_age_keeps_fractional_delay_and_residence_until_serialization() {
+        let request = Instant::now();
+        let received = request + Duration::from_millis(600);
+        let timing = ResponseTiming::new(request, received, SystemTime::UNIX_EPOCH);
+        let entry = timed_entry(HeaderMap::new(), timing, Duration::from_secs(10));
+        let now = request + Duration::from_millis(1200);
+        assert_eq!(entry.current_age_at(now), Duration::from_millis(1200));
+        assert_eq!(entry.into_response_at(now).headers()[AGE], "1");
+    }
+
+    #[test]
+    fn buffering_before_storage_does_not_restart_response_age() {
+        // Model storage three seconds after receipt without sleeping. The
+        // explicit lookup time is independent of constructor execution time.
+        let stored_at = Instant::now();
+        let received_at = stored_at - Duration::from_secs(3);
+        let timing = ResponseTiming::new(
+            received_at - Duration::from_secs(2),
+            received_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1002),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(AGE, "200".parse().unwrap());
+        headers.insert(
+            DATE,
+            httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(900))
+                .parse()
+                .unwrap(),
+        );
+        let entry = timed_entry(headers, timing, Duration::from_secs(1000));
+        assert_eq!(entry.current_age_at(stored_at), Duration::from_secs(205));
+        assert_eq!(
+            entry.current_age_at(stored_at + Duration::from_secs(4)),
+            Duration::from_secs(209),
+        );
+    }
+
+    #[test]
+    fn validation_age_uses_the_new_exchange_and_not_stored_date_or_age() {
+        // RFC 9111 §§4.2.3, 4.3.3–4; RFC 9110 §6.6.1.
+        // Old Age=900/Date=0; validation request=200, response=205, now=208.
+        for (date, age, expected) in [
+            (Some(203), Some("7"), 15),
+            (Some(203), None, 8),
+            (None, None, 8),
+            (Some(0), None, 208),
+        ] {
+            let request = Instant::now();
+            let timing = ResponseTiming::new(
+                request,
+                request + Duration::from_secs(5),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(205),
+            );
+            let mut old_headers = HeaderMap::new();
+            old_headers.insert(AGE, "900".parse().unwrap());
+            old_headers.insert(
+                DATE,
+                httpdate::fmt_http_date(SystemTime::UNIX_EPOCH)
+                    .parse()
+                    .unwrap(),
+            );
+            old_headers.insert(http::header::ETAG, "\"v1\"".parse().unwrap());
+            let old = timed_entry(old_headers, timing, Duration::ZERO);
+            let mut validation_headers = HeaderMap::new();
+            validation_headers.insert(http::header::CACHE_CONTROL, "max-age=1000".parse().unwrap());
+            if let Some(date) = date {
+                validation_headers.insert(
+                    DATE,
+                    httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(date))
+                        .parse()
+                        .unwrap(),
+                );
+            }
+            if let Some(age) = age {
+                validation_headers.insert(AGE, age.parse().unwrap());
+            }
+            let (freshened, store) =
+                old.freshen_from_not_modified(&validation_headers, &HeaderMap::new(), timing);
+            assert!(store);
+            assert_eq!(freshened.body, old.body);
+            let now = request + Duration::from_secs(8);
+            assert_eq!(freshened.current_age_at(now), Duration::from_secs(expected));
+            assert_eq!(
+                freshened.into_response_at(now).headers()[AGE],
+                expected.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn response_age_uses_first_list_member_and_rejects_invalid_values() {
+        // RFC 9111 §5.1: first-member handling is the selected SHOULD behavior.
+        for (value, expected) in [
+            ("5, 99", 5),
+            ("bad, 5", 0),
+            ("+1", 0),
+            ("-1", 0),
+            ("1.5", 0),
+            ("", 0),
+            ("0005", 5),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AGE, value.parse().unwrap());
+            assert_eq!(
+                response_age(&headers),
+                Duration::from_secs(expected),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_age_overflow_saturates_instead_of_becoming_zero() {
+        // RFC 9111 §1.2.2: a valid delta-seconds overflow is never a young age.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AGE,
+            "999999999999999999999999999999999999999999999"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            response_age(&headers),
+            Duration::from_secs(MAX_DELTA_SECONDS)
+        );
+    }
 
     #[test]
     fn delta_seconds_are_clamped_for_overflow_safety() {
