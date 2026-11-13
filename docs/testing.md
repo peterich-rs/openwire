@@ -121,6 +121,15 @@ weekly schedule. Deferred public-origin follow-ons stay in
 One server per test. Bind port `0`. Prefer these helpers over third-party mock
 HTTP crates.
 
+Scoped tracing assertions live in `crates/openwire/tests/tracing.rs`. Each case
+runs alone in a fresh copy of that test executable; its parent uses `--exact`
+and checks both the exit status and a scenario completion marker. This isolates
+tracing's process-wide dispatcher/callsite cache from unrelated test threads
+while the normal test runner stays parallel. Keep future tracing-capture cases
+in this binary and use `run_isolated_tracing_test`; the capture-only async lock
+is insufficient. See [tracing-test-isolation.md](tracing-test-isolation.md) for
+the failure evidence and regression checks.
+
 ```rust
 let server = MockWebServer::http1().await;
 server.enqueue(MockResponse::new().status(StatusCode::FOUND).header("Location", "/next"));

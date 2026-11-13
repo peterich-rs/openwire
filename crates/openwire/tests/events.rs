@@ -6,12 +6,11 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
 use openwire::{Client, RequestBody, WireErrorKind};
 use openwire_test::{
     ok_text, spawn_http1, MockResponse, MockWebServer, RecordingEventListenerFactory,
-    StaticDnsResolver,
 };
 
 use support::*;
@@ -207,83 +206,6 @@ async fn not_modified_is_not_a_redirect() {
 }
 
 #[tokio::test]
-async fn tracing_attempt_spans_record_stable_connection_reuse_fields() {
-    let _trace_test_guard = trace_test_lock().lock().await;
-    let server = spawn_http1(|_request| async move { ok_text("pooled") }).await;
-    let trace = TraceCapture::default();
-    let client = Client::builder().build().expect("client");
-
-    with_trace_capture(&trace, async {
-        let response = client
-            .execute(empty_request(server.http_url("/first")))
-            .await
-            .expect("response");
-        let _ = response.into_body().text().await.expect("body");
-
-        let response = client
-            .execute(empty_request(server.http_url("/second")))
-            .await
-            .expect("response");
-        let _ = response.into_body().text().await.expect("body");
-    })
-    .await;
-
-    let spans = trace.spans_named("openwire.attempt");
-    assert_eq!(spans.len(), 2, "spans = {spans:?}");
-    assert_eq!(
-        spans[0].fields.get("attempt").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        spans[0].fields.get("retry_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        spans[0].fields.get("redirect_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        spans[0].fields.get("auth_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        spans[0].fields.get("pool_hit").map(String::as_str),
-        Some("false")
-    );
-    assert!(!spans[0].fields.contains_key("pool_connection_id"));
-    assert_eq!(
-        spans[0].fields.get("connection_reused").map(String::as_str),
-        Some("false")
-    );
-    assert_eq!(
-        spans[1].fields.get("attempt").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        spans[1].fields.get("auth_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        spans[1].fields.get("pool_hit").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        spans[1].fields.get("pool_connection_id"),
-        spans[1].fields.get("connection_id"),
-        "spans = {spans:?}",
-    );
-    assert_eq!(
-        spans[1].fields.get("connection_reused").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        spans[0].fields.get("connection_id"),
-        spans[1].fields.get("connection_id"),
-        "spans = {spans:?}",
-    );
-}
-
-#[tokio::test]
 async fn interceptors_wrap_transport_in_expected_order() {
     let server = spawn_http1(|_request| async move { ok_text("ok") }).await;
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -393,146 +315,5 @@ async fn request_send_events_surround_transport_handoff() {
             "response_headers_start",
             "response_headers_end 200 OK",
         ],
-    );
-}
-
-#[tokio::test]
-async fn retry_and_redirect_events_follow_stable_order_and_trace_fields() {
-    let _trace_test_guard = trace_test_lock().lock().await;
-    let server = spawn_http1(|request: Request<Incoming>| async move {
-        match request.uri().path() {
-            "/redirect-after-retry" => Response::builder()
-                .status(StatusCode::FOUND)
-                .header("location", "/redirect-target")
-                .body(http_body_util::Full::new(bytes::Bytes::new()))
-                .expect("redirect response"),
-            _ => ok_text("redirect after retry"),
-        }
-    })
-    .await;
-
-    let connector = FailingTcpConnector::new(1);
-    let events = RecordingEventListenerFactory::default();
-    let trace = TraceCapture::default();
-
-    let client = Client::builder()
-        .dns_resolver(StaticDnsResolver::new(server.addr()))
-        .tcp_connector(connector)
-        .event_listener_factory(events.clone())
-        .max_retries(1)
-        .build()
-        .expect("client");
-
-    with_trace_capture(&trace, async {
-        let response = client
-            .execute(empty_request(format!(
-                "http://openwire.test:{}/redirect-after-retry",
-                server.addr().port()
-            )))
-            .await
-            .expect("response");
-        let _ = response.into_body().text().await.expect("body");
-    })
-    .await;
-
-    let events = events.events();
-    assert_event_subsequence(
-        &events,
-        &[
-            "call_start GET",
-            "connect_failed ",
-            "retry 1 connect",
-            "connect_end ",
-            "connection_acquired ",
-            "response_headers_end 302 Found",
-            // Intermediate redirect body is drained so the connection can be
-            // reused before the follow-up hop starts.
-            "response_body_end ",
-            "connection_released ",
-            "redirect 1 http://openwire.test:",
-            "connection_acquired ",
-            "response_headers_end 200 OK",
-            "response_body_end 20",
-            "connection_released ",
-            "call_end",
-        ],
-    );
-
-    let retry_event = trace
-        .event_by_message("retrying request after connection-establishment failure")
-        .or_else(|| trace.event_with_field("retry_reason", "connect"))
-        .unwrap_or_else(|| {
-            panic!(
-                "retry trace event missing; captured messages = {:?}",
-                trace.event_messages()
-            )
-        });
-    assert_eq!(
-        retry_event.fields.get("attempt").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(
-        retry_event.fields.get("retry_count").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        retry_event.fields.get("redirect_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        retry_event.fields.get("auth_count").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        retry_event
-            .fields
-            .get("retry_reason")
-            .map(|value| normalize_trace_message(value)),
-        Some("connect".to_owned())
-    );
-
-    let redirect_event = trace
-        .event_by_message("following redirect")
-        .or_else(|| {
-            trace
-                .inner
-                .lock()
-                .expect("trace capture lock")
-                .events
-                .iter()
-                .find(|event| event.fields.contains_key("redirect_location"))
-                .cloned()
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "redirect trace event missing; captured messages = {:?}",
-                trace.event_messages()
-            )
-        });
-    assert_eq!(
-        redirect_event.fields.get("attempt").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(
-        redirect_event.fields.get("retry_count").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        redirect_event
-            .fields
-            .get("redirect_count")
-            .map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        redirect_event.fields.get("auth_count").map(String::as_str),
-        Some("0")
-    );
-    assert!(
-        redirect_event
-            .fields
-            .get("redirect_location")
-            .is_some_and(|location| location.contains("/redirect-target")),
-        "redirect event = {redirect_event:?}",
     );
 }
