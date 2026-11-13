@@ -1,16 +1,341 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{
     ACCEPT_LANGUAGE, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES,
     HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, PRAGMA, VARY,
 };
-use http::{Method, Request, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
-use openwire::{Client, RequestBody};
+use openwire::{
+    BoxFuture, Client, Exchange, Interceptor, Next, RequestBody, ResponseBody, ResponseTiming,
+    WireError,
+};
 use openwire_cache::CacheInterceptor;
 use openwire_test::{spawn_http1, text_response, RecordingEventListenerFactory};
+
+// Supply a known exchange delay without sleeps. The transport's real timestamp
+// boundaries are exercised in openwire/tests/response_timing.rs.
+struct FixedResponseDelay(Duration);
+
+impl Interceptor for FixedResponseDelay {
+    fn intercept(
+        &self,
+        exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let delay = self.0;
+        Box::pin(async move {
+            let mut response = next.run(exchange).await?;
+            let timing = *response
+                .extensions()
+                .get::<ResponseTiming>()
+                .expect("transport timing");
+            response.extensions_mut().insert(ResponseTiming::new(
+                timing.received_at() - delay,
+                timing.received_at(),
+                timing.received_at_wall(),
+            ));
+            if response.status() == StatusCode::NOT_MODIFIED {
+                response.headers_mut().remove(DATE);
+            }
+            Ok(response)
+        })
+    }
+}
+
+fn assert_received_age(
+    response: &Response<ResponseBody>,
+    timing: ResponseTiming,
+    corrected_initial_age: u64,
+    before: Instant,
+    after: Instant,
+) {
+    let age = response.headers()[AGE]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    // The serialization instant lies between these observations. This is an
+    // RFC-value interval, not a wall-clock performance threshold.
+    let lower = corrected_initial_age
+        + before
+            .saturating_duration_since(timing.received_at())
+            .as_secs();
+    let upper = corrected_initial_age
+        + after
+            .saturating_duration_since(timing.received_at())
+            .as_secs();
+    assert!(
+        (lower..=upper).contains(&age),
+        "Age={age}, expected {lower}..={upper}"
+    );
+}
+
+#[tokio::test]
+async fn cached_age_includes_exchange_delay_and_receipt_residence() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |_request| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async {
+                let mut response = text_response(StatusCode::OK, "timed body");
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, "max-age=1000".parse().unwrap());
+                response.headers_mut().insert(AGE, "200".parse().unwrap());
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .network_interceptor(FixedResponseDelay(Duration::from_secs(2)))
+        .build()
+        .unwrap();
+    let first = client
+        .execute(empty_request(server.http_url("/timed")))
+        .await
+        .unwrap();
+    let timing = *first
+        .extensions()
+        .get::<ResponseTiming>()
+        .expect("preserved transport metadata");
+    assert_eq!(first.into_body().text().await.unwrap(), "timed body");
+    let before = Instant::now();
+    let cached = client
+        .execute(empty_request(server.http_url("/timed")))
+        .await
+        .unwrap();
+    assert_received_age(&cached, timing, 202, before, Instant::now());
+    assert_eq!(cached.into_body().text().await.unwrap(), "timed body");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn validation_age_includes_its_own_delay_and_replaces_missing_date() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hit = hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut response = if hit == 0 {
+                    let mut response = text_response(StatusCode::OK, "validated body");
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+                    response.headers_mut().insert(AGE, "900".parse().unwrap());
+                    response.headers_mut().insert(
+                        DATE,
+                        httpdate::fmt_http_date(SystemTime::UNIX_EPOCH)
+                            .parse()
+                            .unwrap(),
+                    );
+                    response
+                } else {
+                    assert_eq!(request.headers()[IF_NONE_MATCH], "\"v1\"");
+                    let mut response = text_response(StatusCode::NOT_MODIFIED, "");
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, "max-age=1000".parse().unwrap());
+                    response.headers_mut().insert(AGE, "7".parse().unwrap());
+                    response
+                };
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"v1\"".parse().unwrap());
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .network_interceptor(FixedResponseDelay(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+    let first = client
+        .execute(empty_request(server.http_url("/validate-time")))
+        .await
+        .unwrap();
+    assert_eq!(first.into_body().text().await.unwrap(), "validated body");
+    let before = Instant::now();
+    let validated = client
+        .execute(empty_request(server.http_url("/validate-time")))
+        .await
+        .unwrap();
+    let after = Instant::now();
+    let age = validated.headers()[AGE]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((12..=12 + after.duration_since(before).as_secs()).contains(&age));
+    assert_ne!(
+        validated.headers()[DATE],
+        httpdate::fmt_http_date(SystemTime::UNIX_EPOCH)
+    );
+    assert_eq!(validated.status(), StatusCode::OK);
+    assert_eq!(
+        validated.into_body().text().await.unwrap(),
+        "validated body"
+    );
+    let cached = client
+        .execute(empty_request(server.http_url("/validate-time")))
+        .await
+        .unwrap();
+    assert_eq!(cached.into_body().text().await.unwrap(), "validated body");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+struct UntimedResponse(Arc<AtomicUsize>);
+
+impl Interceptor for UntimedResponse {
+    fn intercept(
+        &self,
+        _exchange: Exchange,
+        _next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(Response::builder()
+                .header(CACHE_CONTROL, "max-age=60")
+                .body(ResponseBody::from_bytes(format!("synthetic {call}").into()))
+                .unwrap())
+        })
+    }
+}
+
+#[tokio::test]
+async fn synthetic_responses_without_exchange_timing_are_not_stored() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .application_interceptor(UntimedResponse(calls.clone()))
+        .build()
+        .unwrap();
+    for call in 0..2 {
+        let response = client
+            .execute(empty_request("http://synthetic.test/no-network"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.into_body().text().await.unwrap(),
+            format!("synthetic {call}")
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+struct RemoveValidationTiming;
+
+impl Interceptor for RemoveValidationTiming {
+    fn intercept(
+        &self,
+        exchange: Exchange,
+        next: Next,
+    ) -> BoxFuture<Result<Response<ResponseBody>, WireError>> {
+        Box::pin(async move {
+            let mut response = next.run(exchange).await?;
+            if response.status() == StatusCode::NOT_MODIFIED {
+                response.extensions_mut().remove::<ResponseTiming>();
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[tokio::test]
+async fn untimed_validation_returns_the_stored_body_without_publishing_a_fresh_entry() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hit = hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut response = if hit == 1 {
+                    assert_eq!(request.headers()[IF_NONE_MATCH], "\"v1\"");
+                    text_response(StatusCode::NOT_MODIFIED, "")
+                } else {
+                    assert!(!request.headers().contains_key(IF_NONE_MATCH));
+                    text_response(StatusCode::OK, format!("body {hit}"))
+                };
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"v1\"".parse().unwrap());
+                response.headers_mut().insert(
+                    CACHE_CONTROL,
+                    if hit == 0 { "max-age=0" } else { "max-age=60" }
+                        .parse()
+                        .unwrap(),
+                );
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .network_interceptor(RemoveValidationTiming)
+        .build()
+        .unwrap();
+    for expected in ["body 0", "body 0", "body 2"] {
+        let response = client
+            .execute(empty_request(server.http_url("/untimed-validation")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.into_body().text().await.unwrap(), expected);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn incomplete_response_body_never_publishes_a_complete_cache_entry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        for body in [b"ab".as_slice(), b"hello".as_slice()] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() < 64 * 1024);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n").await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .call_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/incomplete");
+    let error = client
+        .execute(empty_request(&url))
+        .await
+        .expect_err("truncated body cannot be cached");
+    assert!(matches!(
+        error.kind(),
+        openwire::WireErrorKind::Body | openwire::WireErrorKind::Protocol
+    ));
+    let complete = client.execute(empty_request(&url)).await.unwrap();
+    assert_eq!(complete.into_body().text().await.unwrap(), "hello");
+    peer.await.unwrap();
+    // The listener is gone: this response must come from the complete entry.
+    let cached = client.execute(empty_request(&url)).await.unwrap();
+    assert_eq!(cached.into_body().text().await.unwrap(), "hello");
+}
 
 #[tokio::test]
 async fn fresh_get_responses_are_served_from_cache() {

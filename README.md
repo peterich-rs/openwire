@@ -338,7 +338,8 @@ controls needed to avoid unsafe reuse:
 - response `Cache-Control: public`, `max-age`, `s-maxage`,
   `must-revalidate`, `no-cache`, and `no-store`
 - `Expires` freshness when `max-age` is absent
-- `Age` reducing remaining `max-age` freshness
+- `Age` reducing remaining `max-age` freshness, including request-to-response
+  delay and residence since response headers (also while buffering the body)
 - `Date` apparent age and Last-Modified heuristic freshness when explicit
   freshness is absent
 - multiple stored variants for one URI through `Vary` matching against the
@@ -356,6 +357,12 @@ controls needed to avoid unsafe reuse:
   for the target URI, plus same-host `Location` and `Content-Location`
   response URIs when present
 - cached hits generate a current `Age` header
+
+The built-in transport attaches per-exchange `ResponseTiming` metadata to H1
+and H2 responses. Synthetic interceptor responses need this metadata to enter
+the automatic cache; responses without it are returned without being stored.
+Preserve response extensions when wrapping a body. See
+[cache age evidence](docs/cache-age.md) for the RFC mapping and regression cases.
 
 The cache intentionally remains conservative: it only stores `200 OK` `GET`
 responses, skips responses with `Set-Cookie`, treats `s-maxage` as an
