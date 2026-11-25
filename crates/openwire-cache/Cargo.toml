@@ -3,7 +3,7 @@ name = "openwire-cache"
 description = "Application-layer HTTP cache interceptor for OpenWire"
 edition.workspace = true
 license.workspace = true
-version.workspace = true
+version = "0.1.3"
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -16,13 +16,13 @@ async-trait.workspace = true
 bytes.workspace = true
 http.workspace = true
 httpdate.workspace = true
-openwire.workspace = true
+openwire = { path = "../openwire", version = "0.1.3", default-features = false }
 tokio = { workspace = true, features = ["sync"] }
 url.workspace = true
 
 [dev-dependencies]
 hyper.workspace = true
-openwire = { workspace = true, default-features = true }
+openwire = { path = "../openwire", version = "0.1.3" }
 openwire-rustls.workspace = true
 openwire-test.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }

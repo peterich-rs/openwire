@@ -1,115 +1,88 @@
 # Release Process
 
-OpenWire publishes the user-facing crates through crates.io so downstream users
-can depend on standard registry versions instead of Git source paths. The next
-planned release is `0.1.2`.
+OpenWire publishes its user-facing crates through crates.io. Each crate declares
+its version in its own `Cargo.toml`. `openwire-test` is local test support with
+`publish = false`. Its path-only dev-dependencies are omitted by Cargo when it
+packages the published crates.
 
-## Published Crates
+## Prepare a release PR
 
-Publish the workspace crates in dependency order:
+1. Bump the crates whose published code or dependency requirements changed.
+   Keep the versions of compatible crates that can continue using their published
+   packages.
+2. Update minimum dependency versions where a crate uses newer APIs or behavior.
+   Shared requirements in `[workspace.dependencies]` are defaults. A member can
+   declare a higher minimum together with its local `path`. Cargo resolves the
+   local path in the workspace and uses the version requirement on crates.io.
+3. Update `release.json` with the release identifier and the exact versions of
+   the crates to publish. The identifier determines the Git tag. It belongs to
+   the release plan and can name a batch of different crate versions.
+4. Refresh `Cargo.lock`, README installation examples, and release notes.
 
-1. `openwire-core`
-2. `openwire-tokio`
-3. `openwire-rustls`
-4. `openwire`
-5. `openwire-cache`
-6. `openwire-fastwebsockets`
-7. `openwire-tungstenite`
+The `v0.1.3` plan publishes `openwire-core`, `openwire-tokio`, `openwire`, and
+`openwire-cache` as `0.1.3`. `openwire-rustls`, `openwire-fastwebsockets`, and
+`openwire-tungstenite` remain available as `0.1.2`.
 
-`openwire-test` is local test support and has `publish = false`. Published
-crate dev-dependencies that point at `openwire-test` remain path-only so Cargo
-does not emit a registry dependency on a non-published crate.
+## Verify the release PR
 
-## Versioning
-
-All publishable crates use the workspace version from the root
-`[workspace.package]` table. The same version must also be set on the internal
-workspace dependencies in root `[workspace.dependencies]` so packaged manifests
-can resolve each OpenWire crate from crates.io after publication.
-
-For a version bump:
-
-1. Update `version` in root `[workspace.package]`.
-2. Update the `version = "..."`
-   fields for `openwire`, `openwire-cache`, `openwire-core`,
-   `openwire-fastwebsockets`, `openwire-rustls`, `openwire-tokio`, and
-   `openwire-tungstenite` in root `[workspace.dependencies]`.
-3. Update README installation examples and any release notes that name the
-   version.
-4. Run `scripts/publish-crates.sh --dry-run` to verify that package metadata and
-   internal dependency versions are consistent.
-
-## Pull Request Preflight
-
-Run the normal CI gates before publishing:
+Use current stable Cargo and Python 3. Run the CI checks and the release preflight
+from a clean commit.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-scripts/publish-crates.sh --dry-run
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo test --locked --workspace --all-targets --all-features
+python3 -B -m unittest discover -s scripts -p 'test_publish_crates.py'
+scripts/publish-crates.sh --dry-run --release 0.1.3
 ```
 
-The dry-run script is intentionally first-release safe. Cargo requires each
-versioned internal dependency to already exist in the registry when generating a
-full tarball for dependent crates, so before a staged release it checks package
-file lists for every publishable crate and builds the `openwire-core` tarball.
-The actual publish command still runs Cargo's full publish verification for each
-crate after its dependencies have been published.
+The preflight checks the release identifier and each selected crate version,
+then asks Cargo to package and compile the selected crates with all features.
+Cargo stages unpublished dependencies from the same batch in a temporary
+registry and resolves other dependencies from crates.io. The preflight requires
+no publish token. CI uses the current plan in `release.json` automatically.
 
-## Publishing
+## Publish
 
-Set the repository secret `CRATES_IO_TOKEN` to a crates.io API token with
-publish permission for all published OpenWire crates.
-
-After the release PR is merged:
-
-1. Create and push a release tag that matches the workspace version:
-
-   ```sh
-   git tag v0.1.2
-   git push origin v0.1.2
-   ```
-
-2. Pushing the `v0.1.2` tag automatically runs the `Publish Crates` GitHub
-   Actions workflow as a real publish.
-
-Create the release tag only after the release PR has merged. If the intended tag
-already exists on an older commit, delete and recreate it on the release commit
-or choose a new version instead.
-
-For tag pushes, the workflow derives the publish version from
-`refs/tags/v<version>` and refuses to publish if it does not match the workspace
-version. It publishes crates in dependency order and waits for each version to
-become visible through Cargo before publishing the next dependent crate.
-
-The same workflow can still be run manually with `dry_run=true` on a branch or
-tag to execute the package preflight without requiring a crates.io token.
-
-## Resuming a Partial Publish
-
-crates.io rate-limits publishing many brand-new crate names in a short window.
-If a staged publish fails after some crates have already uploaded, wait until
-the time reported by crates.io and rerun `Publish Crates` from `main` with:
-
-- `version` set to the same workspace version
-- `dry_run=false`
-- `start_at` set to the first crate that did not publish
-
-For example, if the first five `0.1.2` crates published and the rate limit
-stopped at `openwire-fastwebsockets`, rerun with
-`start_at=openwire-fastwebsockets`. The workflow only allows non-tag publishing
-when `start_at` is set and the ref is `main`.
-
-## Post-Publish Verification
-
-After the workflow finishes, verify the registry and downstream install path:
+Configure the repository secret `CRATES_IO_TOKEN` with permission to publish
+the selected crates. After the release PR merges and CI passes, use the SHA
+of the merged release commit in place of `RELEASE_COMMIT_SHA`.
 
 ```sh
-cargo info openwire@0.1.2
-tmpdir="$(mktemp -d)"
-cd "$tmpdir"
-cargo init --bin
-cargo add openwire@0.1.2
+git fetch origin
+git tag -a v0.1.3 RELEASE_COMMIT_SHA -m "OpenWire v0.1.3"
+git push origin refs/tags/v0.1.3
+```
+
+Pushing the matching tag starts the real `Publish Crates` workflow. The job
+validates the plan in that commit, checks the crates.io index for each version,
+and passes only pending packages to Cargo. Cargo publishes the batch in
+dependency order. The job also checks that each new version becomes visible.
+
+The workflow can be run manually with `dry_run=true` and a `version` matching the
+plan on the selected branch or tag. A manual publish requires the matching tag.
+
+## Resume a partial publish
+
+Publishing several crates is incremental. If the workflow fails after some
+uploads, resolve the error and rerun the same tag workflow. After rate limiting,
+wait until the time reported by crates.io. The rerun skips the exact versions
+already visible, then publishes the remaining crates. A yanked version or a
+registry lookup failure stops the run with an error.
+
+## Verify published packages
+
+Confirm the four selected versions in the registry, then use an empty directory
+to check a downstream install of the new client with its companion crates.
+
+```sh
+for crate in openwire-core openwire-tokio openwire openwire-cache; do
+  cargo info "${crate}@0.1.3"
+done
+release_check_dir="$(mktemp -d)"
+cargo init --bin --name openwire-release-check "$release_check_dir"
+cd "$release_check_dir"
+cargo add 'openwire@=0.1.3' 'openwire-cache@=0.1.3' 'openwire-tungstenite@=0.1.2'
 cargo check
 ```

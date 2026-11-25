@@ -1154,7 +1154,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openwire"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-compression",
  "base64",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "openwire-cache"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "openwire-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "openwire-tokio"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hyper",
  "openwire-core",
