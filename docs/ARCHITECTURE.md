@@ -512,9 +512,9 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
   `max_connections_total`. Optional per-address caps default to unlimited.
   When a per-address cap is set, waiting on one host still does not consume a
   client-wide request slot. Queue precedence ignores waiters that cannot run
-  because their per-address cap is full, so a different host with spare
-  global and per-host capacity is not rejected with `Capacity` while the
-  queue holds only ineligible waiters. `max_queued_requests` fails
-  with `WireErrorKind::Capacity` before taking a running slot. Dropping a
+  because their per-address cap is full. A different host with spare global
+  and per-host capacity can proceed while the queue holds only ineligible
+  waiters. A full `max_queued_requests` queue returns `WireErrorKind::Internal`
+  in `FailurePhase::Admission` before taking a running slot. Dropping a
   queued or already-promoted acquire future must not leak running counts.
 

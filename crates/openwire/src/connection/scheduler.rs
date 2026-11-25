@@ -392,7 +392,7 @@ fn waiter_is_eligible(global: &GlobalState, id: usize, max_per_address: usize) -
 
 /// Only eligible queued requests (those that could take a slot now) block
 /// immediate admission. A waiter stuck on its per-address cap must not cause a
-/// different host with spare capacity to take the queue-full `Capacity` path.
+/// different host with spare capacity to fail request admission.
 fn queue_blocks_priority(
     global: &GlobalState,
     priority: RequestPriority,
@@ -759,7 +759,7 @@ mod tests {
             .acquire(address.clone(), RequestPriority::Normal)
             .await
             .expect_err("queue is full");
-        assert_eq!(error.kind(), openwire_core::WireErrorKind::Capacity);
+        assert_eq!(error.kind(), openwire_core::WireErrorKind::Internal);
         assert_eq!(error.phase(), openwire_core::FailurePhase::Admission);
 
         drop(first);
