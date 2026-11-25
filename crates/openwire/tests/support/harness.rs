@@ -2424,11 +2424,6 @@ where
         .await
 }
 
-pub fn trace_test_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
 impl<S> Layer<S> for TraceCapture
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
