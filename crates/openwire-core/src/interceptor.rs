@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use http::{Request, Response};
 use tower::layer::Layer;
 use tower::util::BoxCloneSyncService;
-use tower::Service;
+use tower::{Service, ServiceExt};
 
 use crate::{BoxFuture, CallContext, RequestBody, ResponseBody, WireError};
 
@@ -66,6 +66,15 @@ impl Next {
         Box::pin(async move {
             let mut inner = self.inner;
             inner.call(exchange).await
+        })
+    }
+
+    /// Waits for the downstream service to be ready before running the exchange.
+    /// Use this for an additional exchange on a clone of `Next`.
+    pub fn run_when_ready(self, exchange: Exchange) -> BoxFuture<Result<WireResponse, WireError>> {
+        Box::pin(async move {
+            let mut inner = self.inner;
+            inner.ready().await?.call(exchange).await
         })
     }
 }

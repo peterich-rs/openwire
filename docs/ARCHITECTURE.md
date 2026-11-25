@@ -482,8 +482,11 @@ cargo test -p openwire --test live_network -- --ignored --test-threads=1
 - HTTP/2 `TransportConfig` knobs (window sizes, frame/header limits, keep-alive
   timeout, reset-stream cap) and HTTP/1 `writev` / `title_case_headers` are
   applied in `bind_http1` / `bind_http2`. TCP linger and buffer sizes are
-  optional on `TokioTcpConnector` and are set on `TcpSocket` before connect.
-  Defaults keep nodelay on and leave buffers/linger to the OS.
+  set on `TcpSocket` before connect by `ConfiguredTokioTcpConnector`.
+  `TokioTcpConnector` is a public unit struct for default options. Its
+  configuration methods return `ConfiguredTokioTcpConnector`. Both implement
+  `TcpConnector` and share the same socket path. Defaults keep nodelay on and
+  leave buffers and linger to the OS.
 - Dual-stack route plans share a single `Arc<Address>` across candidate routes
   instead of cloning the full address key per IP.
 - Follow-up `RequestSnapshot` stores headers and extensions behind `Arc` so

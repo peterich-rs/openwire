@@ -349,8 +349,13 @@ controls needed to avoid unsafe reuse:
   require the original `Authorization` value to match even when the server did
   not include `Authorization` in `Vary`
 - stale stored responses with `ETag` or `Last-Modified` validators are
-  revalidated with conditional GET requests, and `304 Not Modified` responses
-  refresh stored metadata before returning the cached body as `200 OK`
+  revalidated with conditional GET requests. A `304 Not Modified` refreshes
+  eligible matching responses. When the cache added the condition, it returns
+  the validated body as `200 OK` or retries the original GET once if the `304`
+  cannot validate a stored response. Caller-supplied conditions are forwarded
+  and the origin's `304` is returned to the caller.
+- responses from a followed redirect are excluded from the original URI's
+  cache entries
 - stale stored responses are served only when the request explicitly permits
   them with `max-stale` and the cached response does not require validation
 - non-error `2xx` / `3xx` unsafe-method responses invalidate stored responses

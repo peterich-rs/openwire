@@ -177,7 +177,7 @@ impl TcpConnector for ScriptedRaceTcpConnector {
             .expect("missing tcp script");
         Box::pin(async move {
             tokio::time::sleep(script.delay).await;
-            TokioTcpConnector::default()
+            TokioTcpConnector
                 .connect(ctx, script.actual_addr, timeout)
                 .await
         })

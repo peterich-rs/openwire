@@ -445,31 +445,73 @@ pub struct TcpSocketConfig {
     pub send_buffer_size: Option<u32>,
 }
 
+impl TcpSocketConfig {
+    const DEFAULT: Self = Self {
+        nodelay: true,
+        linger: None,
+        recv_buffer_size: None,
+        send_buffer_size: None,
+    };
+}
+
 impl Default for TcpSocketConfig {
     fn default() -> Self {
-        Self {
-            nodelay: true,
-            linger: None,
-            recv_buffer_size: None,
-            send_buffer_size: None,
-        }
+        Self::DEFAULT
     }
 }
 
+/// A Tokio TCP connector using the default socket options.
 #[derive(Clone, Debug, Default)]
-pub struct TokioTcpConnector {
-    config: TcpSocketConfig,
-}
+pub struct TokioTcpConnector;
 
 impl TokioTcpConnector {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    pub fn from_config(config: TcpSocketConfig) -> Self {
-        Self { config }
+    pub fn from_config(config: TcpSocketConfig) -> ConfiguredTokioTcpConnector {
+        ConfiguredTokioTcpConnector { config }
     }
 
+    pub fn nodelay(self, enabled: bool) -> ConfiguredTokioTcpConnector {
+        ConfiguredTokioTcpConnector::default().nodelay(enabled)
+    }
+
+    pub fn linger(self, linger: Option<Duration>) -> ConfiguredTokioTcpConnector {
+        ConfiguredTokioTcpConnector::default().linger(linger)
+    }
+
+    pub fn recv_buffer_size(self, size: u32) -> ConfiguredTokioTcpConnector {
+        ConfiguredTokioTcpConnector::default().recv_buffer_size(size)
+    }
+
+    pub fn send_buffer_size(self, size: u32) -> ConfiguredTokioTcpConnector {
+        ConfiguredTokioTcpConnector::default().send_buffer_size(size)
+    }
+
+    pub fn config(&self) -> &TcpSocketConfig {
+        &TcpSocketConfig::DEFAULT
+    }
+}
+
+impl TcpConnector for TokioTcpConnector {
+    fn connect(
+        &self,
+        ctx: CallContext,
+        addr: SocketAddr,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<Result<BoxConnection, WireError>> {
+        ConfiguredTokioTcpConnector::default().connect(ctx, addr, timeout)
+    }
+}
+
+/// A Tokio TCP connector with explicit socket options.
+#[derive(Clone, Debug, Default)]
+pub struct ConfiguredTokioTcpConnector {
+    config: TcpSocketConfig,
+}
+
+impl ConfiguredTokioTcpConnector {
     pub fn nodelay(mut self, enabled: bool) -> Self {
         self.config.nodelay = enabled;
         self
@@ -495,7 +537,7 @@ impl TokioTcpConnector {
     }
 }
 
-impl TcpConnector for TokioTcpConnector {
+impl TcpConnector for ConfiguredTokioTcpConnector {
     fn connect(
         &self,
         ctx: CallContext,

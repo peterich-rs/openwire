@@ -13,7 +13,8 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use openwire::{
-    BoxFuture, Exchange, Interceptor, Next, RequestBody, ResponseBody, ResponseTiming, WireError,
+    BoxFuture, Exchange, Interceptor, Next, RedirectedResponse, RequestBody, ResponseBody,
+    ResponseTiming, WireError, WireErrorKind,
 };
 use tokio::sync::RwLock;
 use url::Url;
@@ -63,23 +64,26 @@ where
                 .is_cacheable
                 .then(|| cache_key(exchange.request().uri()));
             let request_headers = exchange.request().headers().clone();
+            let caller_conditional = request_headers.contains_key(IF_NONE_MATCH)
+                || request_headers.contains_key(IF_MODIFIED_SINCE);
 
+            let mut candidates = Vec::new();
             let mut validation_entry = None;
             if let Some(cache_key) = cache_key.as_ref() {
-                for entry in store.get_candidates(cache_key).await.into_iter().rev() {
-                    if entry.matches_request(&request_policy, &request_headers) {
-                        if request_policy.lookup && entry.is_servable_for(&request_policy) {
-                            let response = entry.into_response();
-                            ctx.listener().cache_hit(&ctx, &response);
-                            return Ok(response);
-                        }
+                candidates = store.get_candidates(cache_key).await;
+                candidates.retain(|entry| entry.matches_request(&request_policy, &request_headers));
+                candidates.sort_by_key(CachedResponse::recency);
+                if let Some(entry) = candidates.last().filter(|_| !caller_conditional) {
+                    if request_policy.lookup && entry.is_servable_for(&request_policy) {
+                        let response = entry.clone().into_response();
+                        ctx.listener().cache_hit(&ctx, &response);
+                        return Ok(response);
+                    }
 
-                        if !request_policy.only_if_cached
-                            && entry.can_revalidate(exchange.request().headers())
-                        {
-                            validation_entry = Some(entry);
-                        }
-                        break;
+                    if !request_policy.only_if_cached
+                        && CacheValidators::from_headers(&entry.headers).has_any()
+                    {
+                        validation_entry = Some(entry);
                     }
                 }
 
@@ -90,16 +94,25 @@ where
                 }
             }
 
-            if let Some(entry) = validation_entry.as_ref() {
+            let retry = if let Some(entry) = validation_entry {
+                let original = recovery_exchange(&exchange).ok_or_else(|| {
+                    WireError::new(
+                        WireErrorKind::Internal,
+                        "cache validation requires a replayable request",
+                    )
+                })?;
                 let cached = entry.clone().into_response();
                 ctx.listener().cache_conditional_hit(&ctx, &cached);
                 entry.apply_revalidation_headers(exchange.request_mut().headers_mut());
-            } else if cache_key.is_some() {
-                ctx.listener().cache_miss(&ctx);
-            }
+                Some((next.clone(), original))
+            } else {
+                if cache_key.is_some() {
+                    ctx.listener().cache_miss(&ctx);
+                }
+                None
+            };
 
-            let response = next.run(exchange).await?;
-            let timing = response.extensions().get::<ResponseTiming>().copied();
+            let mut response = next.run(exchange).await?;
             if let Some(invalidation_target) = invalidation_target.as_ref() {
                 if response_status_invalidates_cache(response.status()) {
                     for key in invalidation_keys(invalidation_target, response.headers()) {
@@ -112,49 +125,88 @@ where
                 return Ok(response);
             };
 
-            if let Some(entry) = validation_entry.as_ref() {
-                if response.status() == StatusCode::NOT_MODIFIED {
-                    let (parts, body) = response.into_parts();
-                    let _ = body.bytes().await?;
-                    let Some(timing) = timing else {
-                        // The conditional request was ours, so still reconstruct
-                        // its response. Without exchange timing, do not publish
-                        // a refreshed entry with an underestimated age.
-                        store.remove_candidate(&cache_key, entry).await;
-                        let mut validation_headers = parts.headers;
-                        ensure_response_date(&mut validation_headers, SystemTime::now());
-                        let response = build_response(
-                            entry.status,
-                            entry.version,
-                            merge_304_headers(&entry.headers, &validation_headers),
-                            entry.body.clone(),
-                        );
-                        ctx.listener().cache_hit(&ctx, &response);
-                        return Ok(response);
-                    };
-                    let (freshened, store_response) =
-                        entry.freshen_from_not_modified(&parts.headers, &request_headers, timing);
-                    if store_response {
-                        store.put_candidate(cache_key, freshened.clone()).await;
+            if response.status() == StatusCode::NOT_MODIFIED
+                && (retry.is_some() || caller_conditional)
+            {
+                if retry.is_some() {
+                    std::mem::take(response.body_mut()).bytes().await?;
+                }
+                let timing = response.extensions().get::<ResponseTiming>().copied();
+                let eligible = if response.extensions().get::<RedirectedResponse>().is_some() {
+                    &[]
+                } else {
+                    candidates.as_slice()
+                };
+                let mut reconstructed = None;
+                for entry in validated_candidates(eligible, response.headers()) {
+                    let (freshened, storable) = if let Some(timing) = timing {
+                        entry.freshen_from_not_modified(
+                            response.headers(),
+                            &request_headers,
+                            timing,
+                        )
                     } else {
-                        store.remove_candidate(&cache_key, entry).await;
+                        // Without timing, reconstruct the response without publishing a new Age.
+                        let mut headers = response.headers().clone();
+                        ensure_response_date(&mut headers, SystemTime::now());
+                        let mut freshened = entry.clone();
+                        freshened.headers = merge_304_headers(&entry.headers, &headers);
+                        (freshened, false)
+                    };
+                    if request_policy.store_response {
+                        store
+                            .replace_validated_candidate(
+                                &cache_key,
+                                entry,
+                                storable.then(|| freshened.clone()),
+                            )
+                            .await;
                     }
-                    let response = freshened.into_response();
+                    reconstructed.get_or_insert(freshened);
+                }
+
+                let Some((next, original)) = retry else {
+                    return Ok(response);
+                };
+                if let Some(freshened) = reconstructed {
+                    let response = if timing.is_some() {
+                        freshened.into_response()
+                    } else {
+                        build_response(
+                            freshened.status,
+                            freshened.version,
+                            freshened.headers,
+                            freshened.body,
+                        )
+                    };
                     ctx.listener().cache_hit(&ctx, &response);
                     return Ok(response);
                 }
+
+                // Drop the response extensions before re-entering the chain so any
+                // admission permit from the conditional exchange is released.
+                drop(response);
+                response = next.run_when_ready(original).await?;
+                if response.status() == StatusCode::NOT_MODIFIED {
+                    return Err(WireError::new(
+                        WireErrorKind::Protocol,
+                        "304 response to a cache recovery request without a validation condition",
+                    ));
+                }
             }
 
-            if !request_policy.store_response {
+            if !request_policy.store_response
+                || response.extensions().get::<RedirectedResponse>().is_some()
+            {
                 return Ok(response);
             }
 
-            let Some(timing) = timing else {
+            let Some(timing) = response.extensions().get::<ResponseTiming>().copied() else {
                 if response.status() == StatusCode::OK {
                     remove_unusable_candidate(
                         store.as_ref(),
                         &cache_key,
-                        validation_entry.as_ref(),
+                        validation_entry,
                         &request_policy,
                         &request_headers,
                     )
@@ -170,7 +222,7 @@ where
                 remove_unusable_candidate(
                     store.as_ref(),
                     &cache_key,
-                    validation_entry.as_ref(),
+                    validation_entry,
                     &request_policy,
                     &request_headers,
                 )
@@ -197,7 +249,7 @@ where
                     remove_unusable_candidate(
                         store.as_ref(),
                         &cache_key,
-                        validation_entry.as_ref(),
+                        validation_entry,
                         &request_policy,
                         &request_headers,
                     )
@@ -210,7 +262,7 @@ where
                 remove_unusable_candidate(
                     store.as_ref(),
                     &cache_key,
-                    validation_entry.as_ref(),
+                    validation_entry,
                     &request_policy,
                     &request_headers,
                 )
@@ -245,6 +297,21 @@ where
             Ok(Response::from_parts(parts, ResponseBody::from_bytes(body)))
         })
     }
+}
+
+fn recovery_exchange(exchange: &Exchange) -> Option<Exchange> {
+    let request = exchange.request();
+    let mut cloned = Request::new(request.body().try_clone()?);
+    *cloned.method_mut() = request.method().clone();
+    *cloned.uri_mut() = request.uri().clone();
+    *cloned.version_mut() = request.version();
+    *cloned.headers_mut() = request.headers().clone();
+    *cloned.extensions_mut() = request.extensions().clone();
+    Some(Exchange::new(
+        cloned,
+        exchange.context().clone(),
+        exchange.attempt().saturating_add(1),
+    ))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,6 +361,77 @@ impl CacheValidators {
 
     fn has_any(&self) -> bool {
         self.etag.is_some() || self.last_modified.is_some()
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct EntityTag<'a> {
+    weak: bool,
+    opaque: &'a [u8],
+}
+
+fn entity_tag(value: &HeaderValue) -> Option<EntityTag<'_>> {
+    let value = value.as_bytes();
+    let (weak, value) = match value.strip_prefix(b"W/") {
+        Some(value) => (true, value),
+        None => (false, value),
+    };
+    let opaque = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    // RFC 9110 §8.8.3 permits obs-text and compares opaque tags as octets.
+    opaque
+        .iter()
+        .all(|byte| matches!(byte, b'!' | b'#'..=b'~' | 0x80..=0xff))
+        .then_some(EntityTag { weak, opaque })
+}
+
+fn etag_header(headers: &HeaderMap) -> Option<EntityTag<'_>> {
+    let mut values = headers.get_all(ETAG).into_iter();
+    let tag = entity_tag(values.next()?)?;
+    values.next().is_none().then_some(tag)
+}
+
+fn validated_candidates<'a>(
+    candidates: &'a [CachedResponse],
+    headers: &HeaderMap,
+) -> Vec<&'a CachedResponse> {
+    let tag = etag_header(headers);
+    if headers.contains_key(ETAG) && tag.is_none() {
+        return Vec::new();
+    }
+    if let Some(tag) = tag.as_ref().filter(|tag| !tag.weak) {
+        // A strong validator takes precedence over weak validators, even on a miss.
+        return candidates
+            .iter()
+            .rev()
+            .filter(|entry| etag_header(&entry.headers).as_ref() == Some(tag))
+            .collect();
+    }
+
+    // No trusted origin-clock provenance is available to establish strength for Last-Modified.
+    let last_modified = parse_http_date_header(headers, LAST_MODIFIED);
+    if tag.is_some() || last_modified.is_some() {
+        return candidates
+            .iter()
+            .rev()
+            .find(|entry| {
+                tag.as_ref().is_some_and(|tag| {
+                    etag_header(&entry.headers).is_some_and(|stored| tag.opaque == stored.opaque)
+                }) || last_modified.is_some_and(|date| {
+                    parse_http_date_header(&entry.headers, LAST_MODIFIED) == Some(date)
+                })
+            })
+            .into_iter()
+            .collect();
+    }
+
+    match candidates {
+        [entry]
+            if !headers.contains_key(LAST_MODIFIED)
+                && !CacheValidators::from_headers(&entry.headers).has_any() =>
+        {
+            vec![entry]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -508,6 +646,35 @@ pub trait CacheStore: Send + Sync + 'static {
         let _ = value;
         self.remove(key).await;
     }
+
+    /// Updates or removes a candidate identified by a validation response if the
+    /// stored candidate still matches the snapshot taken before validation.
+    /// Stores shared between concurrent calls should override this method to
+    /// make the check and write atomic.
+    async fn replace_validated_candidate(
+        &self,
+        key: &str,
+        previous: &CachedResponse,
+        replacement: Option<CachedResponse>,
+    ) {
+        if !self
+            .get_candidates(key)
+            .await
+            .iter()
+            .any(|entry| entry.same_snapshot_as(previous))
+        {
+            return;
+        }
+        match replacement {
+            Some(replacement) => {
+                if !previous.same_variant_as(&replacement) {
+                    self.remove_candidate(key, previous).await;
+                }
+                self.put_candidate(key.to_owned(), replacement).await;
+            }
+            None => self.remove_candidate(key, previous).await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -623,6 +790,36 @@ impl CacheStore for MemoryCacheStore {
             return;
         };
         candidates.retain(|candidate| !candidate.same_variant_as(value));
+        if candidates.is_empty() {
+            entries.remove(key);
+        }
+    }
+
+    async fn replace_validated_candidate(
+        &self,
+        key: &str,
+        previous: &CachedResponse,
+        replacement: Option<CachedResponse>,
+    ) {
+        let mut entries = self.entries.write().await;
+        let Some(candidates) = entries.get_mut(key) else {
+            return;
+        };
+        let Some(index) = candidates
+            .iter()
+            .position(|entry| entry.same_snapshot_as(previous))
+        else {
+            return;
+        };
+        candidates.remove(index);
+        if let Some(replacement) = replacement {
+            if !candidates
+                .iter()
+                .any(|entry| entry.same_variant_as(&replacement))
+            {
+                candidates.insert(index, replacement);
+            }
+        }
         if candidates.is_empty() {
             entries.remove(key);
         }
@@ -775,10 +972,26 @@ impl CachedResponse {
         self.vary == other.vary
     }
 
-    fn can_revalidate(&self, request_headers: &HeaderMap) -> bool {
-        !request_headers.contains_key(IF_NONE_MATCH)
-            && !request_headers.contains_key(IF_MODIFIED_SINCE)
-            && CacheValidators::from_headers(&self.headers).has_any()
+    /// Checks whether two entries have the same stored representation and cache
+    /// metadata. Cache stores can use this before replacing a validated entry.
+    pub fn same_snapshot_as(&self, other: &Self) -> bool {
+        self.received_at == other.received_at
+            && self.same_variant_as(other)
+            && self.status == other.status
+            && self.version == other.version
+            && self.headers == other.headers
+            && self.body == other.body
+            && self.initial_age == other.initial_age
+            && self.freshness_lifetime == other.freshness_lifetime
+            && self.must_validate == other.must_validate
+            && self.must_revalidate == other.must_revalidate
+    }
+
+    fn recency(&self) -> (Option<SystemTime>, Instant) {
+        (
+            parse_http_date_header(&self.headers, DATE),
+            self.received_at,
+        )
     }
 
     fn apply_revalidation_headers(&self, request_headers: &mut HeaderMap) {
@@ -1126,13 +1339,14 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use bytes::Bytes;
-    use http::header::{AGE, CONTENT_LOCATION, DATE, LOCATION};
-    use http::{HeaderMap, StatusCode, Uri, Version};
+    use http::header::{AGE, CONTENT_LOCATION, DATE, ETAG, LAST_MODIFIED, LOCATION};
+    use http::{HeaderMap, HeaderValue, StatusCode, Uri, Version};
     use openwire::ResponseTiming;
 
     use super::{
-        invalidation_keys, parse_delta_seconds, response_age, response_current_age, CachedResponse,
-        CachedResponseOptions, RequestCachePolicy, MAX_DELTA_SECONDS,
+        invalidation_keys, parse_delta_seconds, response_age, response_current_age,
+        validated_candidates, CacheStore, CachedResponse, CachedResponseOptions, MemoryCacheStore,
+        RequestCachePolicy, MAX_DELTA_SECONDS,
     };
 
     #[test]
@@ -1185,6 +1399,68 @@ mod tests {
                 ..CachedResponseOptions::default()
             },
         )
+    }
+
+    #[test]
+    fn validation_selects_all_strong_matches_or_the_most_recent_weak_match() {
+        let instant = Instant::now();
+        let timing = ResponseTiming::new(instant, instant, SystemTime::UNIX_EPOCH);
+        let mut candidates = [b"\"\x80\"".as_slice(), b"\"\x80\"", b"W/\"\x80\""].map(|tag| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ETAG, HeaderValue::from_bytes(tag).unwrap());
+            timed_entry(headers, timing, Duration::ZERO)
+        });
+        let mut validation = HeaderMap::new();
+        validation.insert(ETAG, HeaderValue::from_bytes(b"\"\x80\"").unwrap());
+        let matched = validated_candidates(&candidates, &validation);
+        assert_eq!(matched.len(), 2);
+        assert!(std::ptr::eq(matched[0], &candidates[1]));
+        assert!(std::ptr::eq(matched[1], &candidates[0]));
+
+        validation.insert(ETAG, HeaderValue::from_bytes(b"W/\"\x80\"").unwrap());
+        let matched = validated_candidates(&candidates, &validation);
+        assert_eq!(matched.len(), 1);
+        assert!(std::ptr::eq(matched[0], &candidates[2]));
+
+        validation.clear();
+        assert!(validated_candidates(&candidates[..1], &validation).is_empty());
+        candidates[0].headers.remove(ETAG);
+        assert_eq!(validated_candidates(&candidates[..1], &validation).len(), 1);
+        assert!(validated_candidates(&candidates, &validation).is_empty());
+
+        let modified = HeaderValue::from_static("Wed, 01 Jan 2020 00:00:00 GMT");
+        candidates[0]
+            .headers
+            .insert(LAST_MODIFIED, modified.clone());
+        validation.insert(LAST_MODIFIED, modified);
+        assert_eq!(validated_candidates(&candidates, &validation).len(), 1);
+        validation.insert(ETAG, HeaderValue::from_static("\"unknown\""));
+        assert!(validated_candidates(&candidates, &validation).is_empty());
+        validation.append(ETAG, HeaderValue::from_static("W/\"duplicate\""));
+        assert!(validated_candidates(&candidates, &validation).is_empty());
+    }
+
+    #[tokio::test]
+    async fn validated_snapshot_cannot_overwrite_a_replaced_variant() {
+        let instant = Instant::now();
+        let timing = ResponseTiming::new(instant, instant, SystemTime::UNIX_EPOCH);
+        let entry = |tag: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ETAG, HeaderValue::from_static(tag));
+            timed_entry(headers, timing, Duration::ZERO)
+        };
+        let store = MemoryCacheStore::new();
+        let key = "http://example.test/resource";
+        let snapshot = entry("\"v1\"");
+        store.put(key.to_owned(), snapshot.clone()).await;
+        store.put(key.to_owned(), entry("\"v2\"")).await;
+        store
+            .replace_validated_candidate(key, &snapshot, Some(snapshot.clone()))
+            .await;
+        store
+            .replace_validated_candidate(key, &snapshot, None)
+            .await;
+        assert_eq!(store.get(key).await.unwrap().headers[ETAG], "\"v2\"");
     }
 
     #[test]

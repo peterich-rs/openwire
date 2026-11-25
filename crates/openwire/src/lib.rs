@@ -42,3 +42,9 @@ pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};
 pub use policy::{DefaultRedirectPolicy, DefaultRetryPolicy};
 pub use proxy::{NoProxy, Proxy, ProxyChoice, ProxyRules, ProxySelection, ProxySelector};
 pub use url::Url;
+
+/// Response extension indicating that the client followed at least one redirect.
+/// Cache and other application interceptors can use it to distinguish the
+/// response to the original request from a response to a redirect target.
+#[derive(Clone, Copy, Debug)]
+pub struct RedirectedResponse;

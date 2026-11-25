@@ -10,7 +10,7 @@ use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use openwire::{
     BoxFuture, Client, Exchange, Interceptor, Next, RequestBody, ResponseBody, ResponseTiming,
-    WireError,
+    WireError, WireErrorKind,
 };
 use openwire_cache::CacheInterceptor;
 use openwire_test::{spawn_http1, text_response, RecordingEventListenerFactory};
@@ -1916,6 +1916,322 @@ async fn stale_etag_response_revalidates_with_if_none_match() {
         "etag body"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn strong_etag_304_only_refreshes_a_strong_match() {
+    for (stored_tag, validation_tag, expected_body, expected_tag, expected_hits) in [
+        ("\"old\"", "\"old\"", "original", "\"old\"", 2),
+        ("\"old\"", "\"new\"", "replacement", "\"new\"", 3),
+        ("W/\"new\"", "\"new\"", "replacement", "\"new\"", 3),
+    ] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server = spawn_http1({
+            let hits = hits.clone();
+            move |request: Request<Incoming>| {
+                let hit = hits.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(request.headers()[ACCEPT_LANGUAGE], "en");
+                    let last_modified = "Wed, 01 Jan 2020 00:00:00 GMT";
+                    let (mut response, cache_control, etag) = match hit {
+                        0 => (
+                            text_response(StatusCode::OK, "original"),
+                            "max-age=0",
+                            stored_tag,
+                        ),
+                        1 => {
+                            assert_eq!(request.headers()[IF_NONE_MATCH], stored_tag);
+                            assert_eq!(request.headers()[IF_MODIFIED_SINCE], last_modified);
+                            (
+                                text_response(StatusCode::NOT_MODIFIED, ""),
+                                "max-age=600",
+                                validation_tag,
+                            )
+                        }
+                        2 => {
+                            assert!(!request.headers().contains_key(IF_NONE_MATCH));
+                            assert!(!request.headers().contains_key(IF_MODIFIED_SINCE));
+                            (
+                                text_response(StatusCode::OK, "replacement"),
+                                "max-age=60",
+                                expected_tag,
+                            )
+                        }
+                        _ => panic!("an unexpected extra request reached the origin"),
+                    };
+                    let headers = response.headers_mut();
+                    headers.insert(CACHE_CONTROL, cache_control.parse().unwrap());
+                    headers.insert(ETAG, etag.parse().unwrap());
+                    headers.insert(LAST_MODIFIED, last_modified.parse().unwrap());
+                    headers.insert(VARY, "Accept-Language".parse().unwrap());
+                    response
+                }
+            }
+        })
+        .await;
+        let client = Client::builder()
+            .max_requests_total(1)
+            .application_interceptor(CacheInterceptor::memory())
+            .build()
+            .unwrap();
+        let uri = server.http_url("/strong-validator");
+        for (body, tag, cache_control) in [
+            ("original", stored_tag, "max-age=0"),
+            (
+                expected_body,
+                expected_tag,
+                if expected_hits == 2 {
+                    "max-age=600"
+                } else {
+                    "max-age=60"
+                },
+            ),
+            (
+                expected_body,
+                expected_tag,
+                if expected_hits == 2 {
+                    "max-age=600"
+                } else {
+                    "max-age=60"
+                },
+            ),
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.execute(request_with_header(&uri, ACCEPT_LANGUAGE, "en")),
+            )
+            .await
+            .expect("cache recovery released the validation exchange")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[ETAG], tag);
+            assert_eq!(response.headers()[CACHE_CONTROL], cache_control);
+            assert_eq!(response.into_body().text().await.unwrap(), body);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), expected_hits);
+    }
+}
+
+#[tokio::test]
+async fn untimed_mismatched_304_and_unsolicited_recovery_304_do_not_modify_cache() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let hits = hits.clone();
+        move |request: Request<Incoming>| {
+            let hit = hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let (mut response, etag, max_age) = match hit {
+                    0 => (
+                        text_response(StatusCode::OK, "original"),
+                        "\"v1\"",
+                        "max-age=0",
+                    ),
+                    1 => {
+                        assert_eq!(request.headers()[IF_NONE_MATCH], "\"v1\"");
+                        (
+                            text_response(StatusCode::NOT_MODIFIED, ""),
+                            "\"v2\"",
+                            "max-age=600",
+                        )
+                    }
+                    2 => {
+                        assert!(!request.headers().contains_key(IF_NONE_MATCH));
+                        (
+                            text_response(StatusCode::NOT_MODIFIED, ""),
+                            "\"v2\"",
+                            "max-age=600",
+                        )
+                    }
+                    _ => panic!("recovery repeated"),
+                };
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, max_age.parse().unwrap());
+                response.headers_mut().insert(ETAG, etag.parse().unwrap());
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .network_interceptor(RemoveValidationTiming)
+        .build()
+        .unwrap();
+    let uri = server.http_url("/invalid-304");
+    client
+        .execute(empty_request(&uri))
+        .await
+        .unwrap()
+        .into_body()
+        .bytes()
+        .await
+        .unwrap();
+    let error = client.execute(empty_request(&uri)).await.unwrap_err();
+    assert_eq!(error.kind(), WireErrorKind::Protocol);
+    let still_cached = client
+        .execute(request_with_header(
+            &uri,
+            CACHE_CONTROL,
+            "only-if-cached, max-stale",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_cached.headers()[ETAG], "\"v1\"");
+    assert_eq!(still_cached.headers()[CACHE_CONTROL], "max-age=0");
+    assert_eq!(still_cached.into_body().text().await.unwrap(), "original");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn caller_validation_preserves_the_304_and_refreshes_only_a_matching_entry() {
+    for (caller_tag, expected_cache_control) in
+        [("\"v1\"", "max-age=600"), ("\"v2\"", "max-age=60")]
+    {
+        let server = spawn_http1(move |request: Request<Incoming>| async move {
+            let language = request.headers()[ACCEPT_LANGUAGE].to_str().unwrap();
+            let (mut response, tag, max_age) =
+                if let Some(value) = request.headers().get(IF_NONE_MATCH) {
+                    assert_eq!(language, "en");
+                    assert_eq!(value, caller_tag);
+                    (
+                        text_response(StatusCode::NOT_MODIFIED, ""),
+                        caller_tag,
+                        "max-age=600",
+                    )
+                } else {
+                    (
+                        text_response(StatusCode::OK, language.to_owned()),
+                        if language == "en" {
+                            "\"v1\""
+                        } else {
+                            caller_tag
+                        },
+                        "max-age=60",
+                    )
+                };
+            response.headers_mut().insert(ETAG, tag.parse().unwrap());
+            response
+                .headers_mut()
+                .insert(VARY, "Accept-Language".parse().unwrap());
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, max_age.parse().unwrap());
+            response
+        })
+        .await;
+        let client = Client::builder()
+            .application_interceptor(CacheInterceptor::memory())
+            .build()
+            .unwrap();
+        let uri = server.http_url("/caller-validation");
+        for language in ["en", "fr"] {
+            let seed = client
+                .execute(request_with_header(&uri, ACCEPT_LANGUAGE, language))
+                .await
+                .unwrap();
+            assert_eq!(seed.into_body().text().await.unwrap(), language);
+        }
+        let response = client
+            .execute(request_with_headers(
+                &uri,
+                ACCEPT_LANGUAGE,
+                "en",
+                IF_NONE_MATCH,
+                caller_tag,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[ETAG], caller_tag);
+        assert!(response.into_body().bytes().await.unwrap().is_empty());
+        for (language, tag, cache_control) in [
+            ("en", "\"v1\"", expected_cache_control),
+            ("fr", caller_tag, "max-age=60"),
+        ] {
+            let cached = client
+                .execute(request_with_headers(
+                    &uri,
+                    ACCEPT_LANGUAGE,
+                    language,
+                    CACHE_CONTROL,
+                    "only-if-cached",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(cached.headers()[ETAG], tag);
+            assert_eq!(cached.headers()[CACHE_CONTROL], cache_control);
+            assert_eq!(cached.into_body().text().await.unwrap(), language);
+        }
+    }
+}
+
+#[tokio::test]
+async fn redirect_target_304_cannot_validate_the_original_uri() {
+    let original_hits = Arc::new(AtomicUsize::new(0));
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let server = spawn_http1({
+        let original_hits = original_hits.clone();
+        let target_hits = target_hits.clone();
+        move |request: Request<Incoming>| {
+            let (counter, original) = match request.uri().path() {
+                "/original" => (&original_hits, true),
+                "/target" => (&target_hits, false),
+                _ => panic!("unexpected URI"),
+            };
+            let hit = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut response = match (original, hit) {
+                    (true, 0) => text_response(StatusCode::OK, "original body"),
+                    (true, 1 | 2) => {
+                        let mut response = text_response(StatusCode::TEMPORARY_REDIRECT, "");
+                        response
+                            .headers_mut()
+                            .insert(LOCATION, "/target".parse().unwrap());
+                        return response;
+                    }
+                    (false, 0) => {
+                        assert_eq!(request.headers()[IF_NONE_MATCH], "\"v1\"");
+                        text_response(StatusCode::NOT_MODIFIED, "")
+                    }
+                    (false, 1) => {
+                        assert!(!request.headers().contains_key(IF_NONE_MATCH));
+                        text_response(StatusCode::OK, "different target body")
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                let cache_control = if original { "max-age=0" } else { "max-age=600" };
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, cache_control.parse().unwrap());
+                response
+                    .headers_mut()
+                    .insert(ETAG, "\"v1\"".parse().unwrap());
+                response
+            }
+        }
+    })
+    .await;
+    let client = Client::builder()
+        .application_interceptor(CacheInterceptor::memory())
+        .build()
+        .unwrap();
+    let uri = server.http_url("/original");
+    let initial = client.execute(empty_request(&uri)).await.unwrap();
+    assert_eq!(initial.into_body().text().await.unwrap(), "original body");
+    let resolved = client.execute(empty_request(&uri)).await.unwrap();
+    assert_eq!(resolved.status(), StatusCode::OK);
+    assert_eq!(
+        resolved.into_body().text().await.unwrap(),
+        "different target body"
+    );
+    let cache_only = client
+        .execute(request_with_header(&uri, CACHE_CONTROL, "only-if-cached"))
+        .await
+        .unwrap();
+    assert_eq!(cache_only.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(original_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

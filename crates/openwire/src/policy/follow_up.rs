@@ -26,6 +26,7 @@ pub(crate) type SharedCookieJar = Arc<dyn CookieJar>;
 use crate::proxy::SelectedProxy;
 use crate::trace::PolicyTraceContext;
 use crate::transport::{CoalescedConnectionRetryable, NoCoalescedConnections};
+use crate::RedirectedResponse;
 
 #[derive(Clone)]
 pub(crate) struct PolicyConfig {
@@ -112,7 +113,10 @@ impl Service<Exchange> for FollowUpPolicyService {
                 };
 
                 match result {
-                    Ok(response) => {
+                    Ok(mut response) => {
+                        if redirects != 0 {
+                            response.extensions_mut().insert(RedirectedResponse);
+                        }
                         let selected_proxy = response.extensions().get::<SelectedProxy>().cloned();
                         store_response_cookies(
                             &response,
