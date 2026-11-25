@@ -7,6 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use openwire::{Client, RequestPriority, WireErrorKind};
+use openwire_core::FailurePhase;
 use openwire_test::{ok_text, spawn_http1, RecordingEventListenerFactory, StaticDnsResolver};
 
 use support::*;
@@ -316,7 +317,9 @@ async fn max_queued_requests_fails_with_capacity_before_taking_a_slot() {
         )))
         .await
         .expect_err("queue should be full");
-    assert_eq!(error.kind(), WireErrorKind::Capacity);
+    assert_eq!(error.kind(), WireErrorKind::Internal);
+    assert_eq!(error.phase(), FailurePhase::Admission);
+    assert!(!error.request_committed());
 
     drop(first);
     queued
