@@ -526,8 +526,10 @@ impl ClientBuilder {
     }
 
     /// Caps how many calls may wait for a request-admission slot. Default is
-    /// `usize::MAX` (unbounded). A finite cap fails acquire with
-    /// [`WireErrorKind::Capacity`] before taking a running slot.
+    /// `usize::MAX` (unbounded). A full queue returns
+    /// [`WireErrorKind::Internal`](crate::WireErrorKind::Internal) with
+    /// [`FailurePhase::Admission`](openwire_core::FailurePhase::Admission)
+    /// before taking a running slot.
     pub fn max_queued_requests(mut self, max_queued: usize) -> Self {
         self.transport.max_queued_requests = max_queued;
         self
