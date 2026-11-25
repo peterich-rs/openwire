@@ -37,8 +37,9 @@ pub use runtime::{BoxTaskHandle, HyperExecutor, SharedTimer, TaskHandle, WireExe
 pub use transport::{
     BoxConnection, BoxDnsService, BoxTcpService, BoxTlsService, CoalescingInfo, Connected,
     Connection, ConnectionInfo, ConnectionIo, DnsRequest, DnsResolver, DnsResolverService,
-    TcpConnectRequest, TcpConnector, TcpConnectorService, TlsAlpnPreference, TlsConnectRequest,
-    TlsConnector, TlsConnectorService, TowerDnsResolver, TowerTcpConnector, TowerTlsConnector,
+    ResponseTiming, TcpConnectRequest, TcpConnector, TcpConnectorService, TlsAlpnPreference,
+    TlsConnectRequest, TlsConnector, TlsConnectorService, TowerDnsResolver, TowerTcpConnector,
+    TowerTlsConnector,
 };
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

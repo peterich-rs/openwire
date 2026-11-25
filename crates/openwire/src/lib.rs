@@ -33,9 +33,9 @@ pub use openwire_core::{
     BoxTaskHandle, CallContext, CallId, Connected, Connection, ConnectionId, ConnectionInfo,
     CookieJar, DnsResolver, EstablishmentStage, EventListener, EventListenerFactory, Exchange,
     HyperExecutor, Interceptor, Next, NoopEventListener, NoopEventListenerFactory, ProxyEvent,
-    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, RetryContext,
-    RetryPolicy, SharedTimer, TaskHandle, TcpConnector, TlsAlpnPreference, TlsConnector,
-    TlsHandshake, WireError, WireErrorKind, WireExecutor,
+    RedirectContext, RedirectDecision, RedirectPolicy, RequestBody, ResponseBody, ResponseTiming,
+    RetryContext, RetryPolicy, SharedTimer, TaskHandle, TcpConnector, TlsAlpnPreference,
+    TlsConnector, TlsHandshake, WireError, WireErrorKind, WireExecutor,
 };
 #[cfg(feature = "tls-rustls")]
 pub use openwire_rustls::{RustlsTlsConnector, RustlsTlsConnectorBuilder};

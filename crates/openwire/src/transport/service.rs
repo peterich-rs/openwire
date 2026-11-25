@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::{select, Either};
 use http::header::{HeaderName, HeaderValue};
@@ -10,7 +10,8 @@ use hyper::client::conn::{http1, http2, TrySendError};
 use hyper::rt::Timer;
 use openwire_core::{
     BoxConnection, BoxFuture, CallContext, Connection, ConnectionId, ConnectionInfo, Exchange,
-    HyperExecutor, RequestBody, ResponseBody, SharedTimer, WireError, WireErrorKind, WireExecutor,
+    HyperExecutor, RequestBody, ResponseBody, ResponseTiming, SharedTimer, WireError,
+    WireErrorKind, WireExecutor,
 };
 use tower::Service;
 use tracing::instrument::WithSubscriber;
@@ -888,9 +889,10 @@ async fn send_bound_request(
                 map_hyper_error(error)
             })?;
             let request_requests_close = connection_header_requests_close(request.headers());
-            let response = dispatch_try_send_request(&ctx, request, protocol, |request| {
-                sender.try_send_request(request)
-            });
+            let (response, request_sent_at) =
+                dispatch_try_send_request(&ctx, request, protocol, |request| {
+                    sender.try_send_request(request)
+                });
             let response = response.await;
             let mut response = response.map_err(|error| {
                 cleanup_failed_request(
@@ -903,6 +905,11 @@ async fn send_bound_request(
                 );
                 map_try_send_error_with_events(&ctx, error)
             })?;
+            response.extensions_mut().insert(ResponseTiming::new(
+                request_sent_at,
+                Instant::now(),
+                SystemTime::now(),
+            ));
             let reusable = http1_exchange_allows_reuse(request_requests_close, &response);
             response.extensions_mut().insert(info);
             if let Some(selected_proxy) = selected_proxy {
@@ -935,9 +942,10 @@ async fn send_bound_request(
                 );
                 map_hyper_error(error)
             })?;
-            let response = dispatch_try_send_request(&ctx, request, protocol, |request| {
-                sender.try_send_request(request)
-            });
+            let (response, request_sent_at) =
+                dispatch_try_send_request(&ctx, request, protocol, |request| {
+                    sender.try_send_request(request)
+                });
             let response = response.await;
             let mut response = response.map_err(|error| {
                 cleanup_failed_request(
@@ -950,6 +958,11 @@ async fn send_bound_request(
                 );
                 map_try_send_error_with_events(&ctx, error)
             })?;
+            response.extensions_mut().insert(ResponseTiming::new(
+                request_sent_at,
+                Instant::now(),
+                SystemTime::now(),
+            ));
             response.extensions_mut().insert(info);
             if let Some(selected_proxy) = selected_proxy {
                 response.extensions_mut().insert(selected_proxy);
@@ -978,18 +991,19 @@ fn dispatch_try_send_request<F, T>(
     request: Request<RequestBody>,
     protocol: ConnectionProtocol,
     send: F,
-) -> T
+) -> (T, Instant)
 where
     F: FnOnce(Request<RequestBody>) -> T,
 {
     let present_empty = present_empty_outgoing_body(&request, protocol);
     ctx.listener().request_headers_start(ctx);
+    let request_sent_at = Instant::now();
     let pending = send(request);
     ctx.listener().request_headers_end(ctx);
     if present_empty {
         emit_present_empty_body_events(ctx);
     }
-    pending
+    (pending, request_sent_at)
 }
 
 fn map_try_send_error<T>(error: TrySendError<T>) -> WireError {

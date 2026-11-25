@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use hyper::Uri;
 use tower::util::BoxCloneSyncService;
@@ -14,6 +14,54 @@ pub struct ConnectionInfo {
     pub remote_addr: Option<SocketAddr>,
     pub local_addr: Option<SocketAddr>,
     pub tls: bool,
+}
+
+/// Timing of the HTTP exchange that produced a response, stored in its extensions.
+///
+/// The built-in transport records request dispatch after connection readiness and
+/// final response header receipt before response callbacks or body consumption.
+/// Each retry or follow-up has its own timing. Body wrappers should preserve it;
+/// a replacement response source should replace or remove it.
+///
+/// Monotonic timestamps use the standard [`Instant`] clock, independently of a
+/// configured runtime timer. Wall time is used only to interpret HTTP dates.
+#[derive(Clone, Copy, Debug)]
+pub struct ResponseTiming {
+    response_delay: Duration,
+    received_at: Instant,
+    received_at_wall: SystemTime,
+}
+
+impl ResponseTiming {
+    /// Records timestamps from one exchange, all using the same monotonic clock.
+    ///
+    /// Custom response sources can attach this metadata to enable cache storage.
+    pub fn new(
+        request_sent_at: Instant,
+        received_at: Instant,
+        received_at_wall: SystemTime,
+    ) -> Self {
+        Self {
+            response_delay: received_at.saturating_duration_since(request_sent_at),
+            received_at,
+            received_at_wall,
+        }
+    }
+
+    /// Time from request dispatch to final response headers, excluding body reads.
+    pub fn response_delay(&self) -> Duration {
+        self.response_delay
+    }
+
+    /// Monotonic time when final response headers were received.
+    pub fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
+    /// Wall-clock time at the same response header receipt boundary.
+    pub fn received_at_wall(&self) -> SystemTime {
+        self.received_at_wall
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
