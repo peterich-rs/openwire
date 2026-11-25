@@ -826,9 +826,7 @@ impl TcpConnector for FailingTcpConnector {
                 return Err(error);
             }
 
-            TokioTcpConnector::default()
-                .connect(ctx, addr, timeout)
-                .await
+            TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }
 }
@@ -854,9 +852,7 @@ impl TcpConnector for AttemptCountingTcpConnector {
         let attempts = self.attempts.clone();
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::Relaxed);
-            TokioTcpConnector::default()
-                .connect(ctx, addr, timeout)
-                .await
+            TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }
 }
@@ -882,9 +878,7 @@ impl TcpConnector for RecordingTimeoutTcpConnector {
         let timeouts = self.timeouts.clone();
         Box::pin(async move {
             timeouts.lock().expect("connector timeouts").push(timeout);
-            TokioTcpConnector::default()
-                .connect(ctx, addr, timeout)
-                .await
+            TokioTcpConnector.connect(ctx, addr, timeout).await
         })
     }
 }
@@ -930,7 +924,7 @@ impl TcpConnector for ScriptedRaceTcpConnector {
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(script.delay).await;
-            TokioTcpConnector::default()
+            TokioTcpConnector
                 .connect(ctx, script.actual_addr, timeout)
                 .await
         })

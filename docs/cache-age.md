@@ -39,8 +39,8 @@ feasible.
 4. Validation uses the 304 exchange's timing and Age/Date. A recipient with a
    clock adds a missing Date at receipt before merging headers; old Age is
    removed. Missing timing is not guessed: synthetic responses without metadata
-   are returned but not stored, and internal 304s still reconstruct the caller's
-   response without publishing an unverified refreshed entry.
+   are returned without storage. A matching internal 304 with no timing still
+   reconstructs the caller's response without publishing a refreshed entry.
 
 Public metadata API in `crates/openwire-core/src/transport.rs`:
 
@@ -75,13 +75,33 @@ corrections.
 | [RFC 9111 §4.2.3](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2.3): Age correction accounts for request initiation and response delay | MUST interpret corrected Age relative to request initiation; conservative max is a permitted choice | transport timing + cache arithmetic | request1000/response1002/Date900/Age200/now1005 yields205; Date-dominant and future-Date cases | verified by focused tests listed below |
 | RFC 9111 §4.2.3: residence begins at receipt | §4 MUST on unvalidated cache hits; §4.2.3 algorithm | cache entry | entry age uses header receipt rather than construction time; subsecond delay/residence retained | verified by focused tests listed below |
 | RFC 9111 §4 and §4.2: hits emit current Age and freshness is strict | MUST replace Age on unvalidated hits; freshness definition | cache hit/freshness decision | exact Age serialization and stale at equality; local peer request counts | verified by focused tests listed below |
-| RFC 9111 §4.3.3–4 and §4.2.3: an identified response gets validation age metadata | 304 age/Date reconstruction only; validator eligibility remains blocked | 304 merge/cache | validation uses new exchange delay/Age, absent Age is zero; old representation body preserved | verified by focused tests listed below |
+| RFC 9111 §4.3.3–4 and §4.2.3: an identified response gets validation age metadata | 304 age/Date reconstruction for an eligible validator match | 304 merge/cache | validation uses new exchange delay/Age, absent Age is zero; old representation body preserved | verified by focused tests listed below |
 | RFC 9111 §§1.2.2 and 5.1: valid overflow never becomes zero; invalid Age is ignored; first list member selected by default | MUST saturation/invalid handling; SHOULD first-member choice | Age parser | legal oversized digits saturate; signed/fractional/invalid first member ignored | verified by focused tests listed below |
 | [RFC 9110 §6.6.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-6.6.1): recipient with clock records a missing Date when caching | MUST when a clocked recipient caches a response with absent Date | cache normalization | missing ordinary/304 Date becomes receipt wall time, future Date clamps apparent age to zero | verified by focused tests listed below |
 
 Use the conservative RFC formula: maximum of apparent age and incoming Age plus
 response delay, then add monotonic residence. This is an explicit permitted
 choice even when corrected Age alone could be used.
+
+### Validator selection before a 304 update
+
+The private GET cache uses the existing cache key, request-header selection
+(`Vary`), and authorization eligibility before comparing validators. The
+current RFC 9111 text applies. The RFC Editor rejected erratum 9185, which
+would have expanded the candidate set beyond matching `Vary` values. No
+verified erratum changes the comparison or selection rules below.
+[RFC 9111 §§4.3.2–4.3.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.4) ·
+[RFC 9110 §§8.8.2–8.8.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8.3.2) ·
+[Erratum 9185 decision](https://lists.w3.org/Archives/Public/ietf-http-wg/2026OctDec/0193.html) ·
+[Erratum 9164 decision](https://lists.w3.org/Archives/Public/ietf-http-wg/2026OctDec/0191.html)
+
+| Requirement and conditions | Implementation | Verified evidence |
+| --- | --- | --- |
+| A strong `ETag` selects every eligible response with the identical strong tag. With zero matches the cache MUST leave stored responses alone, even when `Last-Modified` agrees. | `validated_candidates` compares opaque tag bytes and strength before the merge. | `strong_etag_304_only_refreshes_a_strong_match` covers identical tags, different strong tags, and weak-to-strong with identical opaque bytes. The match makes two origin requests and refreshes metadata. The other cases make three and return the replacement body. |
+| A weak validator selects the most recent corresponding eligible response. With no validators, selection requires exactly one eligible stored response that also has none. | `validated_candidates` uses weak tag comparison and parsed HTTP dates. The cache treats `Last-Modified` as weak because it lacks origin clock provenance. | `validation_selects_all_strong_matches_or_the_most_recent_weak_match` covers strong and weak selection, opaque obs-text, date matching, missing validators and duplicate tags. |
+| Eligibility from `Vary` applies before tag matching. Caller-supplied validation stays with the origin. | `CacheInterceptor::intercept` forwards the original conditional headers and carries the origin `304` back to its caller. This delegates the §4.3.2 SHOULD for local precondition evaluation to the origin to preserve its full evaluation semantics. The cache skips the optional validator union. | `caller_validation_preserves_the_304_and_refreshes_only_a_matching_entry` verifies a fresh entry, matching and mismatching tags, and another language variant with the same tag. |
+| [RFC 9111 §4](https://www.rfc-editor.org/rfc/rfc9111.html#section-4) requires the cached and requested URI to match. `ETag` identifies representations within a resource. | The follow-up coordinator attaches `RedirectedResponse` after following a redirect. The cache excludes that response from selection and storage for the initial URI. | `redirect_target_304_cannot_validate_the_original_uri` uses identical strong tags for two URIs and verifies that recovery returns the target body without refreshing the original entry. |
+| An internal `304` with zero eligible matches cannot validate the stored response. Use the full response from an original-request replay if available. | `Next::run_when_ready` performs one recovery exchange after releasing the first response. A second `304` yields a protocol error. `MemoryCacheStore::replace_validated_candidate` guards the snapshot under its write lock. | `untimed_mismatched_304_and_unsolicited_recovery_304_do_not_modify_cache`, `strong_etag_304_only_refreshes_a_strong_match`, and `validated_snapshot_cannot_overwrite_a_replaced_variant` cover failed recovery, a single admission slot, and concurrent replacement. |
 
 ## Phased Implementation
 
@@ -177,11 +197,8 @@ other operating systems remains separate evidence.
   assuming zero delay. This affects synthetic interceptor responses; attach
   ResponseTiming to opt into automatic storage.
 - No new production dependency or global clock/test framework.
-- This repair proves the age/Date cases listed above, not all cache conformance.
-  In particular, 304 validator eligibility is outside this repair: the existing
-  freshening path does not reject a mismatched strong ETag. That pre-existing
-  §4.3.4 gap blocks a full validation-conformance claim and affected releases
-  until separately fixed; passing age tests do not waive it.
+- The verification covers the age/Date cases and private GET validation
+  scenarios listed above.
 
 ## File Change Summary
 
